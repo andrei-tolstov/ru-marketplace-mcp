@@ -33,6 +33,7 @@ dependencies = [
     "aliexpress-connector",
     "cian-connector",
     "marketplace-connector",
+    "drom-connector",
 ]
 
 [project.urls]
@@ -61,6 +62,7 @@ mpstats-connector = { workspace = true }
 aliexpress-connector = { workspace = true }
 cian-connector = { workspace = true }
 marketplace-connector = { workspace = true }
+drom-connector = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -171,6 +173,7 @@ source = [
     "packages/aliexpress-connector/src/aliexpress_connector",
     "packages/cian-connector/src/cian_connector",
     "packages/marketplace-connector/src/marketplace_connector",
+    "packages/drom-connector/src/drom_connector",
 ]
 omit = [
     "*/tests/*",

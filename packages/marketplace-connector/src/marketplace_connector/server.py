@@ -49,7 +49,7 @@ mcp = FastMCP(
     instructions=(
         "All marketplace connectors in one server. Tools keep their per-source "
         "names: wb_*, ozon_*, yandex_*, detmir_*, avito_*, taobao_*, "
-        "megamarket_*, lamoda_*, dns_*, citilink_*, aliexpress_*, mpstats_* plus compare_prices and "
+        "megamarket_*, lamoda_*, dns_*, citilink_*, aliexpress_*, mpstats_*, drom_* plus compare_prices and "
         "compare_sources. cian_* is real estate (flats, houses, commercial "
         "property for sale or rent), not goods. Sources whose optional "
         "dependencies are missing are simply absent from the set."
@@ -134,6 +134,13 @@ _CAPABILITIES: dict[str, dict[str, object]] = {
     # Real estate, not goods: search is by filters (deal, type, region, rooms,
     # price, area), never by text, and it takes no part in compare_prices.
     "cian": {"access": "cdp", "requires_cdp": True, "requires_login": False, "currency": "rub", "text_search": False},
+    "drom": {
+        "access": "cdp_or_residential",
+        "requires_cdp": True,
+        "requires_login": False,
+        "currency": "rub",
+        "text_search": True,
+    },
 }
 
 
@@ -162,6 +169,7 @@ def _mount_all() -> None:
         ("citilink", "citilink_connector.server"),
         ("aliexpress", "aliexpress_connector.server"),
         ("cian", "cian_connector.server"),
+        ("drom", "drom_connector.server"),
         ("compare", "compare_connector.server"),
         ("mpstats", "mpstats_connector.server"),
     )

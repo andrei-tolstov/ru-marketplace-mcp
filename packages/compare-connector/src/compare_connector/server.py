@@ -73,6 +73,7 @@ _CARD_TOOL_NAMES = {
     "dns": "dns_card",
     "citilink": "citilink_card",
     "aliexpress": "aliexpress_card",
+    "drom": "drom_card",
 }
 
 
@@ -161,6 +162,13 @@ def _available_sources() -> dict[str, Any]:
     except Exception as exc:
         log_event("compare.source_unavailable", source="aliexpress", error=_redact(str(exc))[:120])
 
+    try:
+        from drom_connector import server as drom_server
+
+        sources["drom"] = drom_server
+    except Exception as exc:
+        log_event("compare.source_unavailable", source="drom", error=_redact(str(exc))[:120])
+
     return sources
 
 
@@ -182,6 +190,7 @@ SEARCHABLE = (
     "dns",
     "citilink",
     "aliexpress",
+    "drom",
 )
 
 # Yuan sources rank separately from ruble ones: a baked-in CNY→RUB rate would go
@@ -710,6 +719,30 @@ async def _search_aliexpress(query: str, limit: int) -> list[MarketOffer]:
     return offers
 
 
+async def _search_drom(query: str, limit: int) -> list[MarketOffer]:
+    """Adapt ``drom_search`` results (CDP or residential tier; auto parts/goods)."""
+    server = SOURCES["drom"]
+    response = await server.drom_search(query=query)
+
+    offers: list[MarketOffer] = []
+    for item in (getattr(response, "items", None) or [])[:limit]:
+        offers.append(
+            MarketOffer(
+                source="drom",
+                product_id=str(item.bulletin_id or ""),
+                title=item.title or "",
+                brand="",
+                seller=item.seller_name or "",
+                price_rub=item.price_rub,
+                rating=None,
+                rating_count=None,
+                in_stock=None,
+                url=item.url or "",
+            )
+        )
+    return offers
+
+
 _SEARCH_IMPLS = {
     "wildberries": _search_wildberries,
     "yandex_market": _search_yandex,
@@ -721,6 +754,7 @@ _SEARCH_IMPLS = {
     "dns": _search_dns,
     "citilink": _search_citilink,
     "aliexpress": _search_aliexpress,
+    "drom": _search_drom,
 }
 
 

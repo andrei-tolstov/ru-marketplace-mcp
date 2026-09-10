@@ -7,7 +7,7 @@
 
 **MCP-серверы для российских и китайских маркетплейсов.** Цены, наличие,
 рейтинги, отзывы и реквизиты продавцов с Wildberries, Ozon, Яндекс Маркета,
-Детского мира, Авито, AliExpress, Taobao, Мегамаркета, Lamoda, DNS и Ситилинка.
+Детского мира, Авито, AliExpress, Taobao, Мегамаркета, Lamoda, DNS, Ситилинка и Дрома (baza.drom.ru).
 Плюс недвижимость с Циана и
 сравнение цен по всем товарным источникам одним вызовом.
 
@@ -37,6 +37,7 @@
 | **Ситилинк**      | 2            | ваш Chrome (Qrator)                                                        | Поиск и карточки электроники                                                              |
 | **AliExpress**    | 2            | ваш Chrome (x5sec)                                                       | Поиск и карточки, цены в рублях                            |
 | **Циан**          | 2            | ваш Chrome (WAF по IP)                                                     | Недвижимость: поиск по фильтрам (продажа, аренда, посуточно) и карточка объявления         |
+| **Дром (baza.drom.ru)** | 3      | ваш Chrome (WAF)                                                           | Автозапчасти, шины, диски, масла: поиск, карточки товаров, профиль продавца и отзывы       |
 | **Сравнение**     | 3            | опрашивает всё перечисленное                                               | «Где дешевле?» одним вызовом                                                              |
 | **MPStats**       | 2            | платный аккаунт MPStats, cookie `mp_auth` (опционально)                    | Продажи/остатки/графики за 30 дней по SKU Ozon/WB, остатки по складам (FBS/FBO)           |
 
@@ -55,11 +56,11 @@ MPStats стоит особняком: это единственный **пла�
 поэтому он опционален и подключается по желанию, на остальные тринадцать
 серверов он не влияет никак.
 
-Всего 38 инструментов в 14 серверах на общем рантайме `mcp-core`. Плюс объединённый
+Всего 41 инструмент в 15 серверах на общем рантайме `mcp-core`. Плюс объединённый
 `marketplace-mcp`, который монтирует всё разом — одна запись в конфиге клиента
-вместо четырнадцати. Он добавляет свой инструмент `marketplace_sources` (какие коннекторы
-поднялись, а какие отвалились и почему), так что в нём 39 инструментов: 38
-смонтированных плюс этот.
+вместо пятнадцати. Он добавляет свой инструмент `marketplace_sources` (какие коннекторы
+поднялись, а какие отвалились и почему), так что в нём 42 инструмента: 41
+смонтированный плюс этот.
 
 ## Быстрый старт
 
@@ -613,8 +614,8 @@ MIT, файл [LICENSE](LICENSE).
 
 **MCP servers for Russian and Chinese marketplaces.** Read prices, stock, ratings,
 reviews and seller identity from Wildberries, Ozon, Yandex Market, Detsky Mir, Avito,
-AliExpress, Taobao, Megamarket, Lamoda, DNS and Citilink, then compare prices across
-all of them in one call. Taobao and AliExpress are the Chinese ones; the other nine
+AliExpress, Taobao, Megamarket, Lamoda, DNS, Citilink and Drom (baza.drom.ru), then compare prices across
+all of them in one call. Taobao and AliExpress are the Chinese ones; the other ten
 are Russian.
 
 Read-only. No credentials, no API keys, no account required — the marketplaces with
@@ -638,6 +639,7 @@ it every other server is unaffected.
 | **Citilink**      | 2     | your Chrome (Qrator)                                                          | Electronics search and cards                                                                       |
 | **AliExpress**    | 2     | your Chrome (x5sec)                                                           | Search and cards, ruble prices                            |
 | **Cian**          | 2     | your Chrome (WAF by IP)                                                      | Real estate: filter search (sale, long-term rent, daily) and one offer's card                      |
+| **Drom (baza.drom.ru)** | 3 | your Chrome (WAF)                                                           | Auto parts, tires, wheels, oils: search, item cards, seller reputation and feedbacks              |
 | **Compare**       | 3     | aggregates the above                                                          | "Where is this cheapest?" in one call                                                              |
 | **MPStats**       | 2     | paid MPStats account, `mp_auth` cookie (optional)                             | 30-day sales/stock graphs per Ozon/WB SKU, warehouse split (FBS/FBO)                               |
 
@@ -653,12 +655,12 @@ from your own session for the current state.
 
 MPStats stands apart as the only **paid** source: without `MPSTATS_MP_AUTH` the
 server boots but its tools answer `auth_missing`. It is therefore optional —
-plug it in if you have an account; the other thirteen servers never notice.
+plug it in if you have an account; the other fourteen servers never notice.
 
-38 tools across 14 stdio MCP servers, sharing one runtime (`mcp-core`), plus the
+41 tools across 15 stdio MCP servers, sharing one runtime (`mcp-core`), plus the
 unified `marketplace-mcp` that mounts them all under one client entry. It adds its
 own `marketplace_sources` tool — which connectors mounted, and which dropped out and
-why — so it exposes 39 tools: the 38 mounted plus that one. stdio is the default;
+why — so it exposes 42 tools: the 41 mounted plus that one. stdio is the default;
 HTTP transport is opt-in for remote deployment — see
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 

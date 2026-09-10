@@ -30,6 +30,7 @@ dependencies = [
     "cian-connector",
     "compare-connector",
     "mpstats-connector",
+    "drom-connector",
 ]
 
 [project.scripts]
@@ -58,3 +59,4 @@ aliexpress-connector = { workspace = true }
 cian-connector = { workspace = true }
 compare-connector = { workspace = true }
 mpstats-connector = { workspace = true }
+drom-connector = { workspace = true }

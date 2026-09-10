@@ -27,6 +27,7 @@ inside a real browser.
 | DNS | ❌ 401 | Qrator JS proof-of-work | ✅ via your Chrome |
 | Citilink | ❌ 429 | Qrator rate block | ✅ via your Chrome |
 | AliExpress | ❌ x5sec challenge | x5sec; search works in a real Chrome | ✅ via your Chrome |
+| baza.drom.ru | ❌ WAF / TLS drop | IP reputation + TLS fingerprint | ✅ via your Chrome |
 
 A second live run in July 2026 confirmed all four CDP sources on the maintainer's
 own machine — a Russian residential IP, a logged-in Chrome over CDP — and it
@@ -663,3 +664,36 @@ the instruction to open cian.ru in the scraping Chrome and pass the check.
 
 **Verdict:** tier 2 only, JSON both ways. Tier 1 (`curl_cffi`) was not built:
 the WAF keys on IP and the residential case is unmeasured.
+
+## baza.drom.ru
+
+Probed live in September 2026 from both a datacenter/VPN IP and an active Chrome
+session on the operator's machine.
+
+**Plain HTTPS (curl_cffi / httpx):** Datacenter and foreign egress IPs are
+silently dropped at the TLS handshake or receive network timeouts / reset packets.
+No human-readable HTML block page or captcha is emitted — traffic simply stalls.
+When connecting through Russian residential IP egress, curl_cffi with Chrome
+impersonation succeeds.
+
+**Inside the operator's Chrome (tier 2):** In-page `fetch()` via Chrome CDP works
+consistently (<300 ms response times, HTTP 200). The site requires no login for
+catalog searches, item card views, seller profiles, and buyer feedbacks.
+
+**Encoding gotcha:** baza.drom.ru serves HTML encoded in `windows-1251` and expects
+query parameters in URL-encoded Windows-1251 bytes (e.g. `%EC%E0%F1%EB%EE` for `масло`).
+UTF-8 queries may trigger 301/302 redirects or degraded search relevance. The
+connector automatically percent-encodes search queries in Windows-1251 and decodes
+response HTML using `response.encoding` / `cp1251`.
+
+**Structure:**
+- Search: HTML listings containing `.bull-item` and `.goods-item` elements with
+  bulletin ID, price, title, city, seller name, and photos.
+- Cards: Rich Schema.org JSON-LD (`@type: "Product"`, `@type: "BreadcrumbList"`)
+  embedded directly in `<script type="application/ld+json">`, backed by DOM
+  fallbacks for OEM cross-numbers, car compatibility, and seller rating.
+- Seller: Public profile `/user/<id>/` with registration year, active bulletin count,
+  and rating, plus paginated customer feedbacks at `/user/<id>/feedbacks`.
+
+**Verdict:** Tier 2 (CDP in-page fetch) is the primary reliable transport;
+Tier 1 (curl_cffi with RU residential proxy) supported for headless environments.

@@ -682,6 +682,171 @@
       "type": "object"
     }
   },
+  "drom_card": {
+    "output": {
+      "properties": {
+        "_meta": {},
+        "address": {},
+        "brand": {},
+        "breadcrumbs": {},
+        "city": {},
+        "compatibility": {},
+        "condition": {},
+        "cross_numbers": {},
+        "delivery_info": {},
+        "description": {},
+        "images": {},
+        "is_available": {},
+        "item_id": {},
+        "oem": {},
+        "price_currency": {},
+        "price_rub": {},
+        "seller": {},
+        "status": {},
+        "tier_used": {},
+        "title": {},
+        "url": {}
+      },
+      "type": "object"
+    },
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "url_or_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "url_or_id"
+      ],
+      "type": "object"
+    }
+  },
+  "drom_search": {
+    "output": {
+      "properties": {
+        "_meta": {},
+        "city": {},
+        "count": {},
+        "items": {},
+        "page": {},
+        "query": {},
+        "status": {},
+        "tier_used": {},
+        "total_count": {}
+      },
+      "type": "object"
+    },
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "city": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "condition": {
+          "anyOf": [
+            {
+              "enum": [
+                "all",
+                "new",
+                "used"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "in_stock_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "page": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query": {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        },
+        "sort_by": {
+          "default": "relevance",
+          "enum": [
+            "relevance",
+            "price_asc",
+            "price_desc"
+          ],
+          "type": "string"
+        },
+        "with_photos_only": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  "drom_seller": {
+    "output": {
+      "properties": {
+        "_meta": {},
+        "feedbacks": {},
+        "offers_count": {},
+        "seller": {},
+        "status": {},
+        "subscribers_count": {},
+        "tier_used": {}
+      },
+      "type": "object"
+    },
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "feedbacks_page": {
+          "default": 1,
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "seller_id_or_url": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "seller_id_or_url"
+      ],
+      "type": "object"
+    }
+  },
   "lamoda_card": {
     "output": {
       "properties": {
