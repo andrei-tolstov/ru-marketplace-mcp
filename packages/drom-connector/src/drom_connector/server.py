@@ -15,6 +15,7 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC. Use
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime
 import json
 import re
@@ -25,7 +26,7 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi
 from fastmcp import Context, FastMCP
 from fastmcp.server.middleware.error_handling import RetryMiddleware
-from mcp.types import ToolAnnotations
+from mcp.types import ImageContent, TextContent, ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
 from mcp_core.errors import (
@@ -236,6 +237,124 @@ async def _fetch(url: str, ctx: Context | None) -> tuple[int, str, str]:
         if isinstance(exc, ToolError):
             raise
         raise_tool_error(TransportDownError(f"baza.drom.ru CDP fetch failed: {_redact(str(exc))}"))
+
+
+MAX_PHOTO_BYTES = 15 * 1024 * 1024
+
+
+def _sniff_image_mime(data: bytes, header_mime: str | None = None) -> str:
+    """Determine MIME type from Content-Type header or magic bytes."""
+    if header_mime and header_mime.startswith("image/"):
+        return header_mime.split(";")[0].strip()
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+def _sync_download_photo(url: str, proxy: str | None = None) -> tuple[bytes, str] | None:
+    """Download image bytes synchronously via curl_cffi with Chrome impersonation."""
+    try:
+        kwargs: dict[str, Any] = {
+            "impersonate": "chrome124",
+            "timeout": 15,
+            "headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Referer": f"{SITE_BASE}/",
+            },
+        }
+        if proxy:
+            kwargs["proxy"] = proxy
+        r = cffi.get(url, **kwargs)
+        if r.status_code == 200 and 100 < len(r.content) <= MAX_PHOTO_BYTES:
+            mime = _sniff_image_mime(r.content, r.headers.get("content-type"))
+            return r.content, mime
+    except Exception:
+        pass
+    return None
+
+
+async def _cdp_download_photo(url: str) -> tuple[bytes, str] | None:
+    """Tier-2 fallback: fetch image inside operator's Chrome via CDP data-URL."""
+    try:
+        async with _cdp_lock, open_page(f"{SITE_BASE}/", wait_ms=2000) as page:
+            raw = await asyncio.wait_for(
+                page.evaluate(
+                    """async (imageUrl) => {
+                        const res = await fetch(imageUrl);
+                        if (!res.ok) return null;
+                        const blob = await res.blob();
+                        const mime = blob.type || 'image/jpeg';
+                        return new Promise((resolve) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => {
+                                resolve({dataUrl: reader.result, mime: mime});
+                            };
+                            reader.onerror = () => resolve(null);
+                            reader.readAsDataURL(blob);
+                        });
+                    }""",
+                    url,
+                ),
+                timeout=20.0,
+            )
+            if isinstance(raw, dict) and raw.get("dataUrl"):
+                data_url = raw["dataUrl"]
+                mime = raw.get("mime", "image/jpeg")
+                if "," in data_url:
+                    b64_str = data_url.split(",", 1)[1]
+                    content = base64.b64decode(b64_str)
+                    if 100 < len(content) <= MAX_PHOTO_BYTES:
+                        return content, mime
+    except Exception:
+        pass
+    return None
+
+
+async def _download_photo(
+    photo_url: str,
+    high_res: bool = True,
+    ctx: Context | None = None,
+) -> tuple[bytes, str] | None:
+    """Download an image from photo_url and return (bytes, mime_type).
+
+    If high_res is True and URL contains '_bulletin', tries '_full' resolution first.
+    Falls back to original URL if high_res variant fails.
+    """
+    clean_url = photo_url.strip()
+    if clean_url.startswith("//"):
+        clean_url = f"https:{clean_url}"
+    elif clean_url.startswith("/"):
+        clean_url = f"{SITE_BASE}{clean_url}"
+
+    urls_to_try: list[str] = []
+    if high_res and "_bulletin" in clean_url:
+        urls_to_try.append(clean_url.replace("_bulletin", "_full"))
+    urls_to_try.append(clean_url)
+
+    proxy = _proxy()
+    for cand_url in urls_to_try:
+        # Try curl_cffi first (fast and does not tie up browser)
+        res = await asyncio.to_thread(_sync_download_photo, cand_url, proxy)
+        if res is not None:
+            return res
+        # If proxy was configured or failed, try direct (CDN is open)
+        if proxy:
+            res_direct = await asyncio.to_thread(_sync_download_photo, cand_url, None)
+            if res_direct is not None:
+                return res_direct
+        # Fallback to CDP if Chrome is reachable
+        cdp_res = await _cdp_download_photo(cand_url)
+        if cdp_res is not None:
+            return cdp_res
+
+    return None
 
 
 def _extract_item_id(raw: str) -> str | None:
@@ -515,6 +634,41 @@ def _parse_card_html(html: str, page_url: str, fallback_id: str | None = None) -
             elif "доставка" in line.lower():
                 delivery_info = line
 
+    # 3. HTML gallery fallback / additional photos
+    gallery_selectors = [
+        ".viewbull-gallery__image",
+        ".viewbull-gallery a[href]",
+        "[data-fancybox='gallery']",
+        "[data-zoom-image]",
+        ".image-gallery img",
+        "img[src*='static.baza.drom.ru']",
+        "a[href*='static.baza.drom.ru']",
+    ]
+    for el in soup.select(", ".join(gallery_selectors)):
+        src = el.get("data-zoom-image") or el.get("data-src") or el.get("href") or el.get("src")
+        if isinstance(src, str) and ("static.baza.drom.ru" in src or "/bulletins" in src):
+            if src.startswith("//"):
+                src = f"https:{src}"
+            elif src.startswith("/"):
+                src = f"{SITE_BASE}{src}"
+            images.append(src)
+
+    # Normalize image URLs & deduplicate preserving order
+    seen_images: set[str] = set()
+    cleaned_images: list[str] = []
+    for img in images:
+        if not img or not isinstance(img, str):
+            continue
+        c_img = img.strip()
+        if c_img.startswith("//"):
+            c_img = f"https:{c_img}"
+        elif c_img.startswith("/"):
+            c_img = f"{SITE_BASE}{c_img}"
+        if c_img not in seen_images:
+            seen_images.add(c_img)
+            cleaned_images.append(c_img)
+    images = cleaned_images
+
     return {
         "item_id": fallback_id or _extract_item_id(page_url),
         "title": title,
@@ -791,6 +945,11 @@ async def drom_card(
 
     Reads Schema.org JSON-LD (Product, Offer, BreadcrumbList) and HTML attributes.
 
+    CRITICAL FOR AUTO PARTS: Always inspect parts photos using `drom_card_photos`
+    to verify visual match (exact shape, bracket locations, connectors, OEM stamps,
+    side/generation) and assess true physical condition (cracks, broken tabs, rust,
+    repair traces, wear).
+
     ## Return Format
 
     DromCardResponse: {status, bulletin_id, url, title, price_rub (None if unpriced — never 0),
@@ -832,6 +991,175 @@ async def drom_card(
     attached = R.attach_meta(res.model_dump(by_alias=True, exclude={"meta"}), warnings, source="drom_card")
     res.meta = MetaOut(**attached["_meta"])
     return res
+
+
+@mcp.tool(
+    name="drom_card_photos",
+    annotations=ToolAnnotations(
+        title="baza.drom.ru Item Photos Inspector",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def drom_card_photos(
+    url_or_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            description="Item ID (e.g. '137849325', 'g12841036510'), baza.drom.ru bulletin URL, or direct photo URL",
+        ),
+    ],
+    max_photos: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=20,
+            description="Maximum number of photos to download and return (1-20, default 5)",
+        ),
+    ] = 5,
+    high_res: Annotated[
+        bool,
+        Field(
+            description="Fetch full-resolution images (_full) instead of standard thumbnails (_bulletin)",
+        ),
+    ] = True,
+    ctx: Context | None = None,
+) -> list[ImageContent | TextContent]:
+    """Download and transfer item photos from baza.drom.ru for visual inspection.
+
+    MANDATORY FOR AUTO PARTS SELECTION:
+    Models and agents must use this tool to visually inspect part photographs
+    to verify:
+    1. Exact compatibility: shape geometry, mounting bracket/tab integrity,
+       electrical connector pin counts, correct side (L/R) and facelift version.
+    2. Physical condition: cracks, dents, corrosion, deep scratches, wear on
+       contact surfaces, and traces of past repair or welding.
+    3. Part numbers: OEM stamps, manufacturer markings and serial labels.
+
+    ## Return Format
+
+    List of MCP contents:
+    - TextContent: Structured summary with lot metadata (title, OEM, condition,
+      price, seller, city) and the visual inspection protocol.
+    - ImageContent: One or more binary images with base64 data and mimeType
+      (image/webp, image/jpeg, image/png) for direct multimodal analysis.
+
+    ## Error Format
+
+    ToolError: BadRequestError if ID or URL is invalid; NotFoundError if lot or
+    photos do not exist; TransportDownError on network or CDN failure.
+    """
+    cleaned = url_or_id.strip()
+
+    # Direct photo URL case
+    if cleaned.startswith("http://") or cleaned.startswith("https://"):
+        parsed = urllib.parse.urlsplit(cleaned)
+        if "static.baza.drom.ru" in parsed.netloc or any(
+            parsed.path.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".webp", ".png")
+        ):
+            photo_res = await _download_photo(cleaned, high_res=high_res, ctx=ctx)
+            if not photo_res:
+                raise_tool_error(TransportDownError(f"Could not download photo from '{cleaned}'."))
+            data_bytes, mime = photo_res
+            b64_str = base64.b64encode(data_bytes).decode("utf-8")
+            intro = (
+                f"Прямое фото автозапчасти Drom: {cleaned}\n"
+                f"Размер: {len(data_bytes)} байт, формат: {mime}\n\n"
+                "Обязательный протокол визуального анализа автозапчасти:\n"
+                "1. Точное соответствие: проверьте геометрию, крепежные ушки/кронштейны, разъемы и сторону (L/R).\n"
+                "2. Заводская маркировка: найдите и сопоставьте OEM-номера и заводские клейма.\n"
+                "3. Оценка состояния: проверьте отсутствие трещин, заломов, следов правки, ржавчины и кустарного ремонта.\n"
+                "4. Резюме: сделайте вывод о пригодности детали к установке."
+            )
+            return [
+                TextContent(type="text", text=intro),
+                ImageContent(type="image", data=b64_str, mimeType=mime),
+            ]
+
+    # Item card bulletin / goods case
+    item_id = _extract_item_id(cleaned)
+    if not item_id:
+        raise_tool_error(BadRequestError(f"Could not extract a valid Drom item ID or photo URL from '{cleaned}'."))
+
+    if cleaned.startswith("http://") or cleaned.startswith("https://"):
+        target_url = cleaned
+    elif item_id.startswith("g"):
+        target_url = f"{SITE_BASE}/{item_id}.html"
+    else:
+        target_url = f"{SITE_BASE}/bulletin/{item_id}.html"
+
+    status, html, tier = await _fetch(target_url, ctx)
+    if status == 404:
+        raise_tool_error(NotFoundError(f"baza.drom.ru item '{item_id}' not found (404)."))
+    if status != 200:
+        raise_tool_error(TransportDownError(f"baza.drom.ru card fetch failed: HTTP {status} via {tier}."))
+
+    card_data = _parse_card_html(html, target_url, fallback_id=item_id)
+    images = card_data.get("images", [])
+    if not images:
+        return [
+            TextContent(
+                type="text",
+                text=f"У лота '{card_data.get('title') or item_id}' ({target_url}) отсутствуют прикрепленные фотографии.",
+            )
+        ]
+
+    target_photos = images[:max_photos]
+    download_tasks = [_download_photo(p_url, high_res=high_res, ctx=ctx) for p_url in target_photos]
+    results = await asyncio.gather(*download_tasks, return_exceptions=True)
+
+    downloaded_images: list[tuple[bytes, str, str]] = []
+    for p_url, res in zip(target_photos, results, strict=True):
+        if isinstance(res, tuple) and res[0]:
+            downloaded_images.append((res[0], res[1], p_url))
+
+    if not downloaded_images:
+        raise_tool_error(
+            TransportDownError(
+                f"Не удалось загрузить ни одну из {len(target_photos)} фотографий лота '{item_id}' с CDN baza.drom.ru."
+            )
+        )
+
+    title_str = card_data.get("title") or "Без названия"
+    oem_str = card_data.get("oem") or "Не указан"
+    cond_str = card_data.get("condition") or "Не указано"
+    brand_str = card_data.get("brand") or "Не указан"
+    price_val = card_data.get("price_rub")
+    price_str = f"{price_val} {card_data.get('price_currency') or 'RUB'}" if price_val is not None else "По запросу"
+    city_str = card_data.get("city") or "Не указан"
+
+    header_lines = [
+        f"Лот: {title_str} (ID: {item_id})",
+        f"Ссылка: {target_url}",
+        f"OEM / Каталожный номер: {oem_str}",
+        f"Заявленное продавцом состояние: {cond_str}",
+        f"Бренд / Производитель: {brand_str}",
+        f"Цена: {price_str}",
+        f"Город: {city_str}",
+        f"Всего фото в объявлении: {len(images)}, передано для визуального анализа: {len(downloaded_images)}.",
+        "",
+        "ВНИМАНИЕ: Обязательный регламент визуального анализа автозапчасти:",
+        "1. Точное соответствие детали: убедитесь, что форма, геометрия, крепежные ушки, кронштейны, разъемы/пины и исполнение (левая/правая сторона, рестайлинг/дорестайлинг) точно соответствуют требуемой запчасти.",
+        "2. Заводская маркировка: найдите на деталях и проверьте четкость OEM-номеров, штампов производителя и наклеек.",
+        "3. Оценка дефектов и физического состояния: детально осмотрите запчасть на фото на предмет:",
+        "   - трещин, сколов, заломов, глубоких царапин на рабочих плоскостях;",
+        "   - деформаций геометрии и следов кустарной правки/рихтовки;",
+        "   - коррозии, окисления контактов, глубокой ржавчины;",
+        "   - целостности пластиковых креплений, ушек, защелок, направляющих;",
+        "   - следов ремонта: пайки пластика, сварных швов, следов герметика/эпоксидной смолы;",
+        "   - состояния резинотехнических элементов (пыльники, сайлентблоки, уплотнители).",
+        "4. Резюме: сформулируйте обоснованное экспертное заключение о пригодности детали к установке и рисках покупки.",
+    ]
+
+    output_contents: list[ImageContent | TextContent] = [TextContent(type="text", text="\n".join(header_lines))]
+
+    for img_bytes, mime_type, _url in downloaded_images:
+        b64_str = base64.b64encode(img_bytes).decode("utf-8")
+        output_contents.append(ImageContent(type="image", data=b64_str, mimeType=mime_type))
+
+    return output_contents
 
 
 @mcp.tool(

@@ -723,6 +723,34 @@
       "type": "object"
     }
   },
+  "drom_card_photos": {
+    "output": {
+      "type": "object"
+    },
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "high_res": {
+          "default": true,
+          "type": "boolean"
+        },
+        "max_photos": {
+          "default": 5,
+          "maximum": 20,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "url_or_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "url_or_id"
+      ],
+      "type": "object"
+    }
+  },
   "drom_search": {
     "output": {
       "properties": {

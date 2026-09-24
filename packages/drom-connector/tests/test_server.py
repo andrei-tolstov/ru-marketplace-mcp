@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from drom_connector import server
 from fastmcp.exceptions import ToolError
+from mcp.types import ImageContent, TextContent
 
 
 @pytest.fixture(autouse=True)
@@ -181,3 +182,132 @@ async def test_drom_selfcheck_healthy(monkeypatch, search_html, card_part_html):
     assert resp.healthy is True
     assert resp.checks["search"].ok is True
     assert resp.checks["card"].ok is True
+
+
+# ------------------------------------------------------------- photo inspection ----
+
+
+def test_sniff_image_mime():
+    assert server._sniff_image_mime(b"\xff\xd8\xff\xe0", "image/jpeg") == "image/jpeg"
+    assert server._sniff_image_mime(b"\x89PNG\r\n\x1a\n\x00", None) == "image/png"
+    assert server._sniff_image_mime(b"RIFF\x00\x00\x00\x00WEBPVP8", None) == "image/webp"
+    assert server._sniff_image_mime(b"GIF89a\x01\x00", None) == "image/gif"
+    assert server._sniff_image_mime(b"unknown bytes", None) == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_download_photo_high_res_and_fallback(monkeypatch):
+    calls: list[str] = []
+
+    def fake_sync_download(url, proxy=None):
+        calls.append(url)
+        if "_full" in url:
+            # Simulate high-res 404/failure
+            return None
+        if "_bulletin" in url:
+            return b"\xff\xd8\xff\xe0test_jpeg", "image/jpeg"
+        return None
+
+    async def fake_cdp_download(url):
+        return None
+
+    monkeypatch.setattr(server, "_sync_download_photo", fake_sync_download)
+    monkeypatch.setattr(server, "_cdp_download_photo", fake_cdp_download)
+    monkeypatch.setattr(server, "_proxy", lambda: None)
+
+    res = await server._download_photo("https://static.baza.drom.ru/drom/1786204363632_bulletin", high_res=True)
+    assert res is not None
+    data, mime = res
+    assert data == b"\xff\xd8\xff\xe0test_jpeg"
+    assert mime == "image/jpeg"
+    assert len(calls) == 2
+    assert "_full" in calls[0]
+    assert "_bulletin" in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_download_photo_cdp_fallback(monkeypatch):
+    monkeypatch.setattr(server, "_sync_download_photo", lambda url, proxy=None: None)
+
+    async def fake_cdp_download(url):
+        return b"\x89PNG\r\n\x1a\nfrom_cdp", "image/png"
+
+    monkeypatch.setattr(server, "_cdp_download_photo", fake_cdp_download)
+    monkeypatch.setattr(server, "_proxy", lambda: None)
+
+    res = await server._download_photo("https://static.baza.drom.ru/drom/photo_test", high_res=False)
+    assert res is not None
+    data, mime = res
+    assert data == b"\x89PNG\r\n\x1a\nfrom_cdp"
+    assert mime == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_drom_card_photos_tool(monkeypatch, card_part_html):
+    async def fake_fetch(url, ctx):
+        return 200, card_part_html, "cdp"
+
+    async def fake_download(url, high_res=True, ctx=None):
+        return b"\xff\xd8\xff\xe0fake_bytes", "image/jpeg"
+
+    monkeypatch.setattr(server, "_fetch", fake_fetch)
+    monkeypatch.setattr(server, "_download_photo", fake_download)
+
+    contents = await server.drom_card_photos("g12841036510", max_photos=2)
+    assert len(contents) >= 2
+    assert isinstance(contents[0], TextContent)
+    assert "Колодки тормозные" in contents[0].text
+    assert "Обязательный регламент визуального анализа" in contents[0].text
+    assert "0446533470" in contents[0].text
+
+    for item in contents[1:]:
+        assert isinstance(item, ImageContent)
+        assert item.type == "image"
+        assert item.mimeType == "image/jpeg"
+        assert len(item.data) > 0
+
+
+@pytest.mark.asyncio
+async def test_drom_card_photos_direct_url(monkeypatch):
+    async def fake_download(url, high_res=True, ctx=None):
+        return b"\x89PNG\r\n\x1a\nfake_png", "image/png"
+
+    monkeypatch.setattr(server, "_download_photo", fake_download)
+
+    direct_url = "https://static.baza.drom.ru/drom/1786204363632_bulletin.jpg"
+    contents = await server.drom_card_photos(direct_url)
+    assert len(contents) == 2
+    assert isinstance(contents[0], TextContent)
+    assert "Прямое фото автозапчасти Drom" in contents[0].text
+    assert isinstance(contents[1], ImageContent)
+    assert contents[1].mimeType == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_drom_card_photos_no_images(monkeypatch):
+    html_without_images = "<html><body><h1>Гайка колесная</h1><div class='price'>100</div></body></html>"
+
+    async def fake_fetch(url, ctx):
+        return 200, html_without_images, "cdp"
+
+    monkeypatch.setattr(server, "_fetch", fake_fetch)
+
+    contents = await server.drom_card_photos("123456")
+    assert len(contents) == 1
+    assert isinstance(contents[0], TextContent)
+    assert "отсутствуют прикрепленные фотографии" in contents[0].text
+
+
+@pytest.mark.asyncio
+async def test_drom_card_photos_download_failure(monkeypatch, card_part_html):
+    async def fake_fetch(url, ctx):
+        return 200, card_part_html, "cdp"
+
+    async def fake_download_fail(url, high_res=True, ctx=None):
+        return None
+
+    monkeypatch.setattr(server, "_fetch", fake_fetch)
+    monkeypatch.setattr(server, "_download_photo", fake_download_fail)
+
+    with pytest.raises(ToolError):
+        await server.drom_card_photos("g12841036510")
