@@ -192,7 +192,7 @@
         "coworking": null,
         "phones": [
           {
-            "number": "9119664962",
+            "number": "0000000000",
             "countryCode": "7"
           }
         ],
@@ -557,7 +557,7 @@
           "phoneNumbers": [
             {
               "countryCode": "+7",
-              "number": "9523724431"
+              "number": "0000000000"
             }
           ],
           "profileUri": "company/131124249/",
@@ -788,7 +788,7 @@
         "coworking": null,
         "phones": [
           {
-            "number": "9820937453",
+            "number": "0000000000",
             "countryCode": "7"
           }
         ],
@@ -1116,7 +1116,7 @@
           "realtor": null
         },
         "user": {
-          "cianUserId": "117832788",
+          "cianUserId": "000000000",
           "isAgent": true,
           "isBuilder": false,
           "isCallbackUser": false,
@@ -1124,7 +1124,7 @@
           "isHidden": true,
           "isPassportVerified": false,
           "isSubAgent": true,
-          "userId": 117832788,
+          "userId": 0,
           "userTrustLevel": "involved",
           "accountType": "specialist",
           "agencyName": "Дмитрий Шубин",
@@ -1162,7 +1162,7 @@
           },
           "canShowOnline": false,
           "cianProfileStatus": "hide",
-          "companyName": "Циан х ПИК-Аренда",
+          "companyName": "00000000000000000",
           "isChatsEnabled": true,
           "isSelfEmployed": false,
           "masterAgent": {
@@ -1179,11 +1179,11 @@
           "phoneNumbers": [
             {
               "countryCode": "+7",
-              "number": "9609919856"
+              "number": "0000000000"
             },
             {
               "countryCode": "+7",
-              "number": "4951563586"
+              "number": "0000000000"
             }
           ],
           "subAgentCompanyName": "Циан х ПИК-Аренда",
@@ -1749,7 +1749,7 @@
         "phones": [
           {
             "countryCode": "7",
-            "number": "9119520225"
+            "number": "0000000000"
           }
         ],
         "isImported": false,
@@ -1843,7 +1843,7 @@
           "realtor": null
         },
         "user": {
-          "cianUserId": "47557313",
+          "cianUserId": "00000000",
           "isAgent": true,
           "isBuilder": false,
           "isCallbackUser": false,
@@ -1851,7 +1851,7 @@
           "isHidden": true,
           "isPassportVerified": true,
           "isSubAgent": true,
-          "userId": 47557313,
+          "userId": 0,
           "userTrustLevel": "involved",
           "accountType": "specialist",
           "agencyName": "Игорь Соснин",
@@ -1891,7 +1891,7 @@
           },
           "canShowOnline": true,
           "cianProfileStatus": "hide",
-          "companyName": "8 ЭТАЖ",
+          "companyName": "000000",
           "isChatsEnabled": true,
           "isSelfEmployed": false,
           "masterAgent": {
@@ -1908,7 +1908,7 @@
           "phoneNumbers": [
             {
               "countryCode": "+7",
-              "number": "9523873161"
+              "number": "0000000000"
             }
           ],
           "subAgentCompanyName": "8 ЭТАЖ",

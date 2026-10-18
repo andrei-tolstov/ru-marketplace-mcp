@@ -6,15 +6,36 @@ internal product endpoint speaks gRPC, and the old public Content API is dead
 server-rendered HTML that embeds its own widget state as JSON. This connector
 reads that state; the extraction rules live in ``yandex_connector.ssr``.
 
-Pages it depends on (all verified live Jul 2026 from a datacenter IP):
+Pages it depends on (all verified live Jul 2026 from a datacenter IP; the
+search price semantics re-verified live Sep 2026 from a residential IP
+against the product card for the same offer):
   - ``https://market.yandex.ru/search?text=…&page=N`` — search (~2 MB)
-  - ``https://market.yandex.ru/product/{id}`` — card + first ~13 reviews (~2.5 MB)
+  - ``https://market.yandex.ru/card/{slug}/{id}`` — card + first ~13 reviews (~2.5 MB)
 
 Behaviours that shape this code:
 
+**Three extraction paths, reported in ``meta.extraction``.** ``ssr`` reads the
+widget-state collections (richest: brand, seller, stock). Since 2026-09-12 the
+anonymous search page ships no collections; its first screen of snippets still
+carries ``data-zone-data`` payloads with both prices, title, sku and rating —
+``zone`` reads those and is a first-class path (no brand, one screen deep).
+``ld+json`` is the last resort: schema.org markup with the Plus price only.
+
 **Two prices, always.** Yandex leads with a subscriber price ("с Плюсом") that
 runs 25-30% below the everyday price. Both are reported separately, because
-quoting only the subscriber price misstates what most buyers pay.
+quoting only the subscriber price misstates what most buyers pay. A third
+figure rides along on discounted rows: the struck-through base price
+(``price_old_rub``). The SERP state stores exactly that figure in
+``offer.price.value`` and ``baobabPayload.price``, so the everyday price is
+read from the snippet's cart price instead — quoting those structural fields
+directly would quote the strike-through (Tuvio TKP2117S: 3698 vs the real
+2293, live-verified Sep 2026).
+
+**A search row is the SERP's offer, not the card's.** One product id covers a
+whole family, and Yandex may show one member in search while the card for the
+same id defaults to another (REDMOND: snippet KM243 sku 4668084807, card
+default KM245). The connector reports the SERP faithfully; search rows and
+cards reconcile by ``sku_id``, never by product URL alone.
 
 **Reviews come from the card, not /reviews.** The dedicated reviews URL renders
 zero reviews server-side (they load over XHR), while the product page ships the
@@ -30,6 +51,21 @@ false positives. Only SmartCaptcha markers count.
 NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC. Use
 ``log_event`` (stderr) or the ``Context`` logging methods.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Expose Yandex Market search and cards from server-rendered state.
+# SCOPE: Read-only paced HTML fetches; distinct everyday, Plus and old prices.
+# DEPENDS: FastMCP; httpx; mcp_core transport/cache; ssr; models_output; settings.
+# LINKS: M-YANDEX; M-COMPARE; M-MARKETPLACE; packages/yandex-connector/tests.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# _fetch_html: Retry bounded page reads and classify HTTP/transport refusals.
+# _guard_parse_status: Distinguish captcha, empty product shell and parser drift.
+# _guard_values_drift: Reject implausible parsed field values.
+# _to_product: Adapt SSR fields to the public product model.
+# yandex_search: Return SSR/zone/fallback offers with explicit price and SKU identity.
+# yandex_card: Read product details and the card's embedded review sample.
+# yandex_selfcheck: Probe operator transport/parser health; not an MCP tool.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
@@ -71,7 +107,7 @@ from yandex_connector.settings import get_settings
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.5.3"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://market.yandex.ru"
@@ -126,7 +162,11 @@ async def _fetch_html(url: str, label: str, ctx: Context | None) -> str:
                     retry_statuses=_RETRY_STATUSES,
                 )
             except httpx.TransportError as exc:
-                raise_tool_error(TransportDownError(f"{label}: {_redact(str(exc))}", provider="yandex"))
+                # An httpx transport exception can carry no message at all, and
+                # "yandex_card: " tells an operator nothing about which failure it
+                # was. Name the class before the (possibly empty) detail.
+                detail = _redact(str(exc)).strip() or "(no message)"
+                raise_tool_error(TransportDownError(f"{label}: {type(exc).__name__}: {detail}", provider="yandex"))
                 raise AssertionError("unreachable") from exc  # pragma: no cover
 
         if status == 429:
@@ -237,9 +277,19 @@ async def yandex_search(
     single source for "what does this cost right now" across the Russian market —
     including goods Wildberries and Ozon do not carry.
 
-    Each result reports `price_rub` (what anyone pays) and `price_with_plus`
-    (requires a Yandex Plus subscription, typically 25-30% lower). Prefer
-    `price_rub` when quoting a price to a person.
+    Each result reports `price_rub` (what anyone pays — the price the SERP
+    snippet's cart button charges, cross-verified against product cards) and
+    `price_with_plus` (requires a Yandex Plus subscription, typically 25-30%
+    lower). Prefer `price_rub` when quoting a price to a person;
+    `price_old_rub` is the struck-through reference price and must never be
+    quoted as the price.
+
+    A search row describes the SERP snippet's offer, which may be a different
+    member of the product family than the offer `yandex_card` for the same
+    `product_id` defaults to (live example: search shows REDMOND KM243 sku
+    4668084807 while the card for that id defaults to a KM245 offer at another
+    price). The row is SERP-faithful — reconcile it with a card by `sku_id`,
+    not by the product URL.
 
     Note `rating_count` counts star ratings, not written reviews; the written
     count is available per product via `yandex_card`.
@@ -249,9 +299,11 @@ async def yandex_search(
     YandexSearchResponse: {query, page, page_count, total_available,
     has_next_page, returned, items, meta}. Items carry product_id, sku_id,
     title, brand, seller, price_rub (everyday — None when absent, never 0),
-    price_with_plus, price_old_rub, currency, rating, rating_count, in_stock,
-    is_express, url, image. Zero results is NOT an error — it is reported via
-    meta.warnings.
+    price_with_plus, price_old_rub (struck-through reference), currency,
+    rating, rating_count, in_stock, is_express, url, image. Zero results is
+    NOT an error — it is reported via meta.warnings. meta.extraction names the
+    path: 'ssr' (full widget state), 'zone' (first-screen snippet payloads —
+    both prices, no brand) or 'ld+json' (degraded, Plus price only).
 
     ## Error Format
 
@@ -276,21 +328,17 @@ async def yandex_search(
     _guard_parse_status(parsed["status"], "yandex_search")
     _guard_values_drift(parsed, "yandex_search")
 
-    # Dedupe by product_id BEFORE applying the limit. Yandex's SSR payload can
-    # carry the same product more than once on a page — the parser keys on
-    # snippet (an on-screen position), and one product legitimately occupies
-    # several of those as different offers. Verified live: a 3-page walk of
-    # "ноутбук" returned 1 repeat between pages 1-2 and 3 between pages 2-3.
-    #
-    # Slicing first would let a duplicate consume part of the caller's budget, so
-    # limit=40 could yield 37 distinct products with no indication why. Deduping
-    # first means the limit always describes distinct products.
+    # Dedupe repeated sellable variants BEFORE applying the limit. A product
+    # family can legitimately appear with different sku_id values and prices;
+    # collapsing by product_id alone would silently discard those variants.
+    # With no reported SKU, repeated product IDs retain the legacy behavior.
+    # Slicing first would let repeats consume the caller's result budget.
     #
     # Order is preserved: Yandex's ranking is the product of the search, and
     # re-sorting it would discard information the caller asked for.
     items: list[YandexProduct] = []
     duplicates_dropped = 0
-    seen_product_ids: set[str] = set()
+    seen_variants: set[tuple[str, str]] = set()
     for raw in parsed["items"]:
         if len(items) >= limit:
             break
@@ -299,10 +347,11 @@ async def yandex_search(
         # be compared for identity, so they pass through rather than collapsing
         # into a single "" bucket that would drop unrelated products.
         if product.product_id:
-            if product.product_id in seen_product_ids:
+            key = (product.product_id, product.sku_id)
+            if key in seen_variants:
                 duplicates_dropped += 1
                 continue
-            seen_product_ids.add(product.product_id)
+            seen_variants.add(key)
         items.append(product)
 
     warnings: list[str] = []
@@ -320,6 +369,13 @@ async def yandex_search(
     if items and all(not p.title for p in items):
         warnings.append("no_titles_on_page: every product lacks a title — likely SSR drift")
 
+    if parsed["status"] == ssr.ParseStatus.OK_ZONE:
+        # No collection bundle, but the first screen of snippets carried its
+        # data-zone-data payloads: both prices, title, sku, rating, seller
+        # (when shipped). Brand is unresolvable (vendorId only) and the page
+        # is one screen deep — a first-class path, not a degraded one, so it
+        # stays healthy; the extraction tag tells callers what they got.
+        extraction = "zone"
     if parsed["status"] == ssr.ParseStatus.OK_LDJSON_ONLY:
         # The widget state was unreadable but schema.org markup carried the first
         # screen — usable, with fewer fields and only the subscriber price.
@@ -413,9 +469,30 @@ async def yandex_card(
     if ctx is not None:
         await ctx.info(f"yandex_card: product_id={pid}")
 
-    url = f"{SITE_BASE}/product/{pid}"
+    url = ssr.card_url(pid)
     html = await _fetch_html(url, "yandex_card", ctx)
     parsed = ssr.parse_card(html)
+    if parsed["status"] == ssr.ParseStatus.EMPTY_PRODUCT_SHELL:
+        # Tri-state doctrine (precedent: taobao's login-wall handling): the page
+        # arrived but carries no product at all — the known field families did
+        # not change shape, they are absent. Live-verified 2026-09-13: the
+        # product was the first hit of its own search while its card answered as
+        # a hollow frame (pageId market:product, zero product state) over
+        # anonymous HTTP and as SmartCaptcha in a real browser. That is degraded
+        # serving or a delisted product — inconclusive and retryable, never
+        # parser_drift, which would page a maintainer about parsers that are
+        # fine. not_found stays reserved for what Yandex itself reports as gone
+        # (HTTP 404 above); a 200 frame with no not-found marker proves nothing.
+        raise_tool_error(
+            TransportDownError(
+                f"yandex_card: empty_product_shell for id={pid} — Yandex served the product "
+                "page frame (pageId market:product) with zero product state, no schema.org "
+                "Product and no captcha/not-found markers: degraded serving or a delisted "
+                "product; the parsers are not implicated",
+                provider="yandex",
+                status_code=200,
+            )
+        )
     _guard_parse_status(parsed["status"], "yandex_card")
 
     if not parsed.get("title"):
@@ -497,7 +574,12 @@ async def yandex_selfcheck(ctx: Context | None = None) -> YandexSelfcheckRespons
 
     Never raises ToolError: each probe catches its own failures — transport
     blocks, geo restrictions and captchas map to inconclusive entries,
-    reached-but-unparseable pages to drift entries.
+    reached-but-unparseable pages to drift entries. Two verdicts are deliberately
+    NOT drift: a hollow product frame (page served, pageId market:product, zero
+    product state) is degraded serving and maps to inconclusive, and a search
+    that only answered through the ld+json fallback is weak (inconclusive,
+    reason ok_ldjson_only), never healthy — its probe id for the card is less
+    reliable and the SSR parsers were never exercised.
     """
     log_event("yandex_selfcheck.start")
     if ctx is not None:
@@ -505,18 +587,48 @@ async def yandex_selfcheck(ctx: Context | None = None) -> YandexSelfcheckRespons
 
     checks: dict[str, YandexSelfcheckEntry] = {}
     probe_product_id: str | None = None
+    probe_id_degraded = False
 
     # 1) Search — also supplies a live product id for the card probe, so the
     #    canary never depends on a hardcoded SKU that may be delisted.
     try:
         search = await yandex_search(query=_settings.selfcheck_query, page=1, limit=5, ctx=None)
         priced = [item for item in search.items if item.price_rub or item.price_with_plus]
-        healthy = bool(search.items) and bool(priced)
-        checks["search"] = YandexSelfcheckEntry(
-            state="healthy" if healthy else "drift",
-            detail=f"returned={search.returned} total={search.total_available} priced={len(priced)}",
-            notes=[] if healthy else ["search parsed but produced no priced items"],
-        )
+        # "ssr" and "zone" are both parser verdicts: the collection parser or the
+        # first-screen zone parser read real product state and the rows carry
+        # everyday prices. Only the schema.org fallback is weak.
+        if search.meta.extraction not in ("ssr", "zone"):
+            # ok_ldjson_only: the widget state was unreadable and the rows came
+            # from the schema.org fallback. A page the parsers could not read is
+            # not a parser verdict in either direction — report weak, never
+            # healthy. Live example 2026-09-13: search answered ld+json-only
+            # (every product collection missing from the SSR state) while the
+            # card for its first item arrived as a hollow frame.
+            probe_id_degraded = True
+            checks["search"] = YandexSelfcheckEntry(
+                state="inconclusive",
+                detail=(
+                    "ok_ldjson_only: widget state unreadable, schema.org fallback carried "
+                    f"returned={search.returned} total={search.total_available} priced={len(priced)}"
+                ),
+                notes=[
+                    "degraded extraction: everyday prices, seller and brand are unavailable",
+                    "the card probe id from this fallback is less reliable",
+                ],
+            )
+        else:
+            healthy = bool(search.items) and bool(priced)
+            notes = [] if healthy else ["search parsed but produced no priced items"]
+            if search.meta.extraction == "zone":
+                notes.append("first-screen zone payloads (collections absent): brand unavailable, one screen deep")
+            checks["search"] = YandexSelfcheckEntry(
+                state="healthy" if healthy else "drift",
+                detail=(
+                    f"extraction={search.meta.extraction} returned={search.returned} "
+                    f"total={search.total_available} priced={len(priced)}"
+                ),
+                notes=notes,
+            )
         if search.items:
             probe_product_id = search.items[0].product_id or None
     except Exception as exc:
@@ -533,18 +645,31 @@ async def yandex_selfcheck(ctx: Context | None = None) -> YandexSelfcheckRespons
         try:
             card = await yandex_card(product_id=probe_product_id, include_reviews=True, ctx=None)
             healthy = bool(card.title) and (card.price_rub is not None or card.price_with_plus is not None)
+            notes = [] if healthy else ["card parsed but carried no title or price"]
+            if probe_id_degraded:
+                notes.append("probe id came from the degraded ld+json search fallback")
             checks["card"] = YandexSelfcheckEntry(
                 state="healthy" if healthy else "drift",
                 detail=f"title={card.title[:30]!r} price={card.price_rub} reviews={len(card.reviews)}",
-                notes=[] if healthy else ["card parsed but carried no title or price"],
+                notes=notes,
             )
         except Exception as exc:
             text = _redact(str(exc))
             drift = "parser_drift" in text
+            if drift:
+                notes = ["SSR structure changed"]
+            elif "empty_product_shell" in text:
+                notes = [
+                    "product frame arrived hollow: degraded serving or a delisted product — parsers not implicated"
+                ]
+            else:
+                notes = ["transport or captcha — parsers untested"]
+            if probe_id_degraded:
+                notes.append("probe id came from the degraded ld+json search fallback")
             checks["card"] = YandexSelfcheckEntry(
                 state="drift" if drift else "inconclusive",
                 detail=text[:200],
-                notes=["SSR structure changed"] if drift else ["transport or captcha — parsers untested"],
+                notes=notes,
             )
     else:
         checks["card"] = YandexSelfcheckEntry(

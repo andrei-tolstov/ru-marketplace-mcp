@@ -22,19 +22,38 @@
 переменной сервер MPStats поднимается и честно отвечает `auth_missing`, а
 остальные двенадцать работают как работали.
 
-Весь доступ только на чтение. Двенадцать источников читают публичные эндпоинты
-каталога, которые дёргает официальный веб-клиент: ни в приватные, ни в
-административные разделы запросов нет. MPStats устроен иначе. Это приватный API
-браузерного плагина, доступный по вашей сессии, и потому единственное место, где
-проект обращается в аккаунтную зону. Что это означает для вашего аккаунта,
-описано в README.
+Весь доступ только на чтение. Двенадцать источников читают публичные
+эндпоинты каталога, которые дёргает официальный веб-клиент: пока opt-in не
+включён, ни в приватные, ни в административные разделы запросов нет. MPStats
+устроен иначе. Это приватный API браузерного плагина, доступный по вашей
+сессии, и потому единственное место, где проект обращается в аккаунтную зону
+без каких-либо условий. Что это означает для вашего аккаунта, описано в README.
+
+**Мегамаркет — второй вход в аккаунтную зону, только по явному opt-in.** По
+умолчанию его коннектор тоже читает лишь публичные эндпоинты: каталог,
+`url/parse` и публичный саггест адресов (`MEGAMARKET_ADDRESS`, Москва по
+умолчанию). Но он умеет прочитать и приватный `/profileService/address/list`
+из залогиненного Chrome-профиля оператора. Что при этом читается: список
+адресов профиля, флаг «адрес по умолчанию» и регион — этого достаточно, чтобы
+выбрать адрес, под который персонализуются цены и наличие. Делается это только
+при `MEGAMARKET_USE_PROFILE_ADDRESS=1`; по умолчанию флаг выключен, и
+включённый Мегамаркет публичных эндпоинтов не покидает. Смысл включения: цены
+и наличие совпадают с тем, что видит сам оператор, а не с городскими.
+Сырой `addressId` не покидает процесс. Раскрытие источника адреса в
+`_meta.warnings` (`address_source:profile|suggest|none`) имеет смысл только
+для состояний, меняющих цену: предупреждение о прочитанном профиле
+(и `_meta.healthy=false`) появляется, когда opt-in сработал, а
+`address_source:none` — когда адрес не разрешился вовсе. Обычный путь через
+саггест предупреждением не помечается и отвечает `_meta.healthy=true`.
 
 ## Единственная часть с реальным риском: уровень CDP
 
 Восемь источников читают через Chrome, который **вы** запустили и в котором залогинились
 сами, по DevTools Protocol. Taobao, Мегамаркет, DNS, Ситилинк и AliExpress — только так,
-анонимного уровня у них нет. Ozon и Авито уходят в браузер лишь когда анонимный
-уровень получил отказ. Lamoda берёт через браузер поиск, карточка идёт анонимно.
+анонимного уровня у них нет. Ozon и поиск Авито уходят в браузер лишь когда анонимный
+уровень получил отказ; карточки и продавцы Авито читаются только через браузер. Циан —
+тоже только через браузер. Lamoda берёт через браузер поиск, а карточку сначала
+просит анонимно по GraphQL и идёт в браузер, если получила отказ.
 
 **CDP даёт любому локальному процессу полный контроль над тем профилем, к которому он
 подключён**, включая все залогиненные в нём сессии. Это и есть угроза, которую нужно
@@ -53,7 +72,7 @@
 маркетплейсы. Подробности в [docs/CDP_SETUP.md](docs/CDP_SETUP.md).
 
 Wildberries, Яндекс Маркет и Детский мир к CDP не обращаются вообще. Если вам хватает
-их, уровень можно не включать — но тогда восемь остальных источников читать нечем.
+их, уровень можно не включать — но тогда девять остальных источников читать нечем.
 
 ## Прочие меры
 
@@ -99,7 +118,7 @@ Wildberries, Яндекс Маркет и Детский мир к CDP не об
 ## Юридическая заметка
 
 Условия маркетплейсов, как правило, запрещают неофициальный парсинг. К
-одиннадцати источникам проект обращается только по публичным эндпоинтам каталога,
+двенадцати источникам проект обращается только по публичным эндпоинтам каталога,
 в намеренно вежливом темпе, для личных исследований.
 
 MPStats требует отдельной оговорки: там вы рискуете оплаченным аккаунтом, а не
@@ -112,7 +131,9 @@ MPStats требует отдельной оговорки: там вы риск
 есть и официальный API: если аналитика нужна постоянно, он безопаснее.
 
 За своё использование, включая соблюдение местного законодательства и условий
-сервисов, отвечаете вы.
+сервисов, отвечаете вы. Чтение приватных эндпоинтов (MPStats по умолчанию,
+профильные адреса Мегамаркета при явном opt-in) — ваша ответственность в той
+же мере: это использование вашей сессии для чтения ваших же данных.
 
 ## Поддерживаемые версии
 
@@ -141,18 +162,35 @@ you supply yourself via env. It is never written into code or stored by the proj
 — there is still nothing to leak.
 
 All access is read-only. Twelve sources read the public catalog endpoints the official
-web clients use, touching no authenticated or administrative area. MPStats is the
-exception: a private browser-plugin API reached with your own session, and so the one
-place this project enters an account-gated zone. The README explains what that means
-for your account.
+web clients use, touching no authenticated or administrative area — unless you opt in.
+MPStats is the one place this project enters an account-gated zone by default: a
+private browser-plugin API reached with your own session. The README explains what
+that means for your account.
+
+**Megamarket is a second account-gated surface, and only on explicit opt-in.**
+By default its connector also stays on public endpoints: catalog reads,
+`url/parse`, and the public address suggest driven by `MEGAMARKET_ADDRESS`
+(Moscow by default). It *can* read the private `/profileService/address/list`
+endpoint from the operator's logged-in Chrome profile. What that touches: the
+profile's address list, the default-address flag, and the region — enough to
+pick the address prices and availability are personalized to. It happens only
+with `MEGAMARKET_USE_PROFILE_ADDRESS=1`; the flag defaults to off, so an
+enabled Megamarket never leaves public endpoints. The point of opting in:
+prices and availability match what the operator themself sees, not city-level
+ones. The raw `addressId` never leaves the process. Source disclosure in
+`_meta.warnings` (`address_source:profile|suggest|none`) is reserved for the
+states that change the prices: a profile-read notice (and `_meta.healthy=false`)
+when the opt-in fired, and `address_source:none` when nothing resolved. The
+ordinary suggest path adds no address warning and answers `_meta.healthy=true`.
 
 ## The one part that carries real risk: the CDP tier
 
-Eight sources run their fetches inside a Chrome instance **you** started and logged
-into, over the DevTools Protocol. Taobao, Megamarket, DNS, Citilink and AliExpress work no other
-way — they have no anonymous tier. Ozon and Avito fall back to the browser only after
-the anonymous tier is refused. Lamoda splits the difference: search goes through the
-browser, the product card does not.
+Nine sources run their fetches inside a Chrome instance **you** started and logged
+into, over the DevTools Protocol. Taobao, Megamarket, DNS, Citilink, AliExpress and Cian work no other
+way — they have no anonymous tier. Ozon and Avito search fall back to the browser only after
+the anonymous tier is refused; Avito cards and sellers always read the page there. Lamoda
+splits the difference: search goes through the browser, the product card tries anonymous
+GraphQL first and the browser only when that is refused.
 
 **CDP grants any local process full control of the profile it is attached to**,
 including every session logged into that profile. That is the threat to understand
@@ -172,7 +210,7 @@ marketplaces there and nothing else. Full detail:
 [docs/CDP_SETUP.md](docs/CDP_SETUP.md).
 
 Wildberries, Yandex Market and Detsky Mir never touch CDP. If those three cover your
-needs, leave the tier off — but the other eight sources cannot be read without it.
+needs, leave the tier off — but the other nine sources cannot be read without it.
 
 ## Other hardening in place
 
@@ -228,7 +266,9 @@ moves you toward a block, and a blocked account is not refunded (clause 5.2). Th
 service also has an official API, which is the safer route for sustained use.
 
 You are responsible for your own use, including compliance with local law and the
-relevant terms.
+relevant terms. Reading private endpoints — MPStats by default, Megamarket's profile
+address list when explicitly opted in — is your responsibility in the same measure:
+it is your session being used to read your own data.
 
 ## Supported versions
 

@@ -48,11 +48,13 @@ everyone.
 `mcp-core` exists so that adding a marketplace means writing fetch and parse logic
 and nothing else.
 
-### `errors` — one taxonomy, eight codes
+### `errors` — one taxonomy, nine codes
 
 Every failure maps to `auth_missing`, `rate_limited`, `timeout`, `transport_down`,
-`parser_drift`, `bad_request`, `permission_denied`, or `not_found`, each carrying a
-`retryable` flag. Tools raise `ToolError` with a JSON body, so an agent can decide
+`parser_drift`, `bad_request`, `permission_denied`, `challenge_required`, or
+`not_found`, each carrying a `retryable` flag. `challenge_required` is the one a
+CDP caller meets most often: the page loaded but a wall stands in front of the data,
+and it is retryable once the wall is cleared. Tools raise `ToolError` with a JSON body, so an agent can decide
 whether to retry without parsing prose.
 
 The distinction that matters most: **`transport_down` means "we were refused",
@@ -92,6 +94,22 @@ holds a browser. `probe_session()` health-checks the session for operator-facing
 diagnostics without raising.
 
 Playwright is imported lazily, so a tier-1-only connector never pays for it.
+
+Lamoda cards try HTTP GraphQL first (tier 1). A non-200 response or
+`httpx.TransportError` triggers exactly one in-page GraphQL POST through the
+operator's Chrome over CDP (tier 2); successful fallback reads report
+`tier_used: graphql_cdp`, while HTTP 200 skips CDP. The dated reason is the
+2026-10-12 307 loop from GraphQL over HTTPS: following redirects does not fix
+that refusal. Lamoda search continues to use Chrome.
+
+Avito search keeps HTTP impersonation with CDP fallback; cards and seller
+profiles read rendered pages over CDP with the same pacing and allowed hosts.
+On 2026-10-12 `/web/1/js/items` ignored `itemId` and `userId`, returning the same
+generic catalog (`totalCount: 1500`) for different sellers. Cards parse schema.org
+Product plus the seller block's reputation/profile link; seller reads accept
+`/brands/<hash>`, `/user/<hash>/profile` or bare ids (32 hex characters select
+`brands`, other ids `user`). Unavailable `active_items` remains `None`. The canary
+chains search → card → seller profile without changing public response fields.
 
 ### `resilience` — tolerant readers
 
@@ -198,7 +216,7 @@ session, so a crafted path must never become a request for a personal endpoint.
 
 ## Testing
 
-1315 offline tests, no network required. Three flavours:
+2302 offline tests, no network required. Three flavours:
 
 **Unit tests** for pure logic — coercion, merging, ranking, cross-platform process
 handling.
@@ -215,7 +233,7 @@ which has neither a Russian-friendly IP nor a logged-in browser. Including them
 would produce noise instead of signal.
 
 Coverage is branch-measured over the sixteen packages' source and enforced at
-a 70 % floor. `scripts/check_coverage_floor.py` measures the offline suite and
+an 80 % floor (raised from 70 % in October 2026, with the total at 83 %). `scripts/check_coverage_floor.py` measures the offline suite and
 compares it against that floor — the coverage analogue of
 `check_test_count.py`, so a quiet regression surfaces where the change was made
 rather than only in a distant CI run.

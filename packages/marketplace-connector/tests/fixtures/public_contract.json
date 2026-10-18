@@ -201,6 +201,7 @@
         "metro": {},
         "newbuilding_name": {},
         "offer_id": {},
+        "photo_urls": {},
         "photos": {},
         "price_history": {},
         "price_period": {},
@@ -413,6 +414,37 @@
       "type": "object"
     }
   },
+  "compare_browser_snapshot": {
+    "output": {
+      "type": "object"
+    },
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "handoff_id": {
+          "maxLength": 80,
+          "minLength": 16,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "type": "string"
+        },
+        "include_image": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "handoff_id"
+      ],
+      "type": "object"
+    }
+  },
   "compare_prices": {
     "output": {
       "properties": {
@@ -487,11 +519,67 @@
     "parameters": {
       "additionalProperties": false,
       "properties": {
+        "expected_identity": {
+          "anyOf": [
+            {
+              "properties": {
+                "brand": {
+                  "default": "",
+                  "type": "string"
+                },
+                "gtin": {
+                  "default": "",
+                  "type": "string"
+                },
+                "model": {
+                  "default": "",
+                  "type": "string"
+                },
+                "mpn": {
+                  "default": "",
+                  "type": "string"
+                },
+                "native_product_id": {
+                  "default": "",
+                  "type": "string"
+                },
+                "source": {
+                  "default": "",
+                  "type": "string"
+                },
+                "variant_attributes": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "expected_price_rub": {
           "anyOf": [
             {
               "minimum": 0,
               "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expected_variant_id": {
+          "anyOf": [
+            {
+              "maxLength": 100,
+              "minLength": 1,
+              "type": "string"
             },
             {
               "type": "null"

@@ -18,6 +18,7 @@ class MarketOffer(BaseModel):
 
     source: str = Field(default="", description="Marketplace the offer came from (wildberries, yandex_market, ozon).")
     product_id: str = Field(default="", description="Marketplace-native product id, for a follow-up card lookup.")
+    variant_id: str = Field(default="", description="Sellable variant/SKU id when the source exposes one separately.")
     title: str = Field(default="", description="Product title as the marketplace names it.")
     brand: str = Field(default="", description="Brand name, when reported.")
     seller: str = Field(default="", description="Seller/shop name, when reported.")
@@ -85,8 +86,26 @@ class SourceOutcome(BaseModel):
         description="ok, blocked (anti-bot or rate limit), timeout, error, or not_installed.",
     )
     detail: str = Field(default="", description="Human-readable outcome detail; the error text when it failed.")
+    warnings: list[str] = Field(
+        default_factory=list, description="Native diagnostics; successful access can still return degraded data."
+    )
     offers_returned: int = Field(default=0, description="How many offers this marketplace contributed.")
     elapsed_ms: int = Field(default=0, description="Round-trip time for this marketplace, in milliseconds.")
+    error_code: str | None = Field(default=None, description="Structured connector error code, if known.")
+    retryable: bool = Field(
+        default=False, description="Retry may succeed; user action must be completed first if required."
+    )
+    requires_user_action: bool = Field(
+        default=False, description="Pause retries for this source until browser action completes."
+    )
+    challenge_type: str | None = Field(default=None, description="captcha, login, or login_or_captcha when known.")
+    handoff_expires_at: str | None = Field(
+        default=None,
+        description="UTC expiry when the challenged tab is retained; repeat the same request after action.",
+    )
+    handoff_id: str | None = Field(
+        default=None, description="Opaque same-session handle for an optional browser snapshot."
+    )
 
 
 class CompareResponse(BaseModel):

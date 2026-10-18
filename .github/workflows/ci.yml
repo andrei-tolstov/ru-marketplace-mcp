@@ -12,8 +12,14 @@ on:
     - cron: "0 3 * * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # The nightly canary runs on this same ref as every push to main, so the group
+  # has to carry the event name: otherwise a routine commit cancels the canary —
+  # which reports nothing when cancelled, it just stops existing — and the canary
+  # cancels a merge verification. Scheduled runs are never cancelled; superseded
+  # push and pull-request runs still cancel each other. See
+  # scripts/test_ci_concurrency.py, which fails if this contract is dropped.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
   # Prove the committed uv.lock rather than re-resolving in CI. With "1" every
@@ -84,6 +90,19 @@ jobs:
         # audit that fixed it was adding tests of its own.
         run: uv run python scripts/check_test_count.py
 
+      - name: Fixture pins describe their fixtures
+        # A provenance file pins the bytes it describes, and nothing checked
+        # that the pin still matched. This is why the stale citilink and avito
+        # pins are visible - and quarantined with dated reasons - instead of silent.
+        run: uv run python scripts/check_provenance.py
+
+      - name: MCP wire-cost baseline
+        # Keep the model-facing surface measurable. A schema expansion over the
+        # stored baseline is a review signal, not an invisible context-cost
+        # regression. Latency is intentionally reported by the probe but is not
+        # gated because hosted runner load is variable.
+        run: uv run python scripts/mcp_wire.py compare-mcp decision-mcp marketplace-mcp --baseline work/performance/wire-baseline.json --max-token-regression-percent 10
+
       - name: One version, everywhere
         # A release version is written down in seventy-two places. Preparing
         # 1.2.1 moved fourteen pyproject.toml files and left thirteen
@@ -117,7 +136,7 @@ jobs:
           node-version: 22
 
       - name: Install jsdom
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -135,6 +154,9 @@ jobs:
         # Live and CDP tests are excluded: CI has no Russian-friendly IP and no
         # logged-in browser, so including them would produce noise, not signal.
         run: uv run pytest -q -m "not live and not cdp"
+
+      - name: Operational gate regression tests
+        run: uv run pytest -q scripts
 
   coverage:
     name: Coverage (ubuntu, py3.12)
@@ -161,11 +183,12 @@ jobs:
         # suite without coverage. Deselects live/cdp so the measured percentage
         # matches the offline suite the floor was derived from.
         #
-        # Measured branch-coverage total on the offline suite was 77.74%; the
-        # 70% floor sits a couple of points below so unrelated churn does not
-        # break the build while the number still ratchets up. --cov reads its
+        # Measured branch-coverage total on the offline suite was 83.2% at
+        # v2.5.1 (77.74% when the floor was introduced at 70%); the 80% floor
+        # sits a few points below so unrelated churn does not break the build
+        # while the number still ratchets up. --cov reads its
         # source/omit (and branch=true) from [tool.coverage.run] in pyproject.toml.
-        run: uv run pytest -q -m "not live and not cdp" --cov --cov-report=term-missing --cov-fail-under=70
+        run: uv run pytest -q -m "not live and not cdp" --cov --cov-report=term-missing --cov-fail-under=80
 
   smoke:
     name: Server smoke test
@@ -200,7 +223,7 @@ jobs:
               "ozon": 3,
               "detmir": 3,
               "yandex": 2,
-              "compare": 3,
+              "compare": 4,
               "avito": 3,
               "taobao": 2,
               "megamarket": 2,

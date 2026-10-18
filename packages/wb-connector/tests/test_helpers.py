@@ -1,8 +1,10 @@
 import asyncio
 import json
+import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -569,12 +571,13 @@ def test_wb_search_warns_when_no_result_has_a_price(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_wb_search_rate_limit_is_surfaced_not_masked_by_fallback(monkeypatch):
+@pytest.mark.parametrize("err", [None, "HTTP 429"])
+def test_wb_search_rate_limit_is_surfaced_not_masked_by_fallback(monkeypatch, err):
     """A 429 from v9 must raise, not silently degrade to the stale-id path."""
 
     async def fake_safe_get_text(client, url):
         if "v9/search" in url:
-            return 429, "", None
+            return 429, "", err
         raise AssertionError("a 429 must not trigger the fallback")
 
     async def no_wait():
@@ -590,6 +593,272 @@ def test_wb_search_rate_limit_is_surfaced_not_masked_by_fallback(monkeypatch):
         assert payload["retryable"] is True
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_wb_search_v9_refusal_never_calls_legacy_path(monkeypatch, status_code):
+    """#101: a refused primary search is an error, not stale legacy data."""
+    calls = []
+
+    async def fake_safe_get_text(client, url):
+        calls.append(url)
+        assert "v9/search" in url
+        return status_code, "", None
+
+    async def forbidden_fallback(*args, **kwargs):
+        pytest.fail("a v9 refusal must not call the legacy path")
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        monkeypatch.setattr(server, "_search_via_search_goods", forbidden_fallback)
+        with pytest.raises(ToolError) as excinfo:
+            await server.wb_search("x")
+        payload = _tool_error_payload(excinfo)
+        assert payload["error"] == "transport_down"
+        assert payload["provider"] == "wb"
+        assert payload["status_code"] == status_code
+        assert f"search.wb.ru v9 refused (HTTP {status_code})" in payload["message"]
+        assert "not falling back to the stale legacy id path" in payload["message"]
+        assert len(calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_wb_search_v9_html_wall_never_calls_legacy_path(monkeypatch):
+    """#101: HTTP 200 does not make an anti-bot HTML wall a search answer."""
+    wall = "<!doctype html><html><body>Angie: access denied</body></html>"
+    assert server._is_edge_wall(wall)
+    calls = []
+
+    async def fake_safe_get_text(client, url):
+        calls.append(url)
+        assert "v9/search" in url
+        return 200, wall, None
+
+    async def forbidden_fallback(*args, **kwargs):
+        pytest.fail("a v9 HTML wall must not call the legacy path")
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        monkeypatch.setattr(server, "_search_via_search_goods", forbidden_fallback)
+        with pytest.raises(ToolError) as excinfo:
+            await server.wb_search("x")
+        payload = _tool_error_payload(excinfo)
+        assert payload["error"] == "transport_down"
+        assert payload["provider"] == "wb"
+        assert payload["status_code"] == 200
+        assert "search.wb.ru v9 refused (HTML wall, HTTP 200)" in payload["message"]
+        assert "not falling back to the stale legacy id path" in payload["message"]
+        assert len(calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_wb_search_v9_http_500_still_calls_legacy_path(monkeypatch):
+    """#101: non-refusal failures must keep the existing fallback."""
+    fallback_calls = []
+
+    async def fake_safe_get_text(client, url):
+        assert "v9/search" in url
+        return 500, "", None
+
+    async def fake_fallback(query, dest, page, ctx):
+        fallback_calls.append((query, dest, page, ctx))
+        return [{"id": 123, "name": "x", "brand": "b", "sizes": [], "totalQuantity": 0}], 42
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        monkeypatch.setattr(server, "_search_via_search_goods", fake_fallback)
+        result = await server.wb_search("x")
+        data = result.model_dump()
+        assert fallback_calls == [("x", server.WB_DEFAULT_DEST, 1, None)]
+        assert data["count"] == 1
+        assert data["items"][0]["nm_id"] == 123
+        assert data["total_ids"] == 42
+        assert data["page_size"] == 30
+        assert any("fallback" in warning for warning in data["meta"]["warnings"])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("endpoint", ["search_goods", "fallback_enrich"])
+@pytest.mark.parametrize(
+    "status_code, body",
+    [
+        (401, ""),
+        (403, ""),
+        (200, "<!doctype html><html><body>Angie: access denied</body></html>"),
+    ],
+)
+def test_wb_search_legacy_refusal_is_not_no_results(monkeypatch, endpoint, status_code, body):
+    """#101: refused ids or enrichment must not look like a successful empty search."""
+    calls = []
+
+    async def fake_safe_get_text(client, url):
+        calls.append(url)
+        if "v9/search" in url:
+            return 500, "", None
+        if "search-goods" in url:
+            if endpoint == "search_goods":
+                return status_code, body, None
+            return 200, json.dumps([123]), None
+        assert "card.wb.ru/cards/v4/detail" in url
+        assert endpoint == "fallback_enrich"
+        return status_code, body, None
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        with pytest.raises(ToolError) as excinfo:
+            await server.wb_search("x")
+        payload = _tool_error_payload(excinfo)
+        assert payload["error"] == "transport_down"
+        assert payload["provider"] == "wb"
+        assert payload["status_code"] == status_code
+        expected_request = "search-goods ids" if endpoint == "search_goods" else "card.wb.ru enrichment"
+        assert f"legacy {expected_request} request refused" in payload["message"]
+        assert f"HTTP {status_code}" in payload["message"]
+        if status_code == 200:
+            assert "HTML wall" in payload["message"]
+        assert len(calls) == (2 if endpoint == "search_goods" else 3)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("endpoint", ["search_goods", "fallback_enrich"])
+def test_wb_search_legacy_429_html_is_not_a_refusal(monkeypatch, endpoint):
+    """A 429 carrying an HTML body is rate limiting, as on v9 — not a transport_down wall."""
+    wall = "<!doctype html><html><body>Angie: too many requests</body></html>"
+
+    async def fake_safe_get_text(client, url):
+        if "v9/search" in url:
+            return 500, "", None
+        if "search-goods" in url:
+            return (429, wall, None) if endpoint == "search_goods" else (200, json.dumps([123]), None)
+        return 429, wall, None
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        with pytest.raises(ToolError) as excinfo:
+            await server.wb_search("x")
+        payload = _tool_error_payload(excinfo)
+        assert payload["error"] == "rate_limited"
+        assert payload["status_code"] == 429
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("endpoint", ["search_goods", "fallback_enrich"])
+@pytest.mark.parametrize(
+    "reply, expected",
+    [
+        ((500, "", None), "transport_down"),
+        ((429, "", "HTTP 429"), "rate_limited"),
+        ((None, None, "connection failed"), "transport_down"),
+        ((200, "not JSON", None), "parser_drift"),
+        ((200, "{}", None), "parser_drift"),
+        ((200, "null", None), "parser_drift"),
+        ((200, '{"products": [null]}', None), "parser_drift"),
+    ],
+)
+def test_wb_search_failed_fallback_is_not_empty(monkeypatch, endpoint, reply, expected):
+    async def fake_safe_get_text(client, url):
+        if "v9/search" in url:
+            return 500, "", None
+        if "search-goods" in url and endpoint == "fallback_enrich":
+            return 200, json.dumps([123]), None
+        return reply
+
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+    monkeypatch.setattr(server, "_polite_wait", no_wait)
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(server.wb_search("x"))
+    assert _tool_error_payload(excinfo)["error"] == expected
+
+
+@pytest.mark.parametrize("endpoint", ["search_goods", "fallback_enrich"])
+def test_wb_search_fallback_http_exception_is_not_empty(monkeypatch, endpoint):
+    async def fake_safe_get_text(client, url):
+        if "v9/search" in url:
+            return 500, "", None
+        if "search-goods" in url and endpoint == "fallback_enrich":
+            return 200, json.dumps([123]), None
+        raise httpx.ConnectError("connection failed")
+
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+    monkeypatch.setattr(server, "_polite_wait", no_wait)
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(server.wb_search("x"))
+    assert _tool_error_payload(excinfo)["error"] == "transport_down"
+
+
+@pytest.mark.parametrize("body", ["not JSON", "{}", '{"products": null}'])
+def test_wb_search_primary_drift_survives_fallback_outage(monkeypatch, body):
+    async def fake_safe_get_text(client, url):
+        return (200, body, None) if "v9/search" in url else (500, "", None)
+
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+    monkeypatch.setattr(server, "_polite_wait", no_wait)
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(server.wb_search("x"))
+    assert _tool_error_payload(excinfo)["error"] == "parser_drift"
+
+
+def test_wb_search_unrecoverable_fallback_ids_without_positive_empty_are_drift(monkeypatch):
+    async def fake_safe_get_text(client, url):
+        return (500, "", None) if "v9/search" in url else (200, json.dumps([True, {"id": "²"}]), None)
+
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+    monkeypatch.setattr(server, "_polite_wait", no_wait)
+    with pytest.raises(ToolError) as excinfo:
+        asyncio.run(server.wb_search("x"))
+    assert _tool_error_payload(excinfo)["error"] == "parser_drift"
+
+
+@pytest.mark.parametrize("body, total", [('{"products": [], "total": 0}', 0), ('{"products": []}', None)])
+def test_wb_search_positive_empty_survives_fallback_failure(monkeypatch, body, total):
+    async def fake_safe_get_text(client, url):
+        return (200, body, None) if "v9/search" in url else (500, "", None)
+
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+    monkeypatch.setattr(server, "_polite_wait", no_wait)
+    result = asyncio.run(server.wb_search("x"))
+    assert result.status == "no_results"
+    assert result.total_ids == total
 
 
 def test_wb_search_returns_no_results_when_both_paths_are_empty(monkeypatch):
@@ -1928,3 +2197,421 @@ def test_known_quantities_produce_no_stock_warning():
     warnings = server._aggregate_offer_warnings(items)
 
     assert not any(w.startswith("stock_unknown") for w in warnings), warnings
+
+
+# --- WB's TLS-fingerprint gate ------------------------------------------------
+#
+# card.wb.ru, search.wb.ru and catalog.wb.ru answer httpx's handshake with a 403
+# HTML page while serving curl_cffi a 200 for the identical URL. These pin which
+# hosts take which transport, because getting the split wrong is silent: a gated
+# host on httpx makes wb_card fail outright and wb_search degrade to the stale
+# legacy ids, which look like an answer.
+
+_GATED_URLS = {
+    "card": "https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&locale=ru&nm=5535522",
+    "search": "https://search.wb.ru/exactmatch/ru/common/v9/search?appType=1&query=x&resultset=catalog",
+    "catalog": "https://catalog.wb.ru/catalog/electronic17/v4/catalog?appType=1&subject=515",
+}
+
+_UNGATED_URLS = {
+    # Same apex as the gated hosts and deliberately NOT impersonated: the split is
+    # a host list, not a suffix rule, and this is the case that proves it.
+    "feedbacks": "https://feedbacks2.wb.ru/feedbacks/v2/1002173489",
+    "search_goods": "https://search-goods.wildberries.ru/search?query=x&dest=-1257786",
+    "basket": "https://basket-01.wbbasket.ru/vol55/part5535/5535522/info/ru/card.json",
+}
+
+
+@pytest.mark.parametrize("url", sorted(_GATED_URLS.values()))
+def test_gated_hosts_read_through_the_impersonated_transport(monkeypatch, url):
+    seen = []
+
+    async def fake_impersonated(target):
+        seen.append(target)
+        return 200, '{"products": []}', None
+
+    async def forbidden_budgeted(*args, **kwargs):
+        raise AssertionError("a gated host must not use the default client")
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "_impersonated_get_text", fake_impersonated)
+        monkeypatch.setattr(server, "get_text_budgeted", forbidden_budgeted)
+        status, text, err = await server._safe_get_text(object(), url)
+        assert (status, text, err) == (200, '{"products": []}', None)
+        assert seen == [url]
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+@pytest.mark.parametrize("url", sorted(_UNGATED_URLS.values()))
+def test_ungated_hosts_keep_the_budgeted_transport(monkeypatch, url):
+    seen = []
+
+    async def fake_budgeted(client, target, **kwargs):
+        seen.append(target)
+        return 200, "[]", None
+
+    async def forbidden_impersonation(target):
+        raise AssertionError("an ungated host must keep the retry/budget path")
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "get_text_budgeted", fake_budgeted)
+        monkeypatch.setattr(server, "_impersonated_get_text", forbidden_impersonation)
+        status, text, err = await server._safe_get_text(object(), url)
+        assert (status, text, err) == (200, "[]", None)
+        assert seen == [url]
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+class _FakeCurlResponse:
+    """A curl_cffi response as the streaming reader sees it."""
+
+    def __init__(self, status_code: int, body: bytes, content_type: str = "application/json") -> None:
+        self.status_code = status_code
+        self.headers = {"content-type": content_type}
+        self._body = body
+
+    def iter_content(self, chunk_size: int = 0):
+        return [self._body]
+
+
+def test_impersonated_refusal_stays_a_transport_error(monkeypatch):
+    """A refusal through the impersonated path is still a block, never drift."""
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        _clear_wb_cache()
+        body = b"<html><title>403 Forbidden</title><hr><center>Angie</center></html>"
+        monkeypatch.setattr(
+            server,
+            "curl_requests",
+            SimpleNamespace(get=lambda url, **kw: _FakeCurlResponse(403, body, "text/html")),
+        )
+
+        # Both transports are stubbed, because the gated hosts now fall back:
+        # without this the fallback would make a real request.
+        async def fake_budgeted(client, target, **kwargs):
+            return 403, body.decode(), None
+
+        monkeypatch.setattr(server, "get_text_budgeted", fake_budgeted)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        with pytest.raises(ToolError) as excinfo:
+            await server.wb_card([5535522])
+        payload = _tool_error_payload(excinfo)
+        assert payload["error"] == "transport_down"
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+def test_impersonated_timeout_uses_the_shared_error_vocabulary(monkeypatch):
+    def slow_get(url, **kwargs):
+        time.sleep(5)
+        raise AssertionError("unreachable: the wall clock should fire first")
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "curl_requests", SimpleNamespace(get=slow_get))
+        monkeypatch.setattr(server, "WB_WALL_TIMEOUT", 0.01)
+        status, text, err = await server._impersonated_get_text(_GATED_URLS["card"])
+        assert (status, text) == (0, None)
+        assert err.startswith("timeout:")
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+def test_impersonated_body_cap_refuses_an_oversized_payload(monkeypatch):
+    """A body past the cap must be refused, and the reader must stop there.
+
+    ``pulled`` is the point of this test: if the reader materialised the whole
+    body first and compared lengths afterwards, every chunk would be pulled and
+    the cap would bound nothing.
+    """
+    pulled: list[int] = []
+
+    class Grower(_FakeCurlResponse):
+        def iter_content(self, chunk_size: int = 0):
+            for index in range(64):
+                pulled.append(index)
+                yield b"x" * 1024
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "curl_requests", SimpleNamespace(get=lambda url, **kw: Grower(200, b"")))
+        monkeypatch.setattr(server, "MAX_BODY_BYTES", 4096)
+        status, text, err = await server._impersonated_get_text(_GATED_URLS["card"])
+        assert status == 200
+        assert text is None
+        assert "exceeded" in err
+        assert len(pulled) <= 6, f"the reader drained the body instead of stopping at the cap ({len(pulled)} chunks)"
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+# ------------------------------------------- refusal accounting and the canary ----
+
+_MARKER_REFUSAL_STREAK = "5 refusals in a row"
+
+
+class _RecordingPacer:
+    """Stands in for the real Pacer so a test can see what it was told."""
+
+    def __init__(self, hint: str = "") -> None:
+        self.events: list[str] = []
+        self._hint = hint
+
+    def record_refusal(self) -> None:
+        self.events.append("refusal")
+
+    def record_success(self) -> None:
+        self.events.append("success")
+
+    def rotation_hint(self) -> str:
+        return self._hint
+
+    async def wait(self, min_gap: float | None = None) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(401, "refusal"), (403, "refusal"), (429, "refusal"), (200, "success"), (500, None)],
+)
+def test_refusals_reach_the_pacer_and_other_statuses_do_not(monkeypatch, status, expected):
+    """The pacer is told about refusals — and only about refusals.
+
+    Nothing in this connector used to call ``record_refusal``, so the longer
+    post-refusal gap and the rotation hint could never fire for the one source
+    that answers 403.
+    """
+    pacer = _RecordingPacer()
+
+    async def fake_budgeted(client, target, **kwargs):
+        return status, "body", None
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "get_text_budgeted", fake_budgeted)
+        monkeypatch.setattr(server, "_pacer", pacer)
+        await server._safe_get_text(object(), _UNGATED_URLS["feedbacks"])
+        assert (pacer.events or [None])[-1] == expected
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+def test_a_transient_fault_is_not_counted_as_a_refusal(monkeypatch):
+    """A timeout is our problem or the network's, not a signal to slow down."""
+    pacer = _RecordingPacer()
+
+    async def fake_budgeted(client, target, **kwargs):
+        return 0, None, "timeout: no response within 15s"
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "get_text_budgeted", fake_budgeted)
+        monkeypatch.setattr(server, "_pacer", pacer)
+        await server._safe_get_text(object(), _UNGATED_URLS["feedbacks"])
+        assert pacer.events == []
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+def test_a_refusal_streak_reaches_the_operator(monkeypatch):
+    """Once refusals stop looking like bad luck, the error must say so.
+
+    ``_safe_get_text`` is stubbed rather than the transport beneath it: ``card.wb.ru``
+    is an impersonated host, so stubbing only ``get_text_budgeted`` would let this
+    test make a real request.
+    """
+    pacer = _RecordingPacer(hint=f"{_MARKER_REFUSAL_STREAK} — this is a standing block, not a blip.")
+
+    async def no_wait():
+        return None
+
+    async def fake_safe_get_text(client, url):
+        return 403, "<html>blocked</html>", None
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        monkeypatch.setattr(server, "_pacer", pacer)
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        with pytest.raises(ToolError) as excinfo:
+            await server.wb_card([5535522])
+        payload = _tool_error_payload(excinfo)
+        assert _MARKER_REFUSAL_STREAK in payload["message"]
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+def _healthy_selfcheck_responder(v9_response):
+    """Every canary probe healthy except v9, which answers with ``v9_response``."""
+
+    async def responder(client, url):
+        if "card.wb.ru" in url:
+            return (
+                200,
+                json.dumps(
+                    {
+                        "products": [
+                            {
+                                "id": server._SELFCHECK_NM,
+                                "name": "x",
+                                "sizes": [{"price": {"product": 10000, "basic": 12000}}],
+                                "reviewRating": 4.5,
+                                "feedbacks": 1,
+                                "totalQuantity": 1,
+                            }
+                        ]
+                    }
+                ),
+                None,
+            )
+        if "feedbacks2.wb.ru" in url:
+            return 200, json.dumps({"feedbacks": [{"text": "ok", "productValuation": 5}]}), None
+        if "search-goods.wildberries.ru" in url:
+            return 200, json.dumps([server._SELFCHECK_NM]), None
+        if "search.wb.ru" in url:
+            return v9_response
+        if "wbbasket.ru" in url:
+            return 200, json.dumps({"imt_id": server._SELFCHECK_IMT}), None
+        return 500, "", "unexpected url"
+
+    return responder
+
+
+@pytest.mark.parametrize(
+    ("v9_response", "expected_state"),
+    [
+        ((403, "", None), "inconclusive"),
+        ((429, "", None), "inconclusive"),
+        ((0, None, "timeout: no response within 15s"), "inconclusive"),
+        ((200, "not json", None), "drift"),
+        ((200, json.dumps({"products": []}), None), "drift"),
+        ((200, json.dumps({"products": [{"name": "x"}]}), None), "drift"),
+        ((200, json.dumps({"products": [{"id": 1, "salePriceU": 1000}]}), None), "healthy"),
+    ],
+)
+def test_the_canary_sees_the_primary_search_path(monkeypatch, v9_response, expected_state):
+    """A refused v9 must show up: the fallback used to answer in its place.
+
+    When v9 was refused, wb_search fell through to the legacy id list and
+    returned unrelated products with prices attached, while this canary stayed
+    green because its other probe reads search-goods and never touched v9.
+    """
+
+    async def no_wait():
+        return None
+
+    async def scenario():
+        monkeypatch.setattr(server, "_safe_get_text", _healthy_selfcheck_responder(v9_response))
+        monkeypatch.setattr(server, "_polite_wait", no_wait)
+        data = (await server.wb_selfcheck()).model_dump()
+        assert data["checks"]["search_v9"]["state"] == expected_state
+        return data
+
+    data = asyncio.run(scenario())
+    if expected_state == "inconclusive" and v9_response[0] in (401, 403, 429):
+        notes = " ".join(data["checks"]["search_v9"]["notes"])
+        assert "primary search path" in notes, "an operator must be able to see WHICH path was refused"
+
+
+def test_an_edge_wall_is_not_a_success_and_is_not_cached(monkeypatch):
+    """A wall served with HTTP 200 is a refusal, and must never reach the cache.
+
+    A cached wall would keep failing for the whole TTL — the failure mode the
+    cache's own docstring names — and the pacer would never hear about the block.
+    """
+    pacer = _RecordingPacer()
+
+    async def fake_budgeted(client, target, **kwargs):
+        return 200, "<html><title>blocked</title><center>Angie</center></html>", None
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "get_text_budgeted", fake_budgeted)
+        monkeypatch.setattr(server, "_pacer", pacer)
+        url = _UNGATED_URLS["feedbacks"]
+        status, _text, _err = await server._safe_get_text(object(), url)
+        assert status == 200, "the status is passed through untouched"
+        assert pacer.events == ["refusal"], "a wall is a refusal, not a success"
+        assert server._cache.get(url) is None, "a wall must not be cached"
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+@pytest.mark.parametrize(
+    ("impersonated_result", "budgeted_result", "expected"),
+    [
+        # impersonation produced no status at all -> the fallback answers
+        ((0, None, "timeout: no response within 15.0s"), (200, "body", None), (200, "body", None)),
+        # impersonation got a wall page with HTTP 200 -> not a read, fall back
+        ((200, "<html>wall</html>", None), (200, "body", None), (200, "body", None)),
+        # impersonation got a real status, the fallback got nothing -> keep the status
+        ((403, "<html>wall</html>", None), (0, None, "timeout: x"), (403, "<html>wall</html>", None)),
+        # both refused -> the refusal is reported, not swallowed
+        ((403, "<html>wall</html>", None), (403, "<html>wall</html>", None), (403, "<html>wall</html>", None)),
+    ],
+)
+def test_a_gated_host_falls_back_when_impersonation_fails(monkeypatch, impersonated_result, budgeted_result, expected):
+    """Preferring impersonation must not mean depending on it.
+
+    Measured on 2026-09-21: from one address the impersonated path timed out on
+    the primary search endpoint while the shared client answered it with 130 KB,
+    and from the next address card.wb.ru refused both. A host list cannot encode
+    that, so the gated hosts try impersonation and then fall back once.
+    """
+
+    async def fake_impersonated(url):
+        return impersonated_result
+
+    async def fake_budgeted(client, target, **kwargs):
+        return budgeted_result
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "_impersonated_get_text", fake_impersonated)
+        monkeypatch.setattr(server, "get_text_budgeted", fake_budgeted)
+        result = await server._safe_get_text(object(), _GATED_URLS["card"])
+        assert result == expected
+
+    asyncio.run(scenario())
+    _clear_wb_cache()
+
+
+def test_a_canary_probe_cannot_be_answered_from_its_own_cache(monkeypatch):
+    """`search_v9: healthy` must describe a read that just happened.
+
+    Every probe uses a fixed URL, and a cached 200 was observed satisfying a probe
+    while a live request to the same endpoint was timing out.
+    """
+    calls: list[str] = []
+
+    async def fake_safe_get_text(client, url):
+        calls.append(url)
+        return 200, "live body", None
+
+    async def scenario():
+        _clear_wb_cache()
+        monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+        url = _GATED_URLS["card"]
+        server._cache.set(url, (200, "stale body", None))
+        _status, text, _err = await server._fresh_get_text(object(), url)
+        assert text == "live body", "the probe was answered from the cache"
+        assert calls == [url]
+
+    asyncio.run(scenario())
+    _clear_wb_cache()

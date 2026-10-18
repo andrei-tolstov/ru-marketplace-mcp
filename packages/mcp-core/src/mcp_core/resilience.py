@@ -21,6 +21,29 @@ turns two fingerprints into missing/added paths. Connector selfchecks currently
 do a live parse-smoke instead; wiring them onto stored baselines is the next
 step, not something already in place.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Normalize drifting upstream values and report structural health honestly.
+# SCOPE: Offline coercion, validation, shape fingerprints and tri-state canaries.
+# DEPENDS: stdlib math,re,collections.abc,typing; no network or persistence.
+# LINKS: M-RESILIENCE; M-DOM; M-MODELS.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# first_present: Bind the first non-null alias while preserving false/empty values.
+# deep_first: Search nested dict/list payloads within a depth bound.
+# coerce_int: Parse unambiguous counts or return None.
+# coerce_price: Accept positive finite prices and reject ambiguous display blobs.
+# coerce_rating: Normalize ratings on the 0..5 scale.
+# validate_offer: Report missing or contradictory normalized offer fields.
+# validate_review_block: Check returned counts and sufficiently large text samples.
+# attach_meta: Mutate a result with source, health and warnings.
+# widget_prefixes: Strip volatile numeric widget suffixes.
+# shape_signature: Fingerprint bounded paths/types independently of values.
+# diff_keys: Return sorted missing and added structural keys.
+# selfcheck_entry: Build healthy/drift/inconclusive sub-check metadata.
+# selfcheck_result: Aggregate verdicts and inject omitted required checks.
+# flatten_text: Reduce display fields to usable scalar text, never container repr.
+# price_from_texts: Pick the first candidate that parses as a real price.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
@@ -80,9 +103,9 @@ def coerce_int(value: Any) -> int | None:
     Returns None (never 0) when no digits are present, so a missing count never
     masquerades as a real zero in comparisons.
 
-    Audit 2026-06-01 (CONFIRMED, but these helpers are not yet wired into any
-    connector — latent contract): a string carrying a sign, a decimal point, or
-    a K/M/тыс magnitude suffix is AMBIGUOUS — digit-concatenation silently
+    Audit 2026-06-01 (CONFIRMED; the helper is now used across the connectors):
+    a string carrying a sign, a decimal point, or a K/M/тыс magnitude suffix
+    is AMBIGUOUS — digit-concatenation silently
     fabricates a plausible-but-wrong count ('1.2K'->12, '-3'->3). Such inputs now
     return None (fail loud) rather than a fabricated integer. Pure grouped digits
     ('24 088', '1 057') still parse, because thousands separators are unambiguous.
@@ -302,6 +325,9 @@ def validate_offer(item: dict, *, require_title: bool = True) -> list[str]:
     return warnings
 
 
+REVIEW_TEXT_DRIFT_MIN_SAMPLE = 10
+
+
 def validate_review_block(block: dict) -> list[str]:
     """Invariant checks on a reviews response (ozon_reviews / wb_reviews shape)."""
     warnings: list[str] = []
@@ -320,12 +346,17 @@ def validate_review_block(block: dict) -> list[str]:
     if returned is not None and reviews is not None and returned != len(reviews):
         warnings.append(f"returned_mismatch: returned={returned} != len(reviews)={len(reviews)}")
 
-    if reviews:
+    # Rating-only reviews are normal on mass-market cards, so a small all-empty
+    # sample says nothing about the parser (issue #111). Only a sample of at
+    # least REVIEW_TEXT_DRIFT_MIN_SAMPLE reviews with zero text is drift.
+    if reviews and len(reviews) >= REVIEW_TEXT_DRIFT_MIN_SAMPLE:
         texts_present = sum(
             1 for r in reviews if (r.get("text") or r.get("positive") or r.get("cons") or r.get("pros"))
         )
         if texts_present == 0:
-            warnings.append("all_review_texts_empty: every returned review has empty text (content key drift)")
+            warnings.append(
+                f"all_review_texts_empty: none of {len(reviews)} returned reviews has text (content key drift?)"
+            )
 
     if score is not None and not (0 <= score <= 5):
         warnings.append(f"score_out_of_range: rating_score={score} outside 0..5")

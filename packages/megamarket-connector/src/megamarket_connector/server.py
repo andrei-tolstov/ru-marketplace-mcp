@@ -19,12 +19,30 @@ from your Chrome first — its verdict tells you which case you are in.
 
 NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Expose Megamarket search and cards from its mobile catalog API.
+# SCOPE: Read-only browser POSTs; delivery context; explicit ServicePipe refusals.
+# INVARIANTS: Reject failed API envelopes before success pacing/cache; preserve empty results.
+# DEPENDS: FastMCP; mcp_core CDP/cache/pacing; models_output; settings.
+# LINKS: M-MEGAMARKET; M-COMPARE; M-MARKETPLACE; packages/megamarket-connector/tests.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# _post: Issue browser API reads; cache only envelopes without explicit failures.
+# _raise_failed_envelope: Distinguish not-found, refusal/service failures and malformed errors.
+# _resolve_address_id: Resolve delivery context; profile access requires opt-in.
+# _final_catalog_url: Resolve the catalog redirect before reading search parameters.
+# _is_ip_block: Detect code-7 ServicePipe refusals rather than treating them as data.
+# megamarket_search: Normalize paginated mobile catalog offers and drift states.
+# megamarket_card: Read one goods envelope with nullable price/stock fields.
+# megamarket_selfcheck: Diagnose operator transport/parser health; not an MCP tool.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
 import asyncio
 import datetime
 import json
+import os
 import re
 import urllib.parse
 from typing import Annotated, Any
@@ -60,7 +78,7 @@ from megamarket_connector.settings import get_settings
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.5.3"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://megamarket.ru"
@@ -84,6 +102,26 @@ _PAGE_SIZE = 44
 _ADDRESS = _settings.address
 _address_id: str | None = None
 _address_resolved = False
+_address_cache: dict[str, tuple[str | None, str | None]] = {}
+# Which of the three sources produced the address: "profile" | "suggest" |
+# "none". _address_warnings() turns it into _meta warnings only for the states
+# that change what the prices mean (the opted-in profile read, or nothing
+# resolved); the default suggest path stays warning-free and healthy. The raw
+# addressId itself never leaves the process.
+_address_source: str | None = None
+# Bound at import from settings and consulted at call time through this module
+# global — the same seam _min_gap uses — so a test can flip the privacy posture
+# without rebuilding the settings object.
+_USE_PROFILE_ADDRESS = _settings.use_profile_address
+
+
+def _address_cache_key() -> str:
+    """Return a non-secret identity for the currently attached Chrome profile."""
+    host = os.environ.get("CHROME_CDP_HOST", "127.0.0.1").strip()
+    port = os.environ.get("CHROME_CDP_PORT", "9222").strip()
+    profile = os.environ.get("CHROME_SCRAPING_PROFILE", "").strip()
+    return f"{host}:{port}|{profile}"
+
 
 mcp = FastMCP(
     name="megamarket-connector",
@@ -194,6 +232,48 @@ def _blocked_error(detail: str = "") -> TransportDownError:
     return TransportDownError(message, status_code=403)
 
 
+def _raise_failed_envelope(payload: dict[str, Any], what: str) -> None:
+    """Reject API failures before they can be cached or parsed as catalog data."""
+    errors = payload.get("errors") or payload.get("error")
+    if payload.get("success") is not False and not errors:
+        return
+
+    entries = errors if isinstance(errors, list) else [errors] if errors else []
+    if any(not isinstance(entry, (dict, str)) for entry in entries):
+        raise_tool_error(ParserDriftError(f"Megamarket {what} failure carried malformed errors"))
+    entries = [payload, *entries]
+    codes: list[str] = []
+    messages: list[str] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            messages.append(entry)
+            continue
+        for key in ("code", "status", "statusCode"):
+            value = entry.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                codes.append(str(value))
+        for key in ("message", "error", "description"):
+            value = entry.get(key)
+            if isinstance(value, str):
+                messages.append(value)
+    detail = _redact("; ".join([*codes, *messages]))
+
+    # Preserve the existing ServicePipe/HTTP refusal verdict and pacing even
+    # when the API puts the refusal inside an HTTP-200 errors envelope.
+    if (
+        any(_is_ip_block(entry) for entry in entries)
+        or _is_ip_block({"error": detail})
+        or any(code in ("401", "403", "429") for code in codes)
+    ):
+        _pacer.record_refusal()
+        raise_tool_error(_blocked_error(detail))
+    if "404" in codes or re.search(r"(?:^|[\s_-])not[\s_-]*found\b|не\s+найден", detail, re.IGNORECASE):
+        raise_tool_error(NotFoundError(f"Megamarket {what} not found: {detail[:200]}"))
+    if not detail.strip():
+        raise_tool_error(ParserDriftError(f"Megamarket {what} reported failure without recognizable error details"))
+    raise_tool_error(TransportDownError(f"Megamarket {what} API failed: {detail[:200]}"))
+
+
 async def _post(api_path: str, body: dict[str, Any], ctx: Context | None, what: str) -> dict[str, Any]:
     """POST through CDP and unwrap the envelope, mapping failures to the taxonomy."""
     cache_key = f"{api_path}:{json.dumps(body, sort_keys=True, ensure_ascii=False)}"
@@ -220,6 +300,7 @@ async def _post(api_path: str, body: dict[str, Any], ctx: Context | None, what: 
         raise_tool_error(_blocked_error(str(payload)[:200]))
     if not isinstance(payload, dict):
         raise_tool_error(ParserDriftError(f"{what} payload is not a JSON object"))
+    _raise_failed_envelope(payload, what)
     _pacer.record_success()
     _cache.set(cache_key, payload)
     return payload
@@ -238,33 +319,55 @@ async def _resolve_address_id(ctx: Context | None) -> str | None:
     Two sources, in order of trust:
 
     1. the logged-in profile's default address — exactly what the operator sees
-       on the site, so prices and availability match their own experience;
+       on the site, so prices and availability match their own experience. This
+       reads a PRIVATE, account-gated endpoint (/profileService/address/list),
+       so it happens only when the operator explicitly opted in via
+       MEGAMARKET_USE_PROFILE_ADDRESS (default off). Off, the connector never
+       touches the profile;
     2. the configured city (MEGAMARKET_ADDRESS, Moscow by default) through the
        public suggest endpoint, which works without a session.
+
+    The winning source is recorded in the module-level ``_address_source``
+    ("profile" | "suggest" | "none") and logged through ``megamarket.address``.
+    _address_warnings() discloses it in _meta warnings only for the states that
+    deserve attention (the opted-in profile read, or nothing resolved). The raw
+    addressId itself never leaves the process.
 
     A failure here is not fatal: the caller still gets a search, and the empty
     result is reported honestly rather than as a mysterious zero.
     """
-    global _address_id, _address_resolved
-    if _address_resolved:
+    global _address_id, _address_resolved, _address_source
+    cache_key = _address_cache_key()
+    cached = _address_cache.get(cache_key)
+    if cached is not None:
+        _address_id, _address_source = cached
+        _address_resolved = True
         return _address_id
 
     _address_resolved = True
-    try:
-        profile = await _post("/profileService/address/list", {}, ctx, "address list")
-        addresses = profile.get("profileAddresses")
-        if isinstance(addresses, list) and addresses:
-            preferred = next(
-                (a for a in addresses if isinstance(a, dict) and a.get("isDefault") is True),
-                next((a for a in addresses if isinstance(a, dict)), None),
-            )
-            if preferred and preferred.get("addressId"):
-                _address_id = str(preferred["addressId"])
-                log_event("megamarket.address", source="profile", region=str(preferred.get("region") or "")[:40])
-                return _address_id
-    except Exception as exc:
-        # Not logged in, or the profile endpoint refused. Fall through.
-        log_event("megamarket.address_profile_failed", error=_redact(str(exc))[:120])
+    if _USE_PROFILE_ADDRESS:
+        try:
+            profile = await _post("/profileService/address/list", {}, ctx, "address list")
+            addresses = profile.get("profileAddresses")
+            if isinstance(addresses, list) and addresses:
+                preferred = next(
+                    (a for a in addresses if isinstance(a, dict) and a.get("isDefault") is True),
+                    next((a for a in addresses if isinstance(a, dict)), None),
+                )
+                if preferred and preferred.get("addressId"):
+                    _address_id = str(preferred["addressId"])
+                    _address_source = "profile"
+                    _address_cache[cache_key] = (_address_id, _address_source)
+                    log_event("megamarket.address", source="profile", region=str(preferred.get("region") or "")[:40])
+                    return _address_id
+        except Exception as exc:
+            # Not logged in, or the profile endpoint refused. Fall through.
+            log_event("megamarket.address_profile_failed", error=_redact(str(exc))[:120])
+    else:
+        log_event(
+            "megamarket.address_profile_skipped",
+            reason="MEGAMARKET_USE_PROFILE_ADDRESS is off; the profile endpoint is not read",
+        )
 
     try:
         suggested = await _post(
@@ -278,17 +381,48 @@ async def _resolve_address_id(ctx: Context | None) -> str | None:
             candidate = items[0].get("addressId")
             if candidate:
                 _address_id = str(candidate)
+                _address_source = "suggest"
+                _address_cache[cache_key] = (_address_id, _address_source)
                 log_event("megamarket.address", source="suggest", query=_ADDRESS[:40])
                 return _address_id
     except Exception as exc:
         log_event("megamarket.address_suggest_failed", error=_redact(str(exc))[:120])
 
+    _address_source = "none"
+    _address_cache[cache_key] = (None, _address_source)
     log_event("megamarket.address_unresolved", configured=_ADDRESS[:40])
     return None
 
 
 # url/parse returns filter bounds as words; the search endpoint wants the codes.
 _FILTER_TYPE_CODES = {"EXACT_VALUE": 0, "LEFT_BOUND": 1, "RIGHT_BOUND": 2}
+
+
+def _address_warnings() -> list[str]:
+    """Disclose the address provenance only when it changes what the prices mean.
+
+    A warning flips ``_meta.healthy`` to false (attach_meta: an empty warnings
+    list is the healthy case), so this list is reserved for the two states an
+    agent should act on before quoting a price: the opted-in profile read —
+    a private account endpoint was used and the prices are personalized — and
+    ``none``, where offers are priced for no address at all. The default
+    suggest path is the normal healthy case: no warning, ``_meta.healthy``
+    stays true, and the source remains observable through the
+    ``megamarket.address`` log event and the documented behavior.
+    """
+    source = _address_source
+    if source == "profile":
+        return [
+            "address_source:profile — prices and availability are personalized to the "
+            "operator's default profile address",
+            "profile_address_read: opted in via MEGAMARKET_USE_PROFILE_ADDRESS; the private "
+            "account endpoint /profileService/address/list was read to resolve the default address",
+        ]
+    if source == "none":
+        return [
+            "address_source:none — no delivery address could be resolved, so offers are priced for no address at all"
+        ]
+    return []
 
 
 # Resolved search params are cached per query for the process lifetime. Each
@@ -410,9 +544,12 @@ def _search_body(
     paging is ``limit``/``offset`` rather than a page number, and
     ``requestVersion`` selects the response shape.
 
-    ``addressId`` stays None: this connector has no address concept, so
-    Megamarket answers for a default region. The prices are therefore
-    default-region prices, which is worth knowing before quoting them.
+    ``addressId`` carries the resolved delivery address when one was resolved
+    (profile default when opted in, otherwise the public suggest result for
+    MEGAMARKET_ADDRESS). Without any address Megamarket answers listingSize>0
+    with an empty items array — see _resolve_address_id — so _address_warnings
+    flags in the response's _meta warnings the states that change what the
+    prices mean (the profile read, or nothing resolved at all).
     """
     page = max(1, int(page))
     body: dict[str, Any] = {
@@ -522,10 +659,19 @@ async def megamarket_search(
 ) -> MegamarketSearchResponse:
     """Search the Megamarket catalog via the mobile API, inside the operator's Chrome.
 
+    Prices and availability depend on the delivery address: by default a public
+    city-level one (MEGAMARKET_ADDRESS); only with MEGAMARKET_USE_PROFILE_ADDRESS=1
+    does the logged-in profile's default address win — that reads a private
+    account endpoint, and the response says so in _meta.warnings
+    ("address_source:profile" plus a "profile_address_read" notice).
+    _meta.healthy is false only for that profile read and for
+    "address_source:none" (no delivery address resolved); the default suggest
+    path answers healthy with no address warning.
+
     ## Return Format
 
     MegamarketSearchResponse: {status, query, tier_used, count, total_count,
-    items[], meta}. price_rub is None when absent — never 0.
+    items[], _meta}. price_rub is None when absent — never 0.
 
     ## Error Format
 
@@ -545,7 +691,7 @@ async def megamarket_search(
         items_raw, total, container_found = _parse_items(payload)
         listing_size = R.coerce_int(payload.get("listingSize"))
         items = [MegamarketSearchItemOut(**it) for it in items_raw]
-        warnings: list[str] = []
+        warnings: list[str] = _address_warnings()
         # A 200 that parses to nothing is the dangerous case: without these two
         # guards the tool reports success with zero offers, and compare_prices
         # then calls the comparison complete while Megamarket has silently
@@ -569,15 +715,20 @@ async def megamarket_search(
             # exist and no *offer* came back. That happens when the request
             # carries no delivery address: every offer has its own
             # deliveryPossibilities, and none can be delivered to nowhere.
+            # The message names the address *source*, never the raw addressId —
+            # the same privacy boundary the success-path serialization keeps.
             raise_tool_error(
                 TransportDownError(
                     f"Megamarket matched {listing_size} products but returned no offers"
                     + (f" (collection {resolved.get('collectionId')})" if resolved.get("collectionId") else "")
                     + (
                         " and no delivery address could be resolved. Set MEGAMARKET_ADDRESS to a city, "
-                        "or log the scraping-profile Chrome into Megamarket so its default address is used."
+                        "or set MEGAMARKET_USE_PROFILE_ADDRESS=1 so the logged-in profile's default "
+                        "address is used."
                         if not address_id
-                        else f" for address {address_id}. The address may not be deliverable for this query; "
+                        else " for the resolved delivery address (address_source:"
+                        + (_address_source or "unknown")
+                        + "). The address may not be deliverable for this query; "
                         "try another city via MEGAMARKET_ADDRESS."
                     )
                 )
@@ -626,7 +777,7 @@ async def megamarket_card(
     ## Return Format
 
     MegamarketCardResponse: {status, item_id, title, price_rub, old_price_rub,
-    is_available, rating, rating_count, url, tier_used, meta}.
+    is_available, rating, rating_count, url, tier_used, _meta}.
 
     ## Error Format
 

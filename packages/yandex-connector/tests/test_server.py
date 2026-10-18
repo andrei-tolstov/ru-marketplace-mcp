@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from fastmcp.exceptions import ToolError
-from yandex_connector import server
+from yandex_connector import server, ssr
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -76,8 +76,32 @@ async def test_search_returns_products_with_both_prices(monkeypatch):
     assert result.meta.extraction == "ssr"
     first = result.items[0]
     assert first.brand == "Tuvio"
-    assert first.price_rub == 22600.0
+    # Re-read from this same Jul 2026 capture after the 2026-09-11 price
+    # mapping fix: 16724 is the displayed cart price; the old pin (22600) was
+    # the struck-through base price and now rides in price_old_rub.
+    assert first.price_rub == 16724.0
     assert first.price_with_plus == 16222.0
+    assert first.price_old_rub == 22600.0
+
+
+async def test_search_quotes_the_cart_price_not_the_strike_through(monkeypatch):
+    """End-to-end regression for the 2026-09-11 price-semantics fix.
+
+    The SERP state carries the struck-through initialPrice in offer.price.value
+    and baobabPayload.price (3698 for the Tuvio TKP2117S); the price any buyer
+    pays is the snippet's cart price (2293), verified the same day against the
+    product card. yandex_search must surface the latter as price_rub and keep
+    the former in price_old_rub.
+    """
+    stub_html(monkeypatch, {"/search": load("search_kettle.html")})
+
+    result = await server.yandex_search(query="чайник")
+
+    tuvio = next(item for item in result.items if item.product_id == "5929806453")
+    assert tuvio.price_rub == 2293.0
+    assert tuvio.price_old_rub == 3698.0
+    assert tuvio.price_with_plus == 2247.0
+    assert tuvio.sku_id == "5929806452"
 
 
 async def test_search_honours_the_limit(monkeypatch):
@@ -180,7 +204,7 @@ async def test_search_rejects_too_short_queries(monkeypatch, bad_query):
 
 
 async def test_card_returns_prices_rating_breakdown_and_reviews(monkeypatch):
-    stub_html(monkeypatch, {"/product/763970960": load("card_washer.html")})
+    stub_html(monkeypatch, {"/card/x/763970960": load("card_washer.html")})
 
     card = await server.yandex_card(product_id="763970960")
 
@@ -194,7 +218,7 @@ async def test_card_returns_prices_rating_breakdown_and_reviews(monkeypatch):
 
 
 async def test_card_can_skip_reviews(monkeypatch):
-    stub_html(monkeypatch, {"/product/": load("card_washer.html")})
+    stub_html(monkeypatch, {"/card/": load("card_washer.html")})
 
     card = await server.yandex_card(product_id="763970960", include_reviews=False)
 
@@ -204,7 +228,7 @@ async def test_card_can_skip_reviews(monkeypatch):
 
 async def test_card_warns_when_a_resale_offer_has_no_rating(monkeypatch):
     """Real and common — the warning explains it rather than implying 0 stars."""
-    stub_html(monkeypatch, {"/product/": load("card_no_rating.html")})
+    stub_html(monkeypatch, {"/card/": load("card_no_rating.html")})
 
     card = await server.yandex_card(product_id="1912483624")
 
@@ -232,10 +256,50 @@ async def test_card_rejects_non_numeric_ids(monkeypatch, bad_id):
 
 
 async def test_card_raises_drift_when_no_title_is_found(monkeypatch):
-    stub_html(monkeypatch, {"/product/": '<html><body>"mainPrice" but no product</body></html>'})
+    stub_html(monkeypatch, {"/card/": '<html><body>"mainPrice" but no product</body></html>'})
 
     with pytest.raises(ToolError) as excinfo:
         await server.yandex_card(product_id="1")
+
+    assert error_payload(excinfo.value)["error"] == "parser_drift"
+
+
+async def test_card_empty_shell_is_not_reported_as_parser_drift(monkeypatch):
+    """The live 2026-09-13 hollow frame: a retryable upstream condition.
+
+    Reporting it as parser_drift would page a maintainer about parsers that
+    are fine (and fail `marketplace-mcp doctor` with exit 1), while the real
+    state of the world is Yandex serving the product frame with no product
+    inside — degraded serving or a delisting, neither of which is a code bug.
+    """
+    stub_html(monkeypatch, {"/card/": load("card_empty_shell.html")})
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.yandex_card(product_id="4315891968")
+
+    payload = error_payload(excinfo.value)
+    assert payload["error"] == "transport_down"
+    assert payload["retryable"] is True
+    assert "empty_product_shell" in payload["message"]
+    assert "4315891968" in payload["message"]
+
+
+async def test_card_renamed_field_families_still_report_drift(monkeypatch):
+    """Drift stays reserved for pages that reshaped known field families.
+
+    Same missing title as the hollow frame, but the collections are populated:
+    the state is there and no longer understood — a maintainer must look.
+    """
+    html = (
+        '<noframes data-apiary="patch">{"collections":{"pageParams":{"current":'
+        '{"id":"current","pageId":"market:product","params":{"productId":"42"}}}}}</noframes>'
+        '<noframes data-apiary="patch">{"collections":{"titleV2":{"t1":{"titleRenamed":"Товар"}},'
+        '"price":{"p1":{"mainPriceRenamed":{}}}}}</noframes>'
+    )
+    stub_html(monkeypatch, {"/card/": html})
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.yandex_card(product_id="42")
 
     assert error_payload(excinfo.value)["error"] == "parser_drift"
 
@@ -247,7 +311,7 @@ async def test_selfcheck_chains_search_into_card(monkeypatch):
     """The card probe uses an id from search, so no fixture SKU can go stale."""
     stub_html(
         monkeypatch,
-        {"/search": load("search_washer.html"), "/product/": load("card_washer.html")},
+        {"/search": load("search_washer.html"), "/card/": load("card_washer.html")},
     )
 
     result = await server.yandex_selfcheck()
@@ -292,12 +356,55 @@ async def test_selfcheck_skips_card_when_search_yields_no_id(monkeypatch):
     assert "skipped" in result.checks["card"].detail
 
 
+async def test_selfcheck_card_shell_is_inconclusive_not_drift(monkeypatch):
+    """Doctor must not page anyone (exit 1) over a hollow serving frame.
+
+    The 2026-09-13 canary reported drift_detected on exactly this page; the
+    product was alive in search the whole time and the parsers were fine.
+    """
+    stub_html(
+        monkeypatch,
+        {"/search": load("search_washer.html"), "/card/": load("card_empty_shell.html")},
+    )
+
+    result = await server.yandex_selfcheck()
+
+    assert result.checks["search"].state == "healthy"
+    assert result.checks["card"].state == "inconclusive"
+    assert "empty_product_shell" in result.checks["card"].detail
+    assert any("hollow" in note for note in result.checks["card"].notes)
+    assert result.status == "inconclusive"
+
+
+async def test_selfcheck_ldjson_only_search_is_weak_not_healthy(monkeypatch):
+    """A search read only through the schema.org fallback proves nothing about
+    the SSR parsers, and its card probe id inherits that weakness — report it
+    as inconclusive(ok_ldjson_only), never healthy (2026-09-13 canary gap)."""
+    html = """<html><body><script type="application/ld+json">
+    {"@type":"ItemList","itemListElement":[{"item":{"name":"X",
+     "url":"https://market.yandex.ru/product/763970960","offers":{"price":100}}}]}
+    </script></body></html>"""
+    stub_html(monkeypatch, {"/search": html, "/card/": load("card_washer.html")})
+
+    result = await server.yandex_selfcheck()
+
+    assert result.checks["search"].state == "inconclusive"
+    assert "ok_ldjson_only" in result.checks["search"].detail
+    assert result.checks["card"].state == "healthy"
+    assert any("degraded" in note for note in result.checks["card"].notes)
+    assert result.status == "inconclusive"
+
+
 def _drifted_values_search_html() -> str:
     """The washer capture with its title/price nodes renamed in the SSR state.
 
     This is what a live re-layout looks like: items keep their product ids
     (collection keys) but lose every title and price (state values). The real
     parser returns them as title '' / price None — verified, not assumed.
+    Since the 2026-09-11 price mapping fix the everyday price also lives in
+    ``baobabPayload.additionalPrices`` (the withDiscount entry), so the
+    simulated rename has to cover that node too — otherwise the fallback
+    chain would mask the drift this test exists to detect.
     """
     html = load("search_washer.html")
     return (
@@ -306,6 +413,7 @@ def _drifted_values_search_html() -> str:
         .replace('"actualPrice"', '"actualPriceZ"')
         .replace('"initialPrice"', '"initialPriceZ"')
         .replace('"oldPrice"', '"oldPriceZ"')
+        .replace('"additionalPrices"', '"additionalPricesZ"')
         .replace('"price"', '"priceZ"')
     )
 
@@ -505,3 +613,46 @@ async def test_limit_still_caps_a_page_without_duplicates(monkeypatch):
 
     assert result.returned == 4
     assert [item.product_id for item in result.items] == ["0", "1", "2", "3"]
+
+
+async def test_fetch_html_names_the_exception_when_httpx_carries_no_message(monkeypatch):
+    """An exception with an empty message must not produce an empty detail.
+
+    Observed live on 2026-09-21: the card probe surfaced ``"yandex_card: "`` with
+    nothing after the colon, which tells an operator nothing about which failure
+    it was and hides the difference between a timeout and a reset.
+    """
+    import httpx
+
+    async def fake_get(client, url, **kwargs):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(server, "get_text_with_retries", fake_get)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server._fetch_html("https://market.yandex.ru/product/1", "yandex_card", None)
+
+    payload = error_payload(excinfo.value)
+    assert payload["error"] == "transport_down"
+    assert "ReadTimeout" in payload["message"], payload["message"]
+    assert payload["message"].strip() != "yandex_card:"
+
+
+async def test_card_requests_the_card_path_not_the_retired_product_path(monkeypatch):
+    """#105: /product/{id} now answers with an empty frame; the card lives at /card/{slug}/{id}."""
+    seen: list[str] = []
+
+    async def capture(url: str, label: str, ctx=None) -> str:
+        seen.append(url)
+        return load("card_washer.html")
+
+    monkeypatch.setattr(server, "_fetch_html", capture)
+
+    await server.yandex_card(product_id="763970960", include_reviews=False)
+
+    assert seen == ["https://market.yandex.ru/card/x/763970960"]
+
+
+def test_fallback_card_url_uses_the_card_path():
+    assert ssr.card_url(42) == "https://market.yandex.ru/card/x/42"
+    assert ssr.card_url(42, "stiralnaya-mashina") == "https://market.yandex.ru/card/stiralnaya-mashina/42"

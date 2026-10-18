@@ -1,12 +1,12 @@
 [project]
 name = "drom-connector"
-version = "2.1.0"
+version = "2.5.3"
 description = "baza.drom.ru MCP connector — auto parts, tires, oils and classifieds via Chrome CDP and HTML/JSON-LD"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Vladimir-Human", email = "39053957+Vladimir-Human@users.noreply.github.com" }]
 dependencies = [
-    "mcp-core==2.1.0",
+    "mcp-core==2.5.3",
     "fastmcp>=3.4.6,<4",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",

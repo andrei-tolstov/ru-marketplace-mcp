@@ -10,8 +10,8 @@ One server mounting every installed connector as a namespaced toolset:
 `lamoda_*`, `dns_*`, `citilink_*`, `aliexpress_*`, `cian_*`, `mpstats_*` plus
 `compare_prices` / `compare_sources` and its own `marketplace_sources`. Tool
 names keep their prefixes, so habits and configs carry over — but the operator
-wires a single `marketplace` entry instead of fourteen. The server exposes 39
-tools: 38 mounted plus `marketplace_sources`. `mpstats_*` is the optional paid
+wires a single `marketplace` entry instead of fourteen. The server exposes 40
+tools: 39 mounted plus `marketplace_sources`. `mpstats_*` is the optional paid
 source: without `MPSTATS_MP_AUTH` its tools answer `auth_missing` while
 everything else is unaffected.
 
@@ -47,8 +47,21 @@ everything else is unaffected.
   `2`, never a `0`.
 
 ## Gotchas
+- Recovery-aware clients should read `source_outcomes.requires_user_action`
+  before scheduling retries. Keep answered sources visible, show the affected
+  marketplace and `challenge_type`, and retry that source after the browser
+  interaction completes. A challenge is not an empty product search. See the
+  compare-prices skill for the retry contract. `handoff_expires_at` confirms that
+  the source retained its tab; repeat the same operation in the same MCP session
+  after browser action and before that expiry. See docs/CDP_SETUP.md for opt-in
+  configuration and supported sources.
 - A source whose optional deps are missing is simply absent from the set —
   `marketplace_sources` says which and why.
+- Set `MARKETPLACE_SOURCES` on the unified server to mount only a comma-separated
+  subset (`wildberries,ozon,compare`); unset or blank keeps every source. The
+  aliases `wb`, `ym`/`yandex`, `detmir`, and `ali` work too. Unknown names fail
+  at startup instead of silently producing a partial server, and deselected
+  sources are reported with a `deselected` reason.
 - compare_prices ranks on everyday ruble prices; Taobao (CNY) is reported in
   `price_native` but never ranked against rubles.
 ## DSH activation

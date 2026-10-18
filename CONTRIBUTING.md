@@ -23,11 +23,17 @@ uv run pre-commit install
 ## Перед открытием pull request
 
 ```bash
+uv lock --check
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run mypy --platform win32
 uv run pytest -q -m "not live and not cdp"
 uv run python scripts/check_no_print.py
+uv run python scripts/check_test_count.py
+uv run python scripts/check_provenance.py
+uv run python scripts/check_versions.py
+uv run python scripts/mcp_wire.py compare-mcp decision-mcp marketplace-mcp \
+  --baseline work/performance/wire-baseline.json --max-token-regression-percent 10
 ```
 
 CI прогоняет то же самое на Ubuntu, Windows и macOS против Python 3.12 и 3.13.
@@ -77,6 +83,14 @@ POSIX-функции через `getattr` и держи ветку платфо�
 разметку: тогда изменение структуры на стороне маркетплейса всё равно всплывёт.
 Тесты, которым нужна сеть, помечай `@pytest.mark.live`, а браузерные —
 `@pytest.mark.cdp`. CI исключает и те, и другие.
+
+## GRACE
+
+GRACE (Graph-RAG Anchored Code Engineering) связывает требования
+(`.grace/context/requirements.xml`), граф модулей и потоков
+(`.grace/graph/index.xml`) и карту проверок (`.grace/verification/index.xml`).
+Контракты и карты функций находятся в комментариях рядом с кодом.
+Меняешь поведение → обнови контракт, граф и карту проверок в том же изменении.
 
 ## Сообщения о сломанном эндпоинте
 
@@ -132,11 +146,17 @@ uv run pre-commit install
 ## Before you open a PR
 
 ```bash
+uv lock --check
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run mypy --platform win32
 uv run pytest -q -m "not live and not cdp"
 uv run python scripts/check_no_print.py
+uv run python scripts/check_test_count.py
+uv run python scripts/check_provenance.py
+uv run python scripts/check_versions.py
+uv run python scripts/mcp_wire.py compare-mcp decision-mcp marketplace-mcp \
+  --baseline work/performance/wire-baseline.json --max-token-regression-percent 10
 ```
 
 CI runs the tests on Ubuntu, Windows and macOS against Python 3.12 and 3.13; lint,
@@ -186,6 +206,14 @@ agent sees, meaning error codes, warnings and field values.
 For HTML/SSR sources, capture a real page and trim it rather than inventing markup,
 so upstream structural changes still surface. Mark network tests
 `@pytest.mark.live` and browser tests `@pytest.mark.cdp`; CI excludes both.
+
+## GRACE
+
+GRACE (Graph-RAG Anchored Code Engineering) connects requirements
+(`.grace/context/requirements.xml`), the module and data-flow graph
+(`.grace/graph/index.xml`), and the verification map (`.grace/verification/index.xml`).
+Contracts and function maps live in comments next to the code.
+Changing behaviour → update the contract, graph and verification in the same change.
 
 ## Reporting a broken endpoint
 

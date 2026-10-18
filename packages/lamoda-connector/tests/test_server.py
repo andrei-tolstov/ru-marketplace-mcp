@@ -7,6 +7,10 @@ GraphQL product JSON, and the search-tile extraction from a rendered page.
 
 from __future__ import annotations
 
+import json
+from contextlib import asynccontextmanager
+
+import httpx
 import pytest
 from fastmcp.exceptions import ToolError
 from lamoda_connector import server
@@ -151,6 +155,50 @@ async def test_search_maps_zero_skus_to_parser_drift(monkeypatch):
         await server.lamoda_search("кроссовки")
 
 
+async def test_search_empty_visible_challenge_is_transport_down(monkeypatch):
+    _patch_render(
+        monkeypatch,
+        {
+            "title": "Lamoda",
+            "items": [],
+            "body_snippet": "Подтвердите, что вы не робот и пройдите проверку",
+        },
+    )
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.lamoda_search("кроссовки")
+    assert "challenge" in str(excinfo.value).lower()
+
+
+async def test_challenge_recovery_bypasses_failed_payload_cache(monkeypatch):
+    from mcp_core.cache import TTLCache
+
+    monkeypatch.setattr(server, "_cache", TTLCache(ttl_s=300))
+    reads = []
+
+    class Page:
+        async def evaluate(self, expression):
+            reads.append(expression)
+            payload = (
+                {"items": [], "body_snippet": "Подтвердите, что вы не робот"} if len(reads) == 1 else SEARCH_EXTRACTED
+            )
+            return json.dumps(payload)
+
+    @asynccontextmanager
+    async def open_page(url, wait_ms):
+        yield Page()
+
+    monkeypatch.setattr(server, "open_page", open_page)
+    with pytest.raises(ToolError) as excinfo:
+        await server.lamoda_search("кроссовки")
+    assert json.loads(str(excinfo.value))["error"] == "challenge_required"
+    assert len(server._cache) == 0
+    recovered = await server.lamoda_search("кроссовки")
+    assert recovered.count > 0
+    await server.lamoda_search("кроссовки")
+    assert len(reads) == 2  # the successful payload still uses the normal cache
+
+
 # ---------------------------------------------------------- lamoda_selfcheck ----
 
 
@@ -222,6 +270,31 @@ async def test_selfcheck_cries_shape_drift_when_the_price_family_vanishes(monkey
     assert any("price" in note for note in search.notes)
 
 
+async def test_selfcheck_price_shape_drift_survives_challenge_copy(monkeypatch):
+    """Visible challenge wording in product copy cannot suppress shape drift."""
+    _patch_graphql(monkeypatch, GRAPHQL_PRODUCT)
+    _patch_render(
+        monkeypatch,
+        {
+            "title": "Кроссовки — Lamoda",
+            "body_snippet": "Кроссовки с защитой от робота; пройти проверку размера",
+            "items": [
+                {
+                    "sku": "MP002XM1RMM3",
+                    "title": "Кроссовки без цены",
+                    "url": "https://www.lamoda.ru/p/mp002xm1rmm3/",
+                }
+            ],
+        },
+    )
+
+    result = await server.lamoda_selfcheck()
+
+    assert result.status == "drift_detected"
+    assert result.checks["search"].state == "drift"
+    assert result.checks["search"].reason == "shape_drift"
+
+
 # ------------------------------------------------------------------- helpers ----
 
 
@@ -261,11 +334,8 @@ async def test_a_graphql_error_block_is_reported_verbatim(monkeypatch):
 
     class FakeResponse:
         status_code = 200
-        content = b"{}"
-        text = "{}"
-
-        def json(self):
-            return {"errors": [{"message": 'Cannot query field "old_price" on type "Product".'}]}
+        text = json.dumps({"errors": [{"message": 'Cannot query field "old_price" on type "Product".'}]})
+        content = text.encode()
 
     class FakeClient:
         async def __aenter__(self):
@@ -301,11 +371,8 @@ async def test_the_graphql_request_carries_a_referer_for_the_sku(monkeypatch):
 
     class FakeResponse:
         status_code = 200
-        content = b"{}"
-        text = "{}"
-
-        def json(self):
-            return {"data": {"products": [{"sku": "MP002XM1RMM3", "name": "x", "price_amount": 100}]}}
+        text = json.dumps({"data": {"products": [{"sku": "MP002XM1RMM3", "name": "x", "price_amount": 100}]}})
+        content = text.encode()
 
     class FakeClient:
         async def __aenter__(self):
@@ -353,7 +420,11 @@ async def test_a_non_200_carries_a_body_preview(monkeypatch):
         async def post(self, url, json=None):
             return FakeResponse()
 
+    async def fake_cdp(query, ctx):
+        return 403, "blocked in Chrome"
+
     monkeypatch.setattr(server, "build_client", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(server, "_graphql_via_cdp", fake_cdp)
     server._cache._data.clear()
 
     with pytest.raises(ToolError) as excinfo:
@@ -405,11 +476,8 @@ REAL_BAD_FIELD = {"error": "Internal server error", "code": -32603}
 def _patch_graphql_response(monkeypatch, payload, status=200):
     class FakeResponse:
         status_code = status
-        content = b"{}"
-        text = "{}"
-
-        def json(self):
-            return payload
+        text = json.dumps(payload)
+        content = text.encode()
 
     class FakeClient:
         async def __aenter__(self):
@@ -476,3 +544,149 @@ async def test_the_standard_graphql_shape_still_works(monkeypatch):
     product = await server._graphql_card("X", None)
 
     assert product["name"] == "y"
+
+
+# ------------------------------------------------------- GraphQL CDP fallback ----
+
+
+async def test_card_graphql_307_falls_back_to_cdp(monkeypatch):
+    _patch_graphql_response(monkeypatch, {}, status=307)
+    opened = []
+    posted = []
+
+    class Page:
+        url = server.SITE_BASE + "/"
+
+        async def evaluate(self, expression, args=None):
+            if expression == server._JS_BODY_SNIPPET:
+                return "Каталог " * 300  # a normal, text-rich landing
+            posted.append(args)
+            assert expression == server._JS_POST
+            assert "credentials: 'include'" in expression
+            assert "res.body.getReader()" in expression
+            return json.dumps({"status": 200, "text": json.dumps(REAL_FOUND)})
+
+    @asynccontextmanager
+    async def open_page(url, wait_ms):
+        opened.append((url, wait_ms))
+        yield Page()
+
+    monkeypatch.setattr(server, "open_page", open_page)
+
+    result = await server.lamoda_card("MP002XM1RMM3")
+
+    assert result.title == "Куртка кожаная"
+    assert result.brand == "Finn Flare"
+    assert result.price_rub == 15724
+    assert result.old_price_rub == 18499
+    assert result.is_available is False
+    assert result.sizes[0].size == "48"
+    assert result.sizes[0].is_available is False
+    assert result.tier_used == "graphql_cdp"
+    assert opened == [(server.SITE_BASE + "/", 4000)]
+    assert posted == [
+        {
+            "url": server.GRAPHQL_URL,
+            "body": {"query": server._GRAPHQL_QUERY % json.dumps("MP002XM1RMM3")},
+            "cap": server.MAX_BODY_BYTES,
+        }
+    ]
+    # The same cache key/TTL serves either tier; retain the tier on cache hits.
+    cached = await server.lamoda_card("MP002XM1RMM3")
+    assert cached.tier_used == "graphql_cdp"
+    assert len(opened) == len(posted) == 1
+
+
+async def test_card_cdp_landing_on_the_challenge_page_is_challenge_required(monkeypatch):
+    """Live 2026-10-12: the landing stopped on /xpvnsulc/ and the POST timed out after 30 s."""
+    _patch_graphql_response(monkeypatch, {}, status=307)
+    posted = []
+
+    class Page:
+        url = server.SITE_BASE + "/xpvnsulc/?back_location=https%3A%2F%2Fwww.lamoda.ru%2F"
+
+        async def evaluate(self, expression, args=None):
+            if expression == server._JS_BODY_SNIPPET:
+                return ""
+            posted.append(args)
+            raise AssertionError("must not POST from a challenge page")
+
+    @asynccontextmanager
+    async def open_page(url, wait_ms):
+        yield Page()
+
+    monkeypatch.setattr(server, "open_page", open_page)
+
+    with pytest.raises(ToolError) as exc:
+        await server.lamoda_card("MP002XM1RMM3")
+
+    assert json.loads(str(exc.value))["error"] == "challenge_required"
+    assert posted == []
+
+
+async def test_card_graphql_200_skips_cdp(monkeypatch):
+    _patch_graphql_response(monkeypatch, REAL_FOUND)
+    calls = []
+
+    async def unexpected_cdp(query, ctx):
+        calls.append(query)
+        raise AssertionError("HTTP 200 must not open Chrome")
+
+    monkeypatch.setattr(server, "_graphql_via_cdp", unexpected_cdp)
+
+    result = await server.lamoda_card("MP002XM1RMM3")
+
+    assert result.title == "Куртка кожаная"
+    assert result.price_rub == 15724
+    assert result.tier_used == "graphql"
+    assert calls == []
+
+
+async def test_card_graphql_both_tiers_fail(monkeypatch):
+    _patch_graphql_response(monkeypatch, {}, status=307)
+    calls = []
+
+    async def blocked_cdp(query, ctx):
+        calls.append(query)
+        return 403, "blocked by Chrome policy"
+
+    monkeypatch.setattr(server, "_graphql_via_cdp", blocked_cdp)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.lamoda_card("MP002XM1RMM3")
+
+    error = json.loads(str(excinfo.value))
+    assert error["error"] == "transport_down"
+    assert "HTTP 307 over HTTPS" in error["message"]
+    assert "HTTP 403 via Chrome" in error["message"]
+    assert error["status_code"] == 403
+    assert len(calls) == 1
+    assert len(server._cache) == 0
+
+
+async def test_card_graphql_transport_error_falls_back_to_cdp(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            raise httpx.ConnectError("offline HTTPS transport failure")
+
+    async def fake_cdp(query, ctx):
+        calls.append(query)
+        return 200, json.dumps(REAL_FOUND)
+
+    monkeypatch.setattr(server, "build_client", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(server, "_graphql_via_cdp", fake_cdp)
+
+    result = await server.lamoda_card("MP002XM1RMM3")
+
+    assert result.title == "Куртка кожаная"
+    assert result.price_rub == 15724
+    assert result.tier_used == "graphql_cdp"
+    assert calls == [server._GRAPHQL_QUERY % json.dumps("MP002XM1RMM3")]

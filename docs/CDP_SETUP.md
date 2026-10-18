@@ -5,15 +5,15 @@ Some marketplaces refuse datacenter traffic outright. Ozon answers
 clears it. The reliable answer is not a better fingerprint — it is to run the fetch
 **inside a browser you already trust**, over the Chrome DevTools Protocol.
 
-Eight sources use this: Ozon, Avito, Taobao, Megamarket, Lamoda, DNS, Citilink
-and AliExpress.
-The split matters. Taobao, Megamarket, DNS, Citilink and AliExpress are
-**CDP-only** — no
-anonymous tier exists, so nothing reads from them without a logged-in Chrome. Ozon
-and Avito use CDP as a **tier-2 fallback**: tier 1 (TLS impersonation) usually works
+Nine sources use this: Ozon, Avito, Taobao, Megamarket, Lamoda, DNS, Citilink,
+AliExpress and Cian.
+The split matters. Taobao, Megamarket, DNS, Citilink, AliExpress and Cian are
+**CDP-only** — no anonymous tier exists, so nothing reads from them without a logged-in Chrome. Ozon
+and Avito search use CDP as a **tier-2 fallback**: tier 1 (TLS impersonation) usually works
 from a Russian residential IP, and CDP only kicks in when the anonymous tier is
-challenged. Lamoda is split — its card path is anonymous GraphQL, but search needs
-CDP. Wildberries, Yandex Market and Detsky Mir never touch it.
+challenged; Avito cards and seller profiles always read the rendered page in Chrome
+(since 2026-10-12). Lamoda is split — cards try anonymous GraphQL first and fall back
+to Chrome when it is refused (the 307 loop, 2026-10-12), search needs CDP. Wildberries, Yandex Market and Detsky Mir never touch it.
 
 ## Read this before you enable it
 
@@ -38,6 +38,36 @@ optional MPStats connector is the one exception — you supply `MPSTATS_MP_AUTH`
 yourself via env; it is never stored by the project either.)
 
 ## Setup
+
+### Optional challenge handoff
+
+Set `CHROME_CHALLENGE_HANDOFF_S=120` in the MCP server's environment to retain
+DOM-detected Lamoda search and Taobao search/card challenge tabs for up to two
+minutes. Default `0` disables retention; the hard maximum is 300 seconds, including
+initial browser attachment/navigation. A headed Chrome and an active MCP session
+are required. This mode does not solve CAPTCHA or log into accounts.
+
+An error with `handoff_expires_at` confirms a retained tab. Complete the interaction
+in that tab, then repeat the same operation and arguments in the same MCP session.
+The connector reads that exact page without navigating again; a successful read
+closes it. For comparison, repeat the original query with only the affected source.
+Pending handoffs take precedence over successful-result caches, so another
+session's cached response cannot bypass the retained page.
+The original expiry never extends on retries. Different sessions and operations
+receive independent tabs; at most four handoffs are active per process. Concurrent
+reads of one lease or a full registry report a busy transport error.
+
+The runtime attempts to reveal the owned browser window and prevents unrelated
+connector calls from hiding it while the handoff is active. Foreground activation
+is best-effort, especially for remote browsers. Expiry, errors, cancellation and
+graceful shutdown close owned tabs; a hard process kill cannot guarantee expiry
+in an external Chrome. Without `handoff_expires_at`, use the ordinary retry flow:
+HTTP errors rejected before DOM extraction, headless runs and calls without an
+MCP session do not retain a tab. No cookies, screenshots or browser profile copies
+are written by the handoff runtime. A retained error also carries an opaque
+`handoff_id`; a vision-capable MCP client may pass it to
+`compare_browser_snapshot(handoff_id)` to receive the current viewport as an
+image plus metadata. The snapshot does not solve or interpret the challenge.
 
 ### 1. Start Chrome with remote debugging
 
@@ -147,13 +177,13 @@ If you only need Wildberries, Yandex Market and Detsky Mir: **no**. All three wo
 over plain anonymous HTTP, and `compare_prices` will report every CDP source it
 can't reach as blocked and rank the rest.
 
-You need it the moment Taobao, Megamarket, DNS, Citilink or AliExpress matter —
-those five have no anonymous tier, so without a logged-in Chrome they return nothing at all. For
-Ozon and Avito it is optional insurance: tier 1 usually answers, and CDP only earns
-its keep when the anonymous tier is challenged. For Lamoda, card lookups work
-without it but search does not.
+You need it the moment Taobao, Megamarket, DNS, Citilink, AliExpress or Cian matter —
+those six have no anonymous tier, so without a logged-in Chrome they return nothing at all. For
+Ozon and Avito search it is optional insurance: tier 1 usually answers, and CDP only earns
+its keep when the anonymous tier is challenged; Avito cards and sellers need it. For
+Lamoda, cards work without it while anonymous GraphQL answers, search never does.
 
 A residential IP is the alternative for the fallback sources — from a Russian
 residential address Ozon's and Avito's tier 1 often work without any browser. It
-does nothing for the CDP-only five, whose block is at the API, not the IP. Set
+does nothing for the CDP-only six, whose block is at the API, not the IP. Set
 `OZON_PROXY`/`AVITO_PROXY` or the standard `HTTPS_PROXY` to route through one.

@@ -25,9 +25,9 @@ def test_no_operator_selfcheck_is_registered_as_a_tool():
     # The count changed from 45 to 34 on purpose (11 selfchecks left), from
     # 34 to 36 when the aliexpress connector (2 tools) joined the mount,
     # from 37 to 39 when the cian connector (2 tools) joined,
-    # from 39 to 42 when the drom connector (3 tools) joined, and
-    # from 42 to 43 when drom_card_photos joined.
-    assert len(tools) == 43
+    # to 40 with the comparison browser snapshot tool, and
+    # to 44 with the drom connector (4 tools: drom_search, drom_card, drom_card_photos, drom_seller).
+    assert len(tools) == 44
 
 
 def test_every_output_schema_is_wire_frugal():

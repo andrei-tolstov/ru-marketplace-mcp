@@ -25,20 +25,89 @@ Pure standard library on purpose — an HTML parser dependency would buy nothing
 here, since the payload is JSON once located.
 
 Verified against live pages Jul 2026 (search, cards across categories, empty
-results, pagination, A/B duplicates).
+results, pagination, A/B duplicates) and re-verified live Sep 2026 (search
+price semantics against the product card for the same offer).
+
+**Hollow frames.** Live-verified 2026-09-13 (residential RU IP): Yandex can
+serve a product page as an empty frame — ``pageId: market:product`` with every
+product collection empty, no schema.org Product and no captcha marker — while
+the product is alive in search, and the same URL shows SmartCaptcha to a real
+browser. ``parse_card`` reports that page as ``EMPTY_PRODUCT_SHELL``: degraded
+serving, never parser drift (the field families did not change shape; they are
+absent). The same day, search pages arrived without the widget-state bundle at
+all, readable only through the schema.org fallback.
+
+**Zone blobs (first screen).** Since 2026-09-12/13 the anonymous search page
+no longer embeds the product *collections* — Yandex moved them to client-side
+lazy loading — but the first screen of snippets is still server-rendered as
+DOM, and every ``<div data-zone-name="productSnippet">`` carries its own
+analytics payload in an HTML-escaped ``data-zone-data`` attribute: marketSku,
+oskuId, title, the base price, ``additionalPrices`` (``withDiscount`` =
+everyday, ``yaBank`` = Plus), vendor/shop ids, rating and availability. That
+is the same ``baobabPayload`` the collections used to carry, minus the joins.
+``parse_zone_items`` reads it (live capture 2026-09-13, 8 snippets on the
+anonymous page, 19 in a hydrated browser DOM), and ``parse_search`` uses it
+whenever the collections are missing — before the thinner schema.org fallback.
 """
 
 from __future__ import annotations
 
+import html as _html
 import json
 import math
 import re
+from collections.abc import Iterator
 from typing import Any
 
 # One state fragment. Yandex emits ~150 of these per search page, ~200 per card.
 _PATCH_RE = re.compile(r'<noframes data-apiary="patch">(.*?)</noframes>', re.S)
 
 _LDJSON_RE = re.compile(r'<script type="application/ld\+json">(.*?)</script>', re.S)
+
+# Opening tag of a server-rendered SERP snippet. Attribute order is not fixed
+# (class/id/data-daemon come and go), so the tag is matched on the zone name
+# and the payload is pulled out of it separately.
+_ZONE_NAME_ATTR_RE = re.compile(r'\bdata-zone-name="productSnippet"')
+_ZONE_DATA_ATTR_RE = re.compile(r'\bdata-zone-data="([^"]*)"')
+
+
+def _iter_tags(html: str) -> Iterator[str]:
+    """Yield each start tag, honouring quoted attribute values.
+
+    A regex like ``<[^>]*>`` ends the tag at the first ``>`` — including one that
+    sits *inside* an attribute value (``title="a > b"``), which is legal HTML. A
+    snippet whose earlier attribute contains a raw ``>`` therefore disappeared
+    from the parse entirely (found by an independent review, 2026-09-18). Walking
+    the tag while tracking quote state is exact and linear, with no backtracking.
+    """
+    index = 0
+    length = len(html)
+    while True:
+        start = html.find("<", index)
+        if start < 0:
+            return
+        # A tag starts with a letter (``<div``) or a closing slash (``</div``).
+        after = html[start + 1 : start + 2]
+        if not after or not (after.isalpha() or after == "/"):
+            index = start + 1
+            continue
+        quote = ""
+        cursor = start + 1
+        while cursor < length:
+            char = html[cursor]
+            if quote:
+                if char == quote:
+                    quote = ""
+            elif char in "\"'":
+                quote = char
+            elif char == ">":
+                yield html[start : cursor + 1]
+                index = cursor + 1
+                break
+            cursor += 1
+        else:
+            return
+
 
 # Visible copy shown when a query genuinely matched nothing. Distinguishing "no
 # results" from "our parser broke" is the whole point of tracking it.
@@ -55,10 +124,17 @@ class ParseStatus:
     """Outcomes a parse can have, kept explicit so callers can branch on them."""
 
     OK = "ok"
+    # The collections were missing but the first screen of snippets carried its
+    # ``data-zone-data`` payloads: both prices, title, sku, rating per row.
+    OK_ZONE = "ok_zone"
     OK_LDJSON_ONLY = "ok_ldjson_only"
     EMPTY = "empty"
     NO_PRODUCTS_FOUND = "no_products_found"
     CAPTCHA = "captcha"
+    # The product page frame arrived with zero product state inside. That is a
+    # serving/session condition (degraded or challenge-gated serving, or a
+    # delisted product), not a parser verdict — see _empty_product_shell.
+    EMPTY_PRODUCT_SHELL = "empty_product_shell"
 
 
 def looks_like_captcha(html: str) -> bool:
@@ -241,6 +317,114 @@ def _to_int(value: Any) -> int | None:
     return int(number) if number is not None else None
 
 
+def zone_snippets(html: str) -> list[dict[str, Any]]:
+    """Raw ``data-zone-data`` payloads of the SERP's productSnippet zones.
+
+    Document order, which is the on-screen order (each payload also carries a
+    ``pos``). The attribute is HTML-escaped JSON (``&quot;``), unescaped here
+    and nowhere else; a snippet without a parseable payload is skipped, never
+    guessed at. Only ``type: offer`` payloads count — the same zone name is
+    reused for non-product tiles on some pages.
+    """
+    out: list[dict[str, Any]] = []
+    for tag in _iter_tags(html):
+        if _ZONE_NAME_ATTR_RE.search(tag) is None:
+            continue
+        attr = _ZONE_DATA_ATTR_RE.search(tag)
+        if attr is None:
+            continue
+        try:
+            payload = json.loads(_html.unescape(attr.group(1)))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("type") == "offer":
+            out.append(payload)
+    return out
+
+
+def _zone_shop_name(payload: dict[str, Any]) -> str:
+    """Shop title out of the payload's ``signals`` — shipped on some rows only."""
+    for signal in _as_list(payload.get("signals")):
+        if isinstance(signal, dict) and signal.get("type") == "shop" and signal.get("title"):
+            return str(signal["title"])
+    return ""
+
+
+def parse_zone_items(html: str) -> list[dict[str, Any]]:
+    """Search rows from the first-screen snippet payloads (no collections needed).
+
+    Price semantics are the ones verified live 2026-09-11 for the identical
+    ``baobabPayload`` fields and re-read on the 2026-09-13 anonymous capture:
+
+    * ``additionalPrices[withDiscount]`` is the everyday price anyone pays
+      (it equalled the cart price and the card's ``prices.price`` row by row),
+      so it is ``price_rub``; on undiscounted rows the entry is absent and the
+      base ``price`` IS the everyday price.
+    * ``additionalPrices[yaBank]`` is the green Yandex Plus price — the figure
+      the SERP prints big and the only ₽ amount visible in the snippet DOM.
+      It is ``price_with_plus`` and is never allowed into ``price_rub``.
+    * ``price`` is the base/initial price; on discounted rows it is the
+      struck-through figure (Realme Note 60x: 12450 struck, 11329 everyday,
+      11102 Plus, badge «Скидка 11%») and rides in ``price_old_rub``.
+
+    ``product_id`` is ``oskuId`` — the id the row's own ``/card/…/{id}`` link
+    and schema.org ``url`` end in and that ``/card/{slug}/{id}`` accepts;
+    ``sku_id`` is ``marketSku``. Brand cannot be resolved (only ``vendorId``
+    ships); seller comes from the ``shop`` signal when present. URL and image
+    are filled from the page's schema.org ``ItemList`` by product id, else the
+    ``/card/{slug}/{id}`` URL is built.
+    """
+    payloads = zone_snippets(html)
+    if not payloads:
+        return []
+
+    ldjson_by_id = {item["product_id"]: item for item in ldjson_item_list(html) if item.get("product_id")}
+
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for payload in payloads:
+        product_id = str(payload.get("oskuId") or payload.get("modelId") or "")
+        # wareId can be absent; keep explicitly distinct sellable variants even
+        # when the page has no offer identifier for those snippets.
+        key = (product_id, str(payload.get("marketSku") or ""), str(payload.get("wareId") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        base_price = _to_number(payload.get("price"))
+        with_discount = _additional_price(payload, "withDiscount")
+        price_rub = with_discount if with_discount is not None else base_price
+        price_old = (
+            base_price if (base_price is not None and price_rub is not None and base_price > price_rub) else None
+        )
+
+        rating_node = _as_dict(payload.get("rating"))
+        is_available = payload.get("isAvailable")
+        ld = ldjson_by_id.get(product_id, {})
+
+        items.append(
+            {
+                "product_id": product_id or None,
+                "sku_id": str(payload.get("marketSku") or ""),
+                "title": str(payload.get("title") or ld.get("title") or ""),
+                "brand": "",
+                "seller": _zone_shop_name(payload),
+                "price_rub": price_rub,
+                "price_with_plus": _additional_price(payload, "yaBank"),
+                "price_old_rub": price_old,
+                "currency": "RUR",
+                "rating": _to_number(rating_node.get("rating")) or ld.get("rating"),
+                "rating_count": _to_int(rating_node.get("gradesCount")) or ld.get("rating_count"),
+                "in_stock": is_available if isinstance(is_available, bool) else None,
+                "is_express": bool(payload.get("isExpress")),
+                "url": str(ld.get("url") or "") or _absolute_url(None, product_id or None),
+                "image": str(ld.get("image") or ""),
+                "source": "zone",
+            }
+        )
+    return items
+
+
 def _amount_int(node: Any) -> float | None:
     """Read a price out of the presentational ``amount.intPart`` shape.
 
@@ -256,6 +440,40 @@ def _amount_int(node: Any) -> float | None:
     return _to_number(amount.get("intPart"))
 
 
+def _cart_price(cart_button: Any) -> float | None:
+    """The price the snippet's cart button would actually charge.
+
+    ``productPayload.cartButton.price`` carries the everyday price the SERP
+    displays big: ``valueFmt`` in roubles, ``value`` in 1e-7 units. Verified live
+    2026-09-11 row by row against the product card for the same offer (Tuvio
+    TKP2117S: cart 2293 == card ``prices.price``) and against the baobab's
+    ``withDiscount`` additional price, which it equalled on every row. This is
+    the number any buyer pays, subscription or not.
+    """
+    if not isinstance(cart_button, dict):
+        return None
+    price = cart_button.get("price")
+    if not isinstance(price, dict):
+        return None
+    return _to_number(price.get("valueFmt"))
+
+
+def _additional_price(baobab: Any, price_type: str) -> float | None:
+    """One named price out of ``baobabPayload.additionalPrices``.
+
+    The SERP snippet ships its price breakdown there: ``withDiscount`` is the
+    discounted everyday price any buyer pays, ``yaBank`` is the green Yandex
+    Plus price. Both verified live 2026-09-11 to equal the product card's
+    ``prices.price`` / ``greenPrice`` for the same offer.
+    """
+    if not isinstance(baobab, dict):
+        return None
+    for entry in _as_list(baobab.get("additionalPrices")):
+        if isinstance(entry, dict) and entry.get("priceType") == price_type:
+            return _to_number(entry.get("priceValue"))
+    return None
+
+
 def _first_dict(collection: Any) -> dict[str, Any]:
     """First dict value in a collection, or an empty dict.
 
@@ -267,6 +485,59 @@ def _first_dict(collection: Any) -> dict[str, Any]:
             if isinstance(value, dict):
                 return value
     return {}
+
+
+# The pageParams.pageId Yandex sets when it believes it is rendering a product
+# page. Present even on a hollow frame, which is what makes the shell verdict
+# more than "we found nothing": Yandex itself claims this is a product render.
+_PRODUCT_PAGE_ID = "market:product"
+
+# Collections a real product card populates at least one of. Every one of them
+# empty while the page claims to be a product render is the hollow-frame
+# signature (live capture 2026-09-13, /product/4315891968).
+_CARD_PRODUCT_COLLECTIONS = (
+    "allPrices",
+    "businessRatingStats",
+    "mediaItem",
+    "offer",
+    "price",
+    "productServiceSnippets",
+    "reviews",
+    "shopInfo",
+    "titleV2",
+)
+
+
+def _empty_product_shell(merged: dict[str, Any], fallback: dict[str, Any]) -> bool:
+    """True when the page is a product frame carrying no product at all.
+
+    Live-verified 2026-09-13 from a residential RU IP: ``/product/4315891968``
+    — a product alive enough to be the first hit of its own search — answered
+    HTTP 200 with ``pageParams {pageId: "market:product", productId:
+    "4315891968"}`` while every product-bearing collection was empty and no
+    schema.org Product was embedded. The same URL in a real browser hit
+    SmartCaptcha. The known field families did not change shape; they are
+    absent. Under the tri-state doctrine that is degraded serving
+    (inconclusive), never parser drift — and without a 404 or a not-found
+    marker it is never not_found either, because the product may well exist.
+
+    Captcha pages never reach this check — ``parse_card`` short-circuits them.
+    ``fallback`` is the ld+json Product dict; a page that still embeds one is
+    not hollow (the degraded card path fills title and price from it).
+    """
+    params = _first_dict(merged.get("pageParams"))
+    if params.get("pageId") != _PRODUCT_PAGE_ID:
+        return False
+    if fallback:
+        return False
+    return all(not _as_dict(merged.get(name)) for name in _CARD_PRODUCT_COLLECTIONS)
+
+
+def _shell_product_id(merged: dict[str, Any]) -> str:
+    """The productId echoed by pageParams on a product frame, if present."""
+    params = _as_dict(_first_dict(merged.get("pageParams")).get("params"))
+    product_id = params.get("productId")
+    return str(product_id) if product_id else ""
 
 
 def _picture_url(node: Any) -> str:
@@ -288,11 +559,20 @@ def _absolute_url(raw: Any, product_id: Any = None, slug: Any = None) -> str:
         if raw.startswith("//"):
             return f"https:{raw}"
         return f"https://market.yandex.ru{raw}"
-    if slug and product_id:
-        return f"https://market.yandex.ru/product--{slug}/{product_id}"
     if product_id:
-        return f"https://market.yandex.ru/product/{product_id}"
+        return card_url(product_id, slug)
     return ""
+
+
+# Yandex moved product pages to /card/{slug}/{id}; the old /product/{id} now answers
+# with an empty page frame (#105). Any slug resolves — the id alone selects the
+# product — so a placeholder stands in when the slug is unknown (live 2026-10-12).
+CARD_SLUG_PLACEHOLDER = "x"
+
+
+def card_url(product_id: Any, slug: Any = None) -> str:
+    """The product page URL for ``product_id``; ``slug`` is cosmetic."""
+    return f"https://market.yandex.ru/card/{slug or CARD_SLUG_PLACEHOLDER}/{product_id}"
 
 
 def parse_search(html: str) -> dict[str, Any]:
@@ -302,6 +582,29 @@ def parse_search(html: str) -> dict[str, Any]:
     ``price_rub`` is what anyone pays, while ``price_with_plus`` requires a
     Yandex Plus subscription and runs 25–30% lower. Reporting only the latter
     would quote a price most callers cannot get.
+
+    ``price_rub`` comes from the snippet's cart price
+    (``productPayload.cartButton.price``, mirrored by the baobab's
+    ``withDiscount`` additional price) — never from ``offer.price.value`` or
+    ``baobabPayload.price`` alone: on discounted rows both of those carry the
+    STRUCK-THROUGH base price. Verified live 2026-09-11 against the product
+    card for the same offer (Tuvio TKP2117S: SERP cart price 2293 == card
+    ``prices.price``, while ``offer.price.value`` and the baobab base price
+    both carry the struck-through ``initialPrice`` 3698). The struck-through
+    figure is surfaced separately as ``price_old_rub``.
+
+    When the page carries no collection bundle at all (anonymous serving since
+    2026-09-12), the rows come from the first-screen snippet payloads instead
+    (``parse_zone_items``, status ``ok_zone``) with the same price semantics;
+    only when those are missing too does the Plus-only schema.org list stand
+    in (``ok_ldjson_only``).
+
+    A search row describes the SERP snippet's offer, which is not necessarily
+    the offer a card for the same product id defaults to: one id covers a
+    product family, and Yandex may show one member in search (REDMOND KM243,
+    sku 4668084807) while the card defaults to another (KM245). Rows are
+    SERP-faithful; reconcile them with cards by ``sku_id``, not by product
+    URL.
     """
     if looks_like_captcha(html):
         return {"status": ParseStatus.CAPTCHA, "items": [], "total": None}
@@ -321,6 +624,14 @@ def parse_search(html: str) -> dict[str, Any]:
     }
 
     if not collections:
+        # No collection bundle (the post-2026-09-12 anonymous page): the first
+        # screen of snippets still ships its data-zone-data payloads, which
+        # carry both prices — read those before the Plus-only schema.org list.
+        zone_items = parse_zone_items(html)
+        if zone_items:
+            result["items"] = zone_items
+            result["status"] = ParseStatus.OK_ZONE
+            return result
         fallback = ldjson_item_list(html)
         if fallback:
             result["items"] = fallback
@@ -374,6 +685,8 @@ def parse_search(html: str) -> dict[str, Any]:
         snippet = snippets.get(snippet_id) if snippet_id else None
         payload = snippet.get("productPayload") if isinstance(snippet, dict) else None
         payload = payload if isinstance(payload, dict) else {}
+        baobab = snippet.get("baobabPayload") if isinstance(snippet, dict) else None
+        baobab = baobab if isinstance(baobab, dict) else {}
 
         offer: dict[str, Any] = {}
         offer_place_id = place.get("defaultOfferShowPlaceId")
@@ -388,10 +701,33 @@ def parse_search(html: str) -> dict[str, Any]:
         product = product if isinstance(product, dict) else {}
 
         price_node = _as_dict(payload.get("price"))
-        price_with_plus = _amount_int(price_node.get("actualPrice"))
-        price_snippet_base = _amount_int(price_node.get("initialPrice"))
-        price_old = _amount_int(price_node.get("oldPrice"))
+        # The everyday price, in decreasing order of trust: what the snippet's
+        # cart button charges (== the figure displayed big on the page), the
+        # baobab's withDiscount price, and only then offer.price.value. The
+        # latter two structural fields both carry the STRUCK-THROUGH base price
+        # on discounted rows — quoting offer.price.value as the everyday price
+        # was the pre-fix bug (Tuvio TKP2117S: 3698 instead of 2293, live
+        # check 2026-09-11).
+        cart_price = _cart_price(payload.get("cartButton"))
+        with_discount = _additional_price(baobab, "withDiscount")
         offer_price = _to_number((_as_dict(offer.get("price"))).get("value"))
+        price_rub = next((price for price in (cart_price, with_discount, offer_price) if price is not None), None)
+
+        price_with_plus = _amount_int(price_node.get("actualPrice"))
+        if price_with_plus is None:
+            price_with_plus = _additional_price(baobab, "yaBank")
+
+        # Struck-through reference: the display node's own old/initial price
+        # when present, else the baobab base price — but only while it actually
+        # sits above the everyday price. On undiscounted rows the baobab price
+        # IS the everyday price and nothing is struck through.
+        price_old = _amount_int(price_node.get("oldPrice"))
+        if price_old is None:
+            price_old = _amount_int(price_node.get("initialPrice"))
+        if price_old is None:
+            baobab_price = _to_number(baobab.get("price"))
+            if baobab_price is not None and price_rub is not None and baobab_price > price_rub:
+                price_old = baobab_price
 
         rating_node = _as_dict(payload.get("rating"))
         delivery = _as_dict(offer.get("delivery"))
@@ -414,8 +750,10 @@ def parse_search(html: str) -> dict[str, Any]:
                 "title": title_node.get("value") or titles.get("raw") or offer_titles.get("raw") or "",
                 "brand": (vendor or {}).get("name") or "",
                 "seller": (shop or {}).get("name") or "",
-                # Base price first: offer.price is structural, the snippet's is display text.
-                "price_rub": offer_price if offer_price is not None else price_snippet_base,
+                # Cart price first: it is what the page displays and charges;
+                # offer.price.value is structural but carries the strike-through
+                # on discounted rows, so it is only a last-resort fallback.
+                "price_rub": price_rub,
                 "price_with_plus": price_with_plus,
                 "price_old_rub": price_old,
                 "currency": (_as_dict(offer.get("price"))).get("currency") or "RUR",
@@ -569,7 +907,7 @@ def parse_card(html: str) -> dict[str, Any]:
     if not stars:
         stars = _stars_from_distribution(reviews_collection.get("distribution"))
 
-    return {
+    result = {
         "status": ParseStatus.OK,
         "product_id": str(product_id) if product_id else "",
         "sku_id": str(baobab.get("skuId") or fallback.get("sku") or ""),
@@ -590,3 +928,15 @@ def parse_card(html: str) -> dict[str, Any]:
         "rating_stars": stars,
         "reviews": parse_reviews(merged),
     }
+    if (
+        not result["title"]
+        and result["price_rub"] is None
+        and result["price_with_plus"] is None
+        and _empty_product_shell(merged, fallback)
+    ):
+        # A hollow frame, not a card: report it as itself so the caller can
+        # classify it as degraded serving (inconclusive) instead of blaming
+        # the parsers (drift). pageParams still echoes the requested id.
+        result["status"] = ParseStatus.EMPTY_PRODUCT_SHELL
+        result["product_id"] = result["product_id"] or _shell_product_id(merged)
+    return result

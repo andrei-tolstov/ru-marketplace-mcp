@@ -51,16 +51,6 @@ Thumbs.db
 scratch/
 *.log
 
-# Operational note for the release run, not part of the project.
-PUBLISH_PROMPT.md
-
-# Agent scaffolding from the autonomous improvement run — not part of the project.
-.agent/
-.qwen/
-MISSION.md
-QWEN.md
-start-run.sh
-
 # Архивы релиза собираются и прикладываются к Releases, а не хранятся в git.
 *.zip
 
@@ -72,3 +62,11 @@ node_modules/
 # dsh/package.json is not the Node artefact above: it is the plugin-bundle
 # manifest every dsh install resolves, so it must be tracked.
 !dsh/package.json
+
+# Local tooling and run artifacts that must never be committed.
+.agent/
+.qwen/
+MISSION.md
+QWEN.md
+PUBLISH_PROMPT.md
+start-run.sh

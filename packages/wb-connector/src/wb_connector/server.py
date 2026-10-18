@@ -3,13 +3,13 @@
 Public WB internal APIs (catalog parsing, not Seller API). Anti-bot light;
 residential IP works without proxies. No credentials needed.
 
-Endpoints (verified Nov 2026 against live data):
+Endpoints (verified before v1.0.0, July 2026 against live data):
   - https://card.wb.ru/cards/v4/detail        (batch product cards)
   - https://basket-NN.wbbasket.ru/...          (root_id / variants / specs)
   - https://feedbacks2.wb.ru/feedbacks/v2/{imt_id}   (review pool)
   - https://search.wb.ru/exactmatch/...        (search; 429-prone)
 
-CRITICAL Nov 2026 discovery:
+CRITICAL pre-v1.0.0 (July 2026) discovery:
   Top-level priceU/salePriceU are NOW null. Real prices live in
   sizes[0].price.{product, basic} as integer kopecks. Code extracts both.
 
@@ -23,6 +23,28 @@ Polite rate limit: 1.5s gap on residential IP. Don't disable.
 
 NEVER use print() in stdio MCP — corrupts JSON-RPC. Use ctx.debug/info/error.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Expose Wildberries catalog, reviews, questions and seller reads.
+# SCOPE: Read-only MCP tools; paced HTTP/CDN access and optional DOM card/search.
+# DEPENDS: FastMCP; httpx; curl_cffi; mcp_core; models_output; settings; dom_transport.
+# LINKS: M-WB; M-COMPARE; M-MARKETPLACE; packages/wb-connector/tests.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# _safe_get_text: Apply bounded HTTP reads, refusal handling and transport fallback.
+# _extract_price_rub: Separate current and basic prices, converting kopecks to rubles.
+# _wb_card_dom: Adapt operator-browser cards into the public response model.
+# _wb_search_dom: Adapt operator-browser search with price semantics and region warnings.
+# _search_via_search_goods: Return legacy products or typed failures, never failed emptiness.
+# wb_card: Read a batch of product cards.
+# wb_root_info: Read root identity, variants and specifications from basket CDN.
+# wb_reviews: Read product review pools with sorting and pagination.
+# wb_questions: Read buyer questions from the questions endpoint.
+# wb_search: Search products with bounded result/page handling.
+# wb_seller: Read seller metadata from static seller endpoints.
+# wb_categories: Read and filter the category menu tree.
+# wb_category_products: Read paginated products for a catalog shard.
+# wb_selfcheck: Probe endpoint/parser health for operators; not an MCP tool.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
@@ -34,8 +56,10 @@ import os
 import re
 import string
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 import httpx
+from curl_cffi import requests as curl_requests
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware.error_handling import RetryMiddleware
@@ -44,6 +68,7 @@ from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
 from mcp_core.errors import (
     BadRequestError,
+    ConnectorError,
     NotFoundError,
     ParserDriftError,
     RateLimitedError,
@@ -57,6 +82,7 @@ from mcp_core.redact import redact_error_text as _redact
 from mcp_core.transport import get_text_budgeted, proxy_from_env
 from pydantic import Field
 
+from wb_connector import dom_transport
 from wb_connector.models_output import (
     MetaOut,
     WbCardItem,
@@ -78,7 +104,7 @@ from wb_connector.settings import get_settings
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.5.3"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 mcp = FastMCP(
@@ -150,7 +176,7 @@ WB_MENU_MAX_NODES = 400
 # always returns ids on search-goods, so 0 recoverable ids = shape drift, not rot.
 _SELFCHECK_SEARCH_QUERY = "телефон"
 
-# Verified live Nov 2026: feedbacks/v2/{imt} IGNORES order=/sort=/take=/skip= and
+# Verified live pre-v1.0.0 (July 2026): feedbacks/v2/{imt} IGNORES order=/sort=/take=/skip= and
 # always returns the same pool (~1000 most-recent, newest-first). So sorting is
 # done CLIENT-SIDE over that returned pool. Aliases mirror ozon_reviews.
 _WB_REVIEW_SORTS = {"recent", "best", "worst"}
@@ -166,7 +192,7 @@ _min_gap = _settings.min_gap
 _pacer = Pacer(_min_gap)
 
 # Bounded retry for TRANSIENT network faults only (connect/read timeout, conn
-# reset). Verified live Nov 2026: wb_search intermittently throws ConnectTimeout
+# reset). Verified live pre-v1.0.0 (July 2026): wb_search intermittently throws ConnectTimeout
 # on the first hit and a single retry succeeds. We retry ONLY on httpx transport
 # exceptions — never on an HTTP status (a 429/5xx retry would worsen rate-limit).
 _NET_RETRIES = _settings.net_retries  # retries after the first try (so up to 3 attempts)
@@ -229,6 +255,146 @@ def _wb_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=WB_TIMEOUT, headers=WB_HEADERS, proxy=_proxy())
 
 
+# WB's API edge answered httpx's TLS handshake with a 403 HTML page served by
+# Angie, while plain curl and curl_cffi got a 200 from the very same address,
+# query and headers. Measured host by host from a Russian residential IP, same
+# URL per row:
+#
+#   card.wb.ru                    httpx 403   curl_cffi 200
+#   search.wb.ru                  httpx 403   curl_cffi 200
+#   catalog.wb.ru                 httpx 403   curl_cffi 200
+#   search-goods.wildberries.ru   httpx 200   curl_cffi 200
+#   feedbacks2.wb.ru              httpx 200   curl_cffi 200
+#   basket-NN.wbbasket.ru         httpx 200   curl_cffi 200
+#
+# Re-measured on 2026-09-21 from two further addresses, the 403s did not
+# reproduce, and the split moved the other way: on one of them plain httpx drew
+# 200 from card.wb.ru and search.wb.ru while the impersonated path timed out on
+# v9, and on the next card.wb.ru refused BOTH transports with the same wall
+# within the same hour. So this is not a fixed property of a host that a host
+# list can capture: it moves with the address, the hour and the endpoint's
+# current mood. That is why the gated hosts below now prefer impersonation and
+# fall back to the shared client once, instead of depending on it.
+#
+# feedbacks2 sits on the same apex as the three gated hosts and is not gated, so
+# this is an explicit host list rather than a suffix rule. Everything outside it
+# keeps the shared budget/retry machinery.
+_IMPERSONATED_HOSTS = ("card.wb.ru", "search.wb.ru", "catalog.wb.ru")
+_IMPERSONATE_PROFILE = "chrome"
+# Impersonation supplies its own User-Agent and client hints. Sending WB_HEADERS'
+# pinned Chrome 120 UA on top would contradict the handshake curl_cffi just
+# performed, so only the request-shaping headers travel with it.
+_IMPERSONATED_HEADERS = {k: v for k, v in WB_HEADERS.items() if k != "User-Agent"}
+
+# Statuses that mean "this source refused us", as opposed to a transient fault.
+# The pacer keeps a longer gap after a refusal and counts consecutive ones so it
+# can say "this is a standing block, not a blip" — and nothing in this connector
+# told it about a refusal, so a 403 from a gated host was invisible to the very
+# mechanism built to notice it. 429 counts: v9 search answers it by design.
+_REFUSAL_STATUSES = frozenset({401, 403, 429})
+
+
+def _refusal_hint() -> str:
+    """The pacer's "this is a standing block" sentence, once it has earned one."""
+
+    hint = _pacer.rotation_hint()
+    return f" {hint}" if hint else ""
+
+
+def _decode_body(body: bytes, content_type: str) -> str:
+    """Decode a streamed body the way curl_cffi's ``resp.text`` would have.
+
+    Streaming means curl_cffi no longer decodes for us, so the charset comes
+    from where it takes it: the Content-Type header, with UTF-8 — what WB's JSON
+    actually is — as the default.
+    """
+
+    match = re.search(r"charset=([A-Za-z0-9._-]+)", content_type or "")
+    charset = match.group(1) if match else "utf-8"
+    try:
+        return body.decode(charset, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
+
+
+def _is_usable(result: tuple[int, str | None, str | None]) -> bool:
+    """True for a real read: HTTP 200, a body, and not the edge's wall page."""
+
+    status, text, err = result
+    return err is None and status == 200 and text is not None and not _is_edge_wall(text)
+
+
+def _is_edge_wall(text: str | None) -> bool:
+    """True when a JSON endpoint answered with an HTML page instead.
+
+    WB's edge serves a wall page rather than a status when it decides the client
+    is a bot — the banner is Angie, and a missing ``dest`` is only one of several
+    ways to earn it. Every caller classifies it as a block, so the transport seam
+    must not count it as a successful read: a wall recorded as a success would
+    also be cached, and a cached wall keeps failing for the whole TTL.
+    """
+
+    if not text:
+        return False
+    return "<html" in text[:200].lower()
+
+
+def _needs_impersonation(url: str) -> bool:
+    """True for hosts that refuse the default client's TLS fingerprint."""
+    return urlsplit(url).hostname in _IMPERSONATED_HOSTS
+
+
+async def _impersonated_get_text(url: str) -> tuple[int, str | None, str | None]:
+    """Fetch via curl_cffi, honouring ``_safe_get_text``'s (status, text, err) contract.
+
+    Same error vocabulary as the httpx path (``timeout:`` / ``network:``), the
+    same body cap and the same wall-clock bound. Deliberately without a retry
+    loop: the fingerprint gate this clears is deterministic, so a refusal would
+    not become a pass on a second attempt, and a genuine transient fault still
+    surfaces to the caller as a transport error.
+    """
+
+    def _fetch() -> tuple[int, str | None, str | None]:
+        """Read the body through the cap, exactly as the shared path does.
+
+        ``stream=True`` is the point: without it the whole response is buffered
+        before ``MAX_BODY_BYTES`` is consulted, which turns a CDN-compromise /
+        MITM defence into a ceiling of "whatever the server happens to send".
+        The httpx path aborts mid-read; this one must not be the weaker of the
+        two. curl_cffi ignores a requested chunk size — curl decides the
+        boundaries — so the bound is the cap plus whatever the final chunk
+        added, not the cap exactly. That is still a bound.
+        """
+        resp = curl_requests.get(
+            url,
+            headers=_IMPERSONATED_HEADERS,
+            impersonate=_IMPERSONATE_PROFILE,
+            timeout=_settings.timeout,
+            allow_redirects=False,
+            proxy=_proxy(),
+            stream=True,
+        )
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in resp.iter_content():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_BODY_BYTES:
+                return resp.status_code, None, f"network: body exceeded {MAX_BODY_BYTES} bytes"
+            chunks.append(chunk)
+        return resp.status_code, _decode_body(b"".join(chunks), resp.headers.get("content-type", "")), None
+
+    try:
+        status, text, err = await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=WB_WALL_TIMEOUT)
+    except TimeoutError:  # asyncio.TimeoutError is an alias of this since 3.11
+        return 0, None, f"timeout: no response within {WB_WALL_TIMEOUT}s"
+    except Exception as exc:  # curl_cffi raises its own RequestsError hierarchy
+        return 0, None, f"network: {exc}"
+
+    return status, text, err
+
+
 class _PoliteGate:
     """Adapter exposing WB's module-level polite gate as a ``RateLimiter``.
 
@@ -241,6 +407,33 @@ class _PoliteGate:
 
     async def wait(self) -> None:
         await _polite_wait()
+
+
+async def _budgeted_get_text(client: httpx.AsyncClient, url: str) -> tuple[int, str | None, str | None]:
+    """The shared path: body cap, wall-clock budget, polite gate, bounded retries."""
+
+    return await get_text_budgeted(
+        client,
+        url,
+        max_bytes=MAX_BODY_BYTES,
+        wall_timeout_s=WB_WALL_TIMEOUT,
+        retries=_NET_RETRIES,
+        backoff_s=_NET_BACKOFF_S,
+        limiter=_PoliteGate(),
+    )
+
+
+async def _fresh_get_text(client: httpx.AsyncClient, url: str) -> tuple[int, str | None, str | None]:
+    """A canary read that cannot be answered from the cache.
+
+    Every probe uses a fixed URL, so a cached 200 would let a canary report
+    ``healthy`` about a read that happened earlier — and ``search_v9: healthy``
+    was observed while a live request to the same endpoint was timing out. A
+    health signal has to describe the present.
+    """
+
+    _cache.invalidate(url)
+    return await _safe_get_text(client, url)
 
 
 async def _safe_get_text(client: httpx.AsyncClient, url: str) -> tuple[int, str | None, str | None]:
@@ -268,19 +461,35 @@ async def _safe_get_text(client: httpx.AsyncClient, url: str) -> tuple[int, str 
     if cached is not None:
         return cached
 
-    result = await get_text_budgeted(
-        client,
-        url,
-        max_bytes=MAX_BODY_BYTES,
-        wall_timeout_s=WB_WALL_TIMEOUT,
-        retries=_NET_RETRIES,
-        backoff_s=_NET_BACKOFF_S,
-        limiter=_PoliteGate(),
-    )
+    if _needs_impersonation(url):
+        # Preferring impersonation must not mean depending on it. Measured on
+        # 2026-09-21 from a second address: search.wb.ru v9 answered the default
+        # client with 130 KB while the impersonated path timed out at 15 s, and
+        # card.wb.ru refused both transports with the same wall. The split is not
+        # a property of the host; it moves with the address and the hour. So the
+        # gated hosts try impersonation first and fall back once, through the same
+        # polite gate and wall-clock budget as any other read.
+        result = await _impersonated_get_text(url)
+        if not _is_usable(result):
+            fallback = await _budgeted_get_text(client, url)
+            # Prefer the fallback when it worked, or when the impersonated attempt
+            # produced no status at all: a 403 wall tells the reader more than a
+            # bare timeout does.
+            if _is_usable(fallback) or result[0] == 0:
+                result = fallback
+    else:
+        result = await _budgeted_get_text(client, url)
 
     status, text, err = result
-    if err is None and status == 200 and text is not None:
+    if err is None and status == 200 and text is not None and not _is_edge_wall(text):
+        _pacer.record_success()
         _cache.set(url, result)
+    elif err is None and (status in _REFUSAL_STATUSES or _is_edge_wall(text)):
+        # Hand the refusal to the pacer so its longer post-refusal gap and its
+        # rotation hint can fire for this source. Read through the live module
+        # attribute, like every other pacer seam here. A wall served with HTTP 200
+        # counts: it is a refusal that arrived wearing a success status code.
+        _pacer.record_refusal()
     return result
 
 
@@ -352,6 +561,14 @@ def _decode_mojibake(s: object) -> str:
         return s
 
 
+def _single_product_color(value: Any) -> str:
+    """Keep only unambiguous typed color evidence, never infer it from a title."""
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        return ""
+    name = value[0].get("name")
+    return _decode_mojibake(name).strip() if isinstance(name, str) else ""
+
+
 def _card_item_dict(p: dict[str, Any]) -> dict[str, Any]:
     """Flatten one WB product object into the shared card-item shape.
 
@@ -368,6 +585,7 @@ def _card_item_dict(p: dict[str, Any]) -> dict[str, Any]:
         "nm_id": p.get("id"),
         "name": _decode_mojibake(p.get("name", "")),
         "brand": _decode_mojibake(p.get("brand", "")),
+        "color": _single_product_color(p.get("colors")),
         "supplier": _decode_mojibake(p.get("supplier", "")),
         "supplier_id": p.get("supplierId"),
         "supplier_rating": p.get("supplierRating"),
@@ -396,11 +614,11 @@ def _normalise_ws(value: object) -> str:
 def _extract_price_rub(p: dict) -> tuple[float | None, float | None]:
     """Return (current_rub, original_rub), or (None, None) if no live offer.
 
-    WB v4 (Nov 2026): top-level priceU/salePriceU are null. Prices live in
+    WB v4 (pre-v1.0.0 (July 2026)): top-level priceU/salePriceU are null. Prices live in
     sizes[0].price.{product, basic} as integer kopecks.
 
     None (not 0.0) is returned when the SKU has no sellable price — verified
-    Nov 2026 that this coincides with totalQuantity==0 (out of stock). A 0.0
+    pre-v1.0.0 (July 2026) that this coincides with totalQuantity==0 (out of stock). A 0.0
     sentinel would falsely rank a dead listing as the cheapest item, corrupting
     any "find the best/cheapest" comparison.
     """
@@ -509,6 +727,84 @@ def _card_products(data: dict[str, Any]) -> list[Any]:
     return products
 
 
+def _dom_dest_warning(dest: str) -> list[str]:
+    if dest and dest != WB_DEFAULT_DEST:
+        return [f"wb_dom: dest={dest} ignored — the region follows the scraping-profile Chrome (set it on the site)"]
+    return []
+
+
+async def _wb_card_dom(nm_ids: list[int], dest: str, ctx: Context | None) -> WbCardResponse:
+    """wb_card over rendered product pages (WB_TRANSPORT=dom). One navigation per SKU."""
+    warnings = _dom_dest_warning(dest)
+    wanted = list(dict.fromkeys(nm_ids))
+    if len(wanted) > _settings.dom_max_cards:
+        warnings.append(
+            f"wb_dom_card: {len(wanted)} nm_ids requested, read the first {_settings.dom_max_cards} "
+            "(each is a page navigation; raise WB_DOM_MAX_CARDS if needed)"
+        )
+        wanted = wanted[: _settings.dom_max_cards]
+    items: list[WbCardItem] = []
+    for nm in wanted:
+        if ctx is not None:
+            await ctx.debug(f"wb_card[dom]: nm={nm}")
+        payload = await dom_transport.render(dom_transport.card_url(nm), dom_transport.CARD_EXTRACT_JS, "card")
+        item, item_warnings = dom_transport.parse_card_page(payload, nm)
+        warnings.extend(item_warnings)
+        if item is not None:
+            items.append(WbCardItem(**item))
+    if any(item.cross_border for item in items):
+        warnings.append(
+            "wb_dom_card: cross-border listing (foreign seller / AliExpress on WB) — longer delivery, returns by request"
+        )
+    log_event("wb_card.done", nm_count=len(nm_ids), items=len(items), transport="dom")
+    return WbCardResponse(
+        dest=dest,
+        count=len(items),
+        items=items,
+        meta=MetaOut(source="wb_card", healthy=bool(items) or not wanted, warnings=warnings[:10]),
+    )
+
+
+async def _wb_search_dom(
+    query: str, dest: str, page: int, ctx: Context | None
+) -> WbSearchResponse | WbNoResultsResponse:
+    """wb_search over the rendered search grid (WB_TRANSPORT=dom)."""
+    url = dom_transport.search_url(query, page)
+    if ctx is not None:
+        await ctx.debug(f"wb_search[dom]: {url}")
+    payload = await dom_transport.render(url, dom_transport.SEARCH_EXTRACT_JS, "search")
+    items, warnings = dom_transport.parse_search_page(payload)
+    if not items and page == 1 and not payload.get("page_says_empty"):
+        # An empty first page without WB's own «ничего не нашлось» means the tile
+        # selectors stopped matching; reporting no_results would hide the drift.
+        log_event("wb_search.dom_drift", query=query[:100], tiles=len(payload.get("tiles") or []))
+        raise_tool_error(
+            ParserDriftError(
+                "wb_search[dom]: the search page rendered no product tiles and no empty-result notice",
+                provider="wb",
+            )
+        )
+    warnings = _dom_dest_warning(dest) + warnings
+    if not items:
+        log_event("wb_search.no_results", transport="dom", query=query[:100], page=page)
+        return WbNoResultsResponse(
+            query=query,
+            page=page,
+            total_ids=0,
+            meta=MetaOut(source="wb_search", healthy=True, warnings=warnings[:10]) if warnings else None,
+        )
+    log_event("wb_search.done", transport="dom", items=len(items), page=page)
+    return WbSearchResponse(
+        query=query,
+        page=page,
+        page_size=len(items),
+        total_ids=len(items),
+        count=len(items),
+        items=[WbCardItem(**item) for item in items],
+        meta=MetaOut(source="wb_search", healthy=True, warnings=warnings[:10]),
+    )
+
+
 @mcp.tool(
     name="wb_card",
     annotations=ToolAnnotations(
@@ -552,9 +848,9 @@ async def wb_card(
     ## Error Format
 
     ToolError: BadRequestError on malformed nm_ids; RateLimitedError on HTTP
-    429; TransportDownError on network failures, non-200 responses, Cloudflare
-    HTML pages and unexpected internal errors; ParserDriftError on a non-JSON
-    or mis-shaped body.
+    429; TransportDownError on network failures, non-200 responses, an HTML wall
+    page from WB's edge, and unexpected internal errors; ParserDriftError on a
+    non-JSON or mis-shaped body.
 
     Args:
         nm_ids: 1..100 nmId integers.
@@ -574,6 +870,9 @@ async def wb_card(
     if any(isinstance(n, bool) or not isinstance(n, int) or n <= 0 for n in nm_ids):
         log_event("wb_card.validation_failed", reason="non_positive_nm_ids")
         raise_tool_error(BadRequestError("nm_ids must be positive integers"))
+
+    if _settings.transport == "dom":
+        return await _wb_card_dom(nm_ids, dest, ctx)
 
     nm_param = ";".join(str(n) for n in nm_ids)
     params = httpx.QueryParams(
@@ -603,11 +902,19 @@ async def wb_card(
                 raise_tool_error(RateLimitedError("wb", retry_after_s=30.0))
             if text and "<html" in text[:200].lower():
                 log_event("wb_card.blocked", reason="cloudflare_html")
-                raise_tool_error(TransportDownError("Cloudflare HTML page (likely missing dest param)", provider="wb"))
+                raise_tool_error(
+                    TransportDownError(
+                        f"WB served an HTML wall page instead of JSON{_refusal_hint()} "
+                        "(the edge decided this client is a bot; a missing dest is one way to earn it)",
+                        provider="wb",
+                    )
+                )
             if status_code != 200:
                 log_event("wb_card.http_error", status=status_code)
                 raise_tool_error(
-                    TransportDownError(f"wb_card HTTP {status_code}", provider="wb", status_code=status_code)
+                    TransportDownError(
+                        f"wb_card HTTP {status_code}{_refusal_hint()}", provider="wb", status_code=status_code
+                    )
                 )
             try:
                 data = json.loads(text or "")
@@ -844,7 +1151,7 @@ async def wb_reviews(
     All product variants share one review pool, indexed by imt_id NOT nmId.
 
     The WB feedbacks endpoint returns a fixed pool (~1000 most-recent reviews,
-    newest-first) and IGNORES server-side order params (verified Nov 2026), so
+    newest-first) and IGNORES server-side order params (verified before v1.0.0, July 2026), so
     `sort` is applied CLIENT-SIDE over that pool. To surface complaints, "worst"
     reorders the returned pool by lowest rating first.
 
@@ -1109,7 +1416,9 @@ async def wb_questions(
             if status_code != 200:
                 log_event("wb_questions.http_error", status=status_code, skip=offset)
                 raise_tool_error(
-                    TransportDownError(f"wb_questions HTTP {status_code}", provider="wb", status_code=status_code)
+                    TransportDownError(
+                        f"wb_questions HTTP {status_code}{_refusal_hint()}", provider="wb", status_code=status_code
+                    )
                 )
 
             try:
@@ -1245,23 +1554,23 @@ async def wb_search(
 ) -> WbSearchResponse | WbNoResultsResponse:
     """Search WB catalog by text query.
 
-    Uses the lightweight `search-goods.wildberries.ru/search` endpoint which
-    returns just product IDs (no PoW protection, very high rate limit). Then
-    enriches via `wb_card` for full details.
+    Uses search.wb.ru v9 product data, with a warned legacy IDs/card fallback.
+    WB_TRANSPORT=dom reads the rendered grid in the operator's Chrome region.
 
     ## Return Format
 
     WbSearchResponse: {query, page, page_size, total_ids, count, items, meta},
     with items in the same shape as wb_card. Zero matches — or a page past the
     end — returns WbNoResultsResponse {status: "no_results", query, page,
-    total_ids} instead. That is NOT an error.
+    total_ids} instead. Optional meta reports DOM warnings only when present.
+    That is NOT an error; unknown totals remain null.
 
     ## Error Format
 
     ToolError: BadRequestError on a page outside 1..20; RateLimitedError on
-    HTTP 429 from the v9 search endpoint; TransportDownError on unexpected
-    internal errors. Plain transport failures of both search paths degrade to
-    a no_results response rather than an error.
+    HTTP 429; ParserDriftError on malformed JSON/shapes when neither path
+    answers successfully; TransportDownError on refusals or transport failures.
+    Failed reads never become no_results without a positive empty answer.
 
     Args:
         query: Russian text.
@@ -1275,6 +1584,9 @@ async def wb_search(
     if page < 1 or page > 20:
         log_event("wb_search.validation_failed", reason="bad_page", page=page)
         raise_tool_error(BadRequestError("page 1..20"))
+
+    if _settings.transport == "dom":
+        return await _wb_search_dom(query, dest, page, ctx)
 
     try:
         # PRIMARY: search.wb.ru v9 returns fully-populated product objects — same
@@ -1306,29 +1618,40 @@ async def wb_search(
 
         products: list[Any] = []
         total_found: int | None = None
-        v9_error: str | None = None
+        v9_error: ConnectorError | None = None
 
         try:
             async with _wb_client() as client:
                 status_code, text, err = await _safe_get_text(client, v9_url)
-            if err:
-                v9_error = err
-            elif status_code == 429:
+            if status_code in (401, 403) or (status_code != 429 and _is_edge_wall(text)):
+                # A refusal must not become a stale legacy answer (#101).
+                log_event("wb_search.refused", endpoint="v9", status=status_code)
+                reason = f"HTTP {status_code}" if status_code in (401, 403) else f"HTML wall, HTTP {status_code}"
+                raise_tool_error(
+                    TransportDownError(
+                        f"wb_search: search.wb.ru v9 refused ({reason}); not falling back to the stale legacy id path",
+                        provider="wb",
+                        status_code=status_code,
+                    )
+                )
+            if status_code == 429:
                 # v9 is 429-prone by design; surface it honestly rather than
                 # silently degrading to the stale-id path.
                 log_event("wb_search.rate_limited", endpoint="v9")
                 raise_tool_error(RateLimitedError("wb", retry_after_s=60.0))
-            elif status_code != 200:
-                v9_error = f"HTTP {status_code}"
+            if err or status_code != 200:
+                v9_error = TransportDownError(
+                    _redact(err or f"wb_search v9: HTTP {status_code}"), provider="wb", status_code=status_code
+                )
             else:
                 try:
                     v9_data = json.loads(text or "")
                 except json.JSONDecodeError as exc:
-                    v9_error = f"invalid JSON: {exc}"
+                    v9_error = ParserDriftError(f"wb_search v9: invalid JSON: {exc}", provider="wb")
                 else:
                     v9_obj, v9_shape_error = _expect_json_object(v9_data, "wb_search v9 response")
                     if v9_shape_error or v9_obj is None:
-                        v9_error = "unexpected response shape"
+                        v9_error = ParserDriftError("wb_search v9: unexpected response shape", provider="wb")
                     else:
                         raw_products = v9_obj.get("products")
                         if not isinstance(raw_products, list):
@@ -1343,24 +1666,32 @@ async def wb_search(
                                 if isinstance(metadata, dict):
                                     total_found = R.coerce_int(metadata.get("total"))
                         else:
-                            v9_error = "no products array in response"
+                            v9_error = ParserDriftError("wb_search v9: no products array in response", provider="wb")
         except ToolError:
             raise
         except httpx.HTTPError as exc:
-            v9_error = f"{type(exc).__name__}: {exc}"
+            v9_error = TransportDownError(_redact(f"{type(exc).__name__}: {exc}"), provider="wb")
 
         fallback_used = False
         if not products:
-            # FALLBACK: the legacy two-step path. Its ids skew stale, but a stale
-            # result beats no result when v9 is unavailable, and the response is
-            # flagged so the caller knows which path produced it.
-            log_event("wb_search.v9_unavailable", error=_redact(v9_error or "empty result"))
+            # Legacy data is flagged when usable. Failure is not emptiness; only
+            # a positively empty primary response can survive a failed fallback.
+            log_event("wb_search.v9_unavailable", error=_redact(str(v9_error) if v9_error else "empty result"))
             fallback_used = True
-            products, total_found = await _search_via_search_goods(query, dest, page, ctx)
+            try:
+                products, total_found = await _search_via_search_goods(query, dest, page, ctx)
+            except ConnectorError as fallback_error:
+                log_event("wb_search.fallback_failed", error=_redact(str(fallback_error)))
+                if v9_error is not None:
+                    if isinstance(fallback_error, RateLimitedError):
+                        raise_tool_error(fallback_error)
+                    if isinstance(v9_error, ParserDriftError):
+                        raise_tool_error(v9_error)
+                    raise_tool_error(fallback_error)
 
         if not products:
             log_event("wb_search.no_results", query=query[:100])
-            return WbNoResultsResponse(query=query, page=page, total_ids=total_found or 0)
+            return WbNoResultsResponse(query=query, page=page, total_ids=total_found)
 
         # Past the end, WB repeats page 1 rather than returning nothing. Honour
         # the documented contract — a page past the end is "no results" — instead
@@ -1372,7 +1703,7 @@ async def wb_search(
                 _page1_fingerprints.set(fp_key, fingerprint)
         elif fingerprint and _page1_fingerprints.get(fp_key) == fingerprint:
             log_event("wb_search.page_wrapped", query=query[:100], page=page)
-            return WbNoResultsResponse(query=query, page=page, total_ids=total_found or 0)
+            return WbNoResultsResponse(query=query, page=page, total_ids=total_found)
 
         page_size = 100 if not fallback_used else 30
         item_dicts: list[dict[str, Any]] = []
@@ -1519,8 +1850,9 @@ async def _search_via_search_goods(
     skew stale — verified Jul 2026, a query whose v9 results were all in stock came
     back from this path entirely delisted — so callers are warned when it is used.
 
-    Returns ``(products, total)`` and never raises for an empty result: an empty
-    list simply means "nothing usable", which the caller reports as no results.
+    Returns ``(products, total)`` only for parsed upstream answers. Transport,
+    throttling and malformed payloads raise typed ConnectorErrors for the caller
+    to combine with v9's outcome. Refusals remain immediate ToolErrors (#101).
     """
     sg_params = httpx.QueryParams({"query": query, "dest": dest})
     sg_url = f"https://search-goods.wildberries.ru/search?{sg_params}"
@@ -1531,21 +1863,41 @@ async def _search_via_search_goods(
     try:
         async with _wb_client() as client:
             status_code, text, err = await _safe_get_text(client, sg_url)
-        if err or status_code != 200 or not text:
-            log_event("wb_search.fallback_failed", status=status_code, error=_redact(err or ""))
-            return [], None
-        ids = json.loads(text)
-    except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        log_event("wb_search.fallback_failed", error=_redact(str(exc)))
-        return [], None
+        if status_code in (401, 403) or (status_code != 429 and _is_edge_wall(text)):
+            # A refused id list is not an empty search result (#101).
+            log_event("wb_search.refused", endpoint="search_goods", status=status_code)
+            reason = f"HTTP {status_code}" if status_code in (401, 403) else f"HTML wall, HTTP {status_code}"
+            raise_tool_error(
+                TransportDownError(
+                    f"wb_search: legacy search-goods ids request refused ({reason})",
+                    provider="wb",
+                    status_code=status_code,
+                )
+            )
+        if status_code == 429:
+            raise RateLimitedError("wb")
+        if err or status_code != 200:
+            raise TransportDownError(
+                _redact(err or f"wb_search search-goods: HTTP {status_code}"), provider="wb", status_code=status_code
+            )
+        ids = json.loads(text or "")
+    except httpx.HTTPError as exc:
+        raise TransportDownError(_redact(str(exc)), provider="wb") from exc
+    except json.JSONDecodeError as exc:
+        raise ParserDriftError(f"wb_search search-goods: invalid JSON: {exc}", provider="wb") from exc
 
-    if not isinstance(ids, list) or not ids:
-        return [], None
+    if not isinstance(ids, list):
+        raise ParserDriftError("wb_search search-goods: expected an ids list", provider="wb")
+    if not ids:
+        return [], 0
 
     page_size = 30
     start = (page - 1) * page_size
-    page_ids = _recover_search_ids(ids[start : start + page_size])
+    raw_page_ids = ids[start : start + page_size]
+    page_ids = _recover_search_ids(raw_page_ids)
     if not page_ids:
+        if raw_page_ids:
+            raise ParserDriftError("wb_search search-goods: no recoverable ids", provider="wb")
         return [], len(ids)
 
     card_params = httpx.QueryParams(
@@ -1564,21 +1916,37 @@ async def _search_via_search_goods(
     try:
         async with _wb_client() as client:
             status_code, text, err = await _safe_get_text(client, card_url)
-        if err or status_code != 200 or not text:
-            log_event("wb_search.fallback_enrich_failed", status=status_code, error=_redact(err or ""))
-            return [], len(ids)
-        card_data = json.loads(text)
-    except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        log_event("wb_search.fallback_enrich_failed", error=_redact(str(exc)))
-        return [], len(ids)
+        if status_code in (401, 403) or (status_code != 429 and _is_edge_wall(text)):
+            # Refused enrichment must not hide behind no_results (#101).
+            log_event("wb_search.refused", endpoint="fallback_enrich", status=status_code)
+            reason = f"HTTP {status_code}" if status_code in (401, 403) else f"HTML wall, HTTP {status_code}"
+            raise_tool_error(
+                TransportDownError(
+                    f"wb_search: legacy card.wb.ru enrichment request refused ({reason})",
+                    provider="wb",
+                    status_code=status_code,
+                )
+            )
+        if status_code == 429:
+            raise RateLimitedError("wb")
+        if err or status_code != 200:
+            raise TransportDownError(
+                _redact(err or f"wb_search fallback card: HTTP {status_code}"), provider="wb", status_code=status_code
+            )
+        card_data = json.loads(text or "")
+    except httpx.HTTPError as exc:
+        raise TransportDownError(_redact(str(exc)), provider="wb") from exc
+    except json.JSONDecodeError as exc:
+        raise ParserDriftError(f"wb_search fallback card: invalid JSON: {exc}", provider="wb") from exc
 
     card_obj, shape_error = _expect_json_object(card_data, "wb_search fallback card response")
     if shape_error or card_obj is None:
-        return [], len(ids)
+        raise ParserDriftError("wb_search fallback card: expected an object", provider="wb")
     products, products_error = _card_products_checked(card_obj)
-    if products_error:
-        log_event("wb_search.fallback_enrich_failed", error=products_error)
-        return [], len(ids)
+    if products_error or any(not isinstance(product, dict) for product in products):
+        raise ParserDriftError(
+            f"wb_search fallback card: {products_error or 'products contain non-objects'}", provider="wb"
+        )
     return products, len(ids)
 
 
@@ -1914,7 +2282,7 @@ async def wb_category_products(
     ToolError: BadRequestError on malformed selectors or the unlistable
     'blackhole' shard; NotFoundError on a 404 (stale shard/query pair);
     RateLimitedError on HTTP 429; TransportDownError on network failures,
-    non-200 responses, Cloudflare HTML pages and unexpected internal errors;
+    non-200 responses, an HTML wall page from WB's edge, and unexpected internal errors;
     ParserDriftError on a non-JSON or mis-shaped body.
 
     Args:
@@ -2004,11 +2372,19 @@ async def wb_category_products(
             )
         if text and "<html" in text[:200].lower():
             log_event("wb_category_products.blocked", reason="cloudflare_html")
-            raise_tool_error(TransportDownError("Cloudflare HTML page (likely missing dest param)", provider="wb"))
+            raise_tool_error(
+                TransportDownError(
+                    f"WB served an HTML wall page instead of JSON{_refusal_hint()} "
+                    "(the edge decided this client is a bot; a missing dest is one way to earn it)",
+                    provider="wb",
+                )
+            )
         if status_code != 200:
             log_event("wb_category_products.http_error", status=status_code)
             raise_tool_error(
-                TransportDownError(f"wb_category_products HTTP {status_code}", provider="wb", status_code=status_code)
+                TransportDownError(
+                    f"wb_category_products HTTP {status_code}{_refusal_hint()}", provider="wb", status_code=status_code
+                )
             )
 
         try:
@@ -2067,9 +2443,12 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
       * card        — card.wb.ru v4 (wb_card / wb_search enrich): critical fields
                       + price extract.
       * reviews     — feedbacks2.wb.ru pool (wb_reviews): texts + productValuation.
-      * search_goods— search-goods.wildberries.ru (wb_search STEP 1): the id list
-                      must still be a non-empty list of recoverable ids on a broad
-                      evergreen query, else wb_search silently returns no_results.
+      * search_goods— search-goods.wildberries.ru (the legacy fallback path): the id
+                      list must still be a non-empty list of recoverable ids on a
+                      broad evergreen query, else wb_search silently returns no_results.
+      * search_v9   — search.wb.ru v9 (the PRIMARY path wb_search prefers): must
+                      answer 200 with identified, priced products, else a refusal of
+                      the primary path would only surface as the fallback's answers.
       * root_basket — basket-NN.wbbasket.ru (wb_root_info): imt_id must resolve,
                       else wb_root_info AND wb_reviews (indexed by imt_id) break.
 
@@ -2082,7 +2461,7 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
 
     WbSelfCheckResponse: {status, healthy, connector, checks, server_version,
     server_started_at, process_id, config_loaded, tool_count} — checks maps
-    card / reviews / search_goods / root_basket to a per-subcheck verdict
+    card / reviews / search_goods / search_v9 / root_basket to a per-subcheck verdict
     (healthy/drift/inconclusive). drift_detected and inconclusive are NOT
     errors; they are valid canary verdicts returned as a normal response.
 
@@ -2094,7 +2473,7 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
     """
     log_event("wb_selfcheck.start")
     if ctx is not None:
-        await ctx.info("wb_selfcheck: probing card / reviews / search_goods / root_basket")
+        await ctx.info("wb_selfcheck: probing card / reviews / search_goods / search_v9 / root_basket")
     checks: dict[str, dict] = {}
 
     # --- card v4 ---
@@ -2104,7 +2483,7 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
     try:
         async with asyncio.timeout(45):  # whole-subcheck wall-clock (audit CRASH_HANG)
             async with _wb_client() as client:
-                status_code, text, err = await _safe_get_text(client, card_url)
+                status_code, text, err = await _fresh_get_text(client, card_url)
             if err or status_code != 200:
                 checks["card"] = R.selfcheck_entry(
                     "inconclusive", baseline=str(nm), reason="transport_down", notes=[f"http {status_code} err={err}"]
@@ -2225,7 +2604,7 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
             used_host = ""
             async with _wb_client() as client:
                 for host in WB_REVIEW_HOSTS:
-                    status_code, text, err = await _safe_get_text(
+                    status_code, text, err = await _fresh_get_text(
                         client, f"https://{host}/feedbacks/v2/{_SELFCHECK_IMT}"
                     )
                     if err or status_code != 200:
@@ -2345,7 +2724,7 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
     try:
         async with asyncio.timeout(45):
             async with _wb_client() as client:
-                status_code, text, err = await _safe_get_text(client, sg_url)
+                status_code, text, err = await _fresh_get_text(client, sg_url)
             if err or status_code == 429:
                 checks["search_goods"] = R.selfcheck_entry(
                     "inconclusive",
@@ -2418,6 +2797,115 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
             notes=[f"{type(exc).__name__}: {str(exc)[:120]}"],
         )
 
+    # --- search_v9 (the PRIMARY path wb_search prefers) ---
+    #
+    # Probed separately from search_goods, because they fail differently and only
+    # this one is on the path a caller actually takes. When v9 was refused, search
+    # fell through to the legacy id list and answered with unrelated products and
+    # prices attached — and this canary stayed green, because its other probe reads
+    # search-goods and never touched v9. A refused primary path has to be visible.
+    v9_params = httpx.QueryParams(
+        {
+            "appType": "1",
+            "curr": "rub",
+            "dest": WB_DEFAULT_DEST,
+            "locale": "ru",
+            "query": sq,
+            "resultset": "catalog",
+            "page": "1",
+            "spp": "30",
+        }
+    )
+    v9_url = f"https://search.wb.ru/exactmatch/ru/common/v9/search?{v9_params}"
+    await _polite_wait()
+    try:
+        async with asyncio.timeout(45):
+            async with _wb_client() as client:
+                status_code, text, err = await _fresh_get_text(client, v9_url)
+            if err or status_code == 429:
+                checks["search_v9"] = R.selfcheck_entry(
+                    "inconclusive",
+                    baseline=sq,
+                    reason="rate_limited" if status_code == 429 else "transport_down",
+                    notes=[f"http {status_code} err={err} — primary search path (v9) unavailable"],
+                )
+            elif status_code != 200:
+                checks["search_v9"] = R.selfcheck_entry(
+                    "inconclusive",
+                    baseline=sq,
+                    reason="transport_down",
+                    notes=[f"http {status_code} — primary search path refused"],
+                )
+            else:
+                try:
+                    payload = json.loads(text or "")
+                except json.JSONDecodeError as exc:
+                    checks["search_v9"] = R.selfcheck_entry(
+                        "drift",
+                        baseline=sq,
+                        reason="parse_error",
+                        notes=[f"v9 returned HTTP 200 but invalid JSON: {exc}"],
+                    )
+                    payload = None
+                if payload is not None:
+                    v9_products: Any = None
+                    if isinstance(payload, dict):
+                        v9_products = payload.get("products")
+                        if not isinstance(v9_products, list):
+                            nested = payload.get("data")
+                            if isinstance(nested, dict) and isinstance(nested.get("products"), list):
+                                v9_products = nested["products"]
+                    if not isinstance(payload, dict):
+                        checks["search_v9"] = R.selfcheck_entry(
+                            "drift",
+                            baseline=sq,
+                            reason="schema_drift",
+                            notes=[f"v9 returned {type(payload).__name__}, not object"],
+                        )
+                    elif not isinstance(v9_products, list):
+                        checks["search_v9"] = R.selfcheck_entry(
+                            "drift",
+                            baseline=sq,
+                            reason="schema_drift",
+                            notes=["v9 200 body has no products list (wb_search would fall back to stale ids)"],
+                        )
+                    elif not v9_products:
+                        checks["search_v9"] = R.selfcheck_entry(
+                            "drift",
+                            baseline=sq,
+                            reason="empty_products",
+                            notes=["v9 answered 200 with no products for an evergreen query"],
+                        )
+                    else:
+                        identified = [
+                            item
+                            for item in v9_products
+                            if isinstance(item, dict)
+                            and (
+                                (isinstance(item.get("id"), int) and not isinstance(item.get("id"), bool))
+                                or (isinstance(item.get("nmId"), int) and not isinstance(item.get("nmId"), bool))
+                            )
+                        ]
+                        priced = [item for item in identified if item.get("salePriceU") or item.get("priceU")]
+                        if not identified:
+                            checks["search_v9"] = R.selfcheck_entry(
+                                "drift",
+                                baseline=sq,
+                                raw_len=len(v9_products),
+                                notes=["v9 products carry no numeric id (id-shape drift)"],
+                            )
+                        else:
+                            checks["search_v9"] = R.selfcheck_entry(
+                                "healthy", baseline=sq, recovered_ids=len(identified), priced=len(priced)
+                            )
+    except (TimeoutError, Exception) as exc:
+        checks["search_v9"] = R.selfcheck_entry(
+            "inconclusive",
+            baseline=sq,
+            reason="timeout" if isinstance(exc, asyncio.TimeoutError) else "transport_down",
+            notes=[f"{type(exc).__name__}: {str(exc)[:120]}"],
+        )
+
     # --- root_basket (wb_root_info imt_id resolution) ---
     await _polite_wait()
     try:
@@ -2427,7 +2915,7 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
             part = nm // 1000
             basket_url = f"https://{host}/vol{vol}/part{part}/{nm}/info/ru/card.json"
             async with _wb_client() as client:
-                status_code, text, err = await _safe_get_text(client, basket_url)
+                status_code, text, err = await _fresh_get_text(client, basket_url)
             if err or status_code == 404 or status_code != 200:
                 checks["root_basket"] = R.selfcheck_entry(
                     "inconclusive",
@@ -2509,7 +2997,7 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
     result = R.selfcheck_result(
         "wb",
         checks,
-        required=("card", "reviews", "search_goods", "root_basket"),
+        required=("card", "reviews", "search_goods", "search_v9", "root_basket"),
         server_version=SERVER_VERSION,
         server_started_at=SERVER_STARTED_AT,
         process_id=os.getpid(),

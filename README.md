@@ -16,8 +16,13 @@
 опциональный MPStats берёт платный токен (`MPSTATS_MP_AUTH`) — без него всё
 остальное работает как прежде.
 
-[English version below](#english-version) · [Архитектура](docs/ARCHITECTURE.md) ·
+[English version below](#english-version) · [Первый успешный запрос](docs/QUICKSTART.md) · [Архитектура](docs/ARCHITECTURE.md) ·
 [Как добавить источник](docs/ADDING_A_SOURCE.md) · [Про анти-бот](docs/ANTI_BOT.md)
+
+Для проверок в браузере добавлен опциональный режим сохранения вкладки:
+`CHROME_CHALLENGE_HANDOFF_S=120`. После завершения проверки повтор того же
+запроса в той же MCP-сессии продолжает чтение этой вкладки. Поддержка и ограничения
+описаны в [настройке Chrome](docs/CDP_SETUP.md#optional-challenge-handoff).
 
 ---
 
@@ -32,17 +37,18 @@
 | **Авито**         | 3            | ваш Chrome + российский домашний IP и запросы вразрядку — иначе блок по IP | Поиск объявлений, карточки, репутация продавца                                            |
 | **Taobao**        | 2            | ваш Chrome с активным входом в Taobao                                      | Поиск и карточки, цены в юанях                                                            |
 | **Мегамаркет**    | 2            | ваш Chrome с активным входом — анонимной сессии API отдаёт пусто           | Поиск и карточки через мобильный API                                                      |
-| **Lamoda**        | 2            | карточки анонимно (GraphQL), поиск — ваш Chrome                            | Поиск, карточки с размерами                                                               |
+| **Lamoda**        | 2            | карточки: HTTP GraphQL → Chrome при отказе; поиск — Chrome                            | Поиск, карточки с размерами                                                               |
 | **DNS**           | 2            | ваш Chrome (Qrator)                                                        | Поиск и карточки электроники                                                              |
 | **Ситилинк**      | 2            | ваш Chrome (Qrator)                                                        | Поиск и карточки электроники                                                              |
 | **AliExpress**    | 2            | ваш Chrome (x5sec)                                                       | Поиск и карточки, цены в рублях                            |
 | **Циан**          | 2            | ваш Chrome (WAF по IP)                                                     | Недвижимость: поиск по фильтрам (продажа, аренда, посуточно) и карточка объявления         |
-| **Дром (baza.drom.ru)** | 3      | ваш Chrome (WAF)                                                           | Автозапчасти, шины, диски, масла: поиск, карточки товаров, профиль продавца и отзывы       |
-| **Сравнение**     | 3            | опрашивает всё перечисленное                                               | «Где дешевле?» одним вызовом                                                              |
+| **Дром (baza.drom.ru)** | 4      | ваш Chrome (WAF)                                                           | Автозапчасти, шины, диски, масла: поиск, карточки товаров, фото-инспекция деталей, профиль продавца и отзывы |
+| **Сравнение**     | 4            | опрашивает всё перечисленное                                               | «Где дешевле?» одним вызовом                                                              |
 | **MPStats**       | 2            | платный аккаунт MPStats, cookie `mp_auth` (опционально)                    | Продажи/остатки/графики за 30 дней по SKU Ozon/WB, остатки по складам (FBS/FBO)           |
 
-Читается анонимно, без браузера: Wildberries, Яндекс Маркет, Детский мир и
-карточки Lamoda. Остальным нужен ваш залогиненный Chrome (CDP). Taobao и
+Читается анонимно, без браузера: Wildberries, Яндекс Маркет и Детский мир.
+Карточки Lamoda сначала читаются по HTTP GraphQL; при отказе нужен ваш Chrome
+(CDP) для запасного уровня. Остальным нужен ваш залогиненный Chrome (CDP). Taobao и
 Мегамаркет вдобавок требуют активного входа в саму площадку — без него Taobao
 упирается в стену логина, а Мегамаркет отдаёт пустой ответ. Авито ещё и блокирует
 по IP: с датацентрового адреса это глухой отказ, с российского домашнего — работает,
@@ -53,24 +59,29 @@
 
 MPStats стоит особняком: это единственный **платный** источник. Без
 `MPSTATS_MP_AUTH` сервер запускается, но инструменты отвечают `auth_missing` —
-поэтому он опционален и подключается по желанию, на остальные тринадцать
+поэтому он опционален и подключается по желанию, на остальные четырнадцать
 серверов он не влияет никак.
 
-Всего 41 инструмент в 15 серверах на общем рантайме `mcp-core`. Плюс объединённый
+Всего 43 инструмента в 15 серверах на общем рантайме `mcp-core`. Плюс объединённый
 `marketplace-mcp`, который монтирует всё разом — одна запись в конфиге клиента
 вместо пятнадцати. Он добавляет свой инструмент `marketplace_sources` (какие коннекторы
-поднялись, а какие отвалились и почему), так что в нём 42 инструмента: 41
-смонтированный плюс этот.
+поднялись, а какие отвалились и почему), так что в нём 44 инструмента: 43
+смонтированных плюс этот.
+
+**Проверка 2.5.3:** 13 октября с одного адреса selfcheck прошли Ozon, Яндекс Маркет, Детский мир, Авито (поиск, карточка, продавец), Taobao, Ситилинк, AliExpress и Циан; Wildberries отвечает через `WB_TRANSPORT=dom`. Lamoda, DNS и Мегамаркет честно отвечают «заблокировано», пока человек не пройдёт их проверку в Chrome: куки живут минуты (12 октября после проверки они работали). Дрейфа не найдено, визуальная приёмка не выполнена. [Статус источников](docs/releases/RELEASE_NOTES_v2.5.3.md).
 
 ## Быстрый старт
 
 Нужны **Python 3.12+** и [uv](https://docs.astral.sh/uv/).
 
+Для установки клиента, выбора источников и проверки первого предложения —
+[пошаговый старт](docs/QUICKSTART.md). Node нужен только для тестов разработчика.
+
 ```bash
 git clone https://github.com/Vladimir-Human/ru-marketplace-mcp.git
 cd ru-marketplace-mcp
 uv sync --all-packages
-uv run pytest -q -m "not live and not cdp"   # 1315 офлайн-тестов, сеть не нужна
+uv run pytest -q -m "not live and not cdp"   # 2302 офлайн-тестов, сеть не нужна
 ```
 
 Проверка живого эндпоинта:
@@ -139,6 +150,36 @@ macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 команд — `wb-mcp`, `ozon-mcp`, `yandex-mcp`, `detmir-mcp`, `avito-mcp`,
 `taobao-mcp`, `megamarket-mcp`, `lamoda-mcp`, `dns-mcp`, `citilink-mcp`,
 `compare-mcp`, `marketplace-mcp`.
+
+### Только нужные площадки: `MARKETPLACE_SOURCES`
+
+Объединённый сервер монтирует все источники, а описания их инструментов уходят
+в контекст **в каждом запросе**. Переменная `MARKETPLACE_SOURCES` оставляет
+только перечисленные:
+
+```jsonc
+{
+  "mcpServers": {
+    "marketplace": {
+      "command": "uv",
+      "args": ["run", "--directory", "C:/путь/к/ru-marketplace-mcp", "marketplace-mcp"],
+      "env": {
+        "MARKETPLACE_SOURCES": "wildberries,ozon,yandex_market,avito,aliexpress,dns,compare",
+      },
+    },
+  },
+}
+```
+
+Имена — канонические (`wildberries`, `ozon`, `yandex_market`, `detsky_mir`,
+`avito`, `taobao`, `megamarket`, `lamoda`, `dns`, `citilink`, `aliexpress`,
+`cian`, `compare`, `mpstats`); короткие псевдонимы `wb`, `ym`/`yandex`, `detmir`, `ali`
+тоже принимаются. Неизвестное имя отклоняется при запуске с перечнем
+поддерживаемых источников, чтобы опечатка не превратилась в частичный сервер.
+Переменная не задана или пуста — монтируется всё, как раньше.
+Отключённые источники видно в `marketplace_sources`: они попадают в `skipped`
+с пометкой, что их сняли, а не что они не импортировались. `compare_prices`
+опрашивает ровно тот же набор.
 
 </details>
 
@@ -238,6 +279,15 @@ dsh plugin --profile web add github:Vladimir-Human/ru-marketplace-mcp#path:/dsh
 `blackhole` — у них нет своей выдачи, и инструмент честно об этом говорит вместо
 пустого списка.
 
+Если с вашего адреса API WB отвечает 403 (так бывает: отказ зависит и от адреса,
+и от клиента), включите `WB_TRANSPORT=dom`. Тогда `wb_search` и `wb_card` читают
+отрисованные страницы WB в вашем Chrome через CDP, как DNS и Ситилинк, без
+обращений к API. В выдаче поиска `price_rub` — цена по WB Кошельку
+(`price_kind: wallet`); карточка отдаёт обычную цену, цену по Кошельку и
+зачёркнутую раздельно, а также магазин, склад, срок доставки, возврат, гарантию,
+значок «Оригинал» и строку «Все N предложений от X ₽». Подробности —
+[ANTI_BOT.md](docs/ANTI_BOT.md#when-the-api-refuses-rendered-pages-wb_transportdom).
+
 ### Яндекс Маркет — `yandex_*`
 
 | Инструмент                                 | Что делает                                     |
@@ -249,6 +299,12 @@ dsh plugin --profile web add github:Vladimir-Human/ru-marketplace-mcp#path:/dsh
 требует подписку Яндекс Плюс и обычно на 25–30% ниже. Интерфейс Яндекса показывает
 вторую крупным шрифтом, поэтому назвать её без оговорки — значит пообещать цену,
 которую человек без подписки не получит.
+
+**Строка поиска — это оффер из выдачи, а не дефолтный оффер карточки.** Один
+`product_id` покрывает семейство товаров, и в выдаче может показываться один его
+представитель, а в карточке по тому же id — другой; сверяйте строки поиска с
+карточками по `sku_id`, а не по URL. `price_old_rub` в строках поиска — зачёркнутая
+базовая цена, контекст скидки; называть её ценой нельзя.
 
 `rating_stars` даёт распределение вида `{1: 10, 2: 3, 3: 10, 4: 19, 5: 502}`. Из
 него видно, честная ли средняя 4.8 или за ней прячется кучка единиц.
@@ -304,14 +360,26 @@ TLS-имперсонация. Если Cloudflare выдаёт челлендж,
 | Инструмент                                            | Что делает                                           |
 | ----------------------------------------------------- | ---------------------------------------------------- |
 | `avito_search(query, page, location_id, category_id)` | Поиск объявлений через внутренний `js/items` API     |
-| `avito_card(item_id_or_url)`                          | Одно объявление: цена, описание, просмотры, продавец |
-| `avito_seller(seller_id_or_url)`                      | Рейтинг продавца, число отзывов, активные объявления |
+| `avito_card(item_id_or_url)`                          | Страница объявления через CDP: название, цена, описание, число фото, продавец (рейтинг, ссылка на профиль) |
+| `avito_seller(seller_id_or_url)`                      | Рейтинг продавца, число отзывов; число активных объявлений недоступно (`null`) |
 
 Авито — это объявления, а не каталог: пула отзывов на товар нет, репутация
 продавца и есть сигнал доверия. Бесплатное/обменное объявление приходит с
 `price_rub: null` — никогда не `0`, чтобы не оказаться «самым дешёвым» в
-сравнении. С датацентрового IP Авито отвечает 403-файрволом, поэтому коннектор
-двухуровневый: TLS-имперсонация, дальше ваш Chrome (как у Ozon).
+сравнении. Поиск использует TLS-имперсонацию и ваш Chrome как запасной путь.
+Карточки читают schema.org Product и блок продавца со страницы объявления через
+CDP: `seller` содержит репутацию и ссылку на профиль, если блок доступен.
+На 2026-10-12 `/web/1/js/items` игнорирует `itemId` и `userId`; разные продавцы
+получают один общий каталог с `totalCount: 1500`, а не свои объявления.
+Поэтому продавцы читаются с отрисованного профиля через CDP с теми же паузами и
+разрешёнными хостами, что и карточки. Принимаются `/brands/<hash>`,
+`/user/<hash>/profile` и голый ID: 32 шестнадцатеричных символа ведут в `brands`,
+остальные ID — в `user`. Недоступный счётчик `active_items` остаётся `null`.
+Полный URL карточки используется без query/fragment; для ID применяется `/{id}`:
+Авито перенаправляет его на страницу объявления. `location`, `posted_at`, `views`
+остаются `null`: их нет в Product JSON-LD. Без Product или одновременно без
+названия и цены возвращается `parser_drift`, а не пустой успех. Canary проходит
+цепочку поиск → карточка → профиль продавца. С датацентрового IP возможен 403-файрвол.
 
 ### Taobao — `taobao_*`
 
@@ -332,14 +400,17 @@ TLS-имперсонация. Если Cloudflare выдаёт челлендж,
 JSON API из-за ServicePipe, и одного пройденного челленджа мало: анонимной сессии
 API отдаёт пустой список, нужен активный вход в Мегамаркет. DNS (`dns_*`) и Ситилинк
 (`citilink_*`) — отрисованный DOM из-за Qrator; у всех трёх анонимного пути нет вообще.
-Lamoda (`lamoda_*`) наполовину: карточки берутся анонимно через GraphQL, а поиск —
-через Chrome. Chrome с CDP (`scripts/start_chrome_cdp.sh`) нужен всем, кроме карточек
-Lamoda.
+Lamoda (`lamoda_*`) наполовину: поиск идёт через Chrome, а карточки сначала
+читаются через HTTP GraphQL (tier 1). При ответе не 200 или
+`httpx.TransportError` выполняется ровно один GraphQL POST внутри страницы вашего
+Chrome через CDP (tier 2); успешный fallback отмечен `tier_used: graphql_cdp`.
+HTTP 200 не вызывает CDP. Причина: 2026-10-12 GraphQL по HTTPS отвечал циклом 307.
+Chrome с CDP (`scripts/start_chrome_cdp.sh`) нужен остальным всегда, а карточкам
+Lamoda — только для запасного уровня.
 
-Всего через CDP ходят восемь источников — эти плюс Taobao, AliExpress, Ozon и
-Авито, где Chrome лишь
-запасной уровень: их tier 1 обычно отвечает, а браузер включается, когда анонимный
-уровень упёрся в челлендж. `marketplace-mcp doctor` из вашего браузера скажет, какие
+Всего через CDP ходят девять источников — эти плюс Taobao, AliExpress, Циан, Ozon и
+Авито. У Ozon, а также у поиска и продавцов Авито Chrome — запасной уровень,
+когда анонимный tier 1 упёрся в челлендж; карточки Авито всегда требуют CDP. `marketplace-mcp doctor` из вашего браузера скажет, какие
 эндпоинты подтверждены.
 
 
@@ -404,8 +475,11 @@ compare_prices("кроссовки мужские")
 Маркетплейсы опрашиваются параллельно, и каждый отчитывается сам за себя. Если один
 заблокирован, сравнение не рушится: `complete: false` вместе с `source_outcomes`
 покажет, что именно вы видите. Подписочные цены в ранжировании не участвуют.
-Совпадающие предложения по паре (источник, id товара) схлопываются, так что один
-и тот же товар не занимает два места в ранжировании.
+Повторы по (источник, id товара, id варианта) схлопываются. Разные SKU Яндекса
+сохраняются даже внутри одной товарной семьи. Наличие в сравнении трёхзначное:
+`true` — подтверждено, `false` — подтверждено отсутствие, `null` — неизвестно.
+При `in_stock_only=true` победитель выбирается только среди `true`; неизвестные
+остатки WB и неоднозначные подписи Ozon остаются видимыми в конце списка.
 
 У каждого предложения есть `currency` (строчный ISO-код, по умолчанию `rub`) и
 `price_native` — цена в этой валюте, как её показывает маркетплейс. Для российских
@@ -493,7 +567,7 @@ compare_prices("кроссовки мужские")
 | `AVITO_`             | `TIMEOUT`, `MIN_GAP`, `IMPERSONATE`, `CACHE_TTL`, `PROXY`, `LOCATION_ID`                                                         |
 | `TAOBAO_`            | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`,                                                                                               |
 | `ALI_`               | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`                                                                                                |
-| `MEGAMARKET_`        | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`                                                                                                |
+| `MEGAMARKET_`        | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`, `USE_PROFILE_ADDRESS` (0/1, по умолчанию 0 — приватный список адресов профиля не читается; 1 = адрес по умолчанию из залогиненного профиля, цены «как видит оператор») |
 | `LAMODA_`            | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`, `PROXY`                                                                                       |
 | `DNS_` / `CITILINK_` | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`                                                                                                |
 | `CHROME_`            | `CDP_HOST`, `CDP_PORT`, `SCRAPING_PROFILE`, `BINARY`, `HEADLESS`, `STEALTH`                                                      |
@@ -504,7 +578,7 @@ compare_prices("кроссовки мужские")
 `CHROME_CDP_HOST` указывает, куда дозвониться CDP-клиенту (по умолчанию
 `127.0.0.1`). Из контейнера ставьте `chrome` (сайдкар) или `host.docker.internal`
 — это открывает tier-2 источники (Ozon, Авито, Taobao, Мегамаркет, Lamoda,
-DNS, Ситилинк) в Docker без host networking. Подробности в
+DNS, Ситилинк, AliExpress, Циан) в Docker без host networking. Подробности в
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 `*_CACHE_TTL=0` выключает кэш. `*_PROXY` перекрывает стандартные `HTTPS_PROXY` и
@@ -527,7 +601,7 @@ TTL.
 
 ```bash
 uv sync --all-packages
-uv run pytest -q -m "not live and not cdp"    # 1315 офлайн-тестов
+uv run pytest -q -m "not live and not cdp"    # 2302 офлайн-тестов
 uv run pytest -q -m "not live"                # то, что гоняет CI
 uv run pytest -q -m "not live" --cov          # покрытие, порог 70% в CI
 uv run ruff check . && uv run ruff format --check .
@@ -579,9 +653,12 @@ CI прогоняет тесты на Ubuntu, Windows и macOS против Pyth
 должен.
 
 Условия маркетплейсов, как правило, запрещают неофициальный парсинг. Коннекторы
-обращаются только к публичным эндпоинтам каталога, которые использует официальный
-веб-клиент. В приватные и административные разделы запросов нет. Уровень Ozon с
-браузером работает внутри сессии, которую вы открыли сами. Используйте на своё
+обращаются к публичным эндпоинтам каталога, которые использует официальный
+веб-клиент: пока opt-in не включён, в приватные и административные разделы
+запросов нет — список адресов профиля Мегамаркета читается только при
+`MEGAMARKET_USE_PROFILE_ADDRESS=1`, а MPStats заходит в аккаунтную зону по
+вашему токену (`MPSTATS_MP_AUTH`). Уровень Ozon с браузером работает внутри
+сессии, которую вы открыли сами. Используйте на своё
 усмотрение, для личных исследований, в вежливом темпе запросов. Пауза между
 вызовами к площадкам с анти-ботом — это часть конструкции, а не случайное
 торможение: её не нужно убирать ради скорости. Данные инструментов не предназначены
@@ -590,19 +667,21 @@ CI прогоняет тесты на Ubuntu, Windows и macOS против Pyth
 ## Как это сделано
 
 Код и документацию я писал вместе с ИИ-ассистентами. Они работают быстро и
-ошибаются уверенно, поэтому проект устроен вокруг проверки: 1315 офлайн-тестов,
+ошибаются уверенно, поэтому проект устроен вокруг проверки: 2302 офлайн-тестов,
 аудит перед выпуском, тесты, которые прогоняют настоящий экстрактор по снятой с
 сайта разметке. В заметках к релизу перечислено, какие источники сверены с живыми
 страницами вручную и какие остались непроверенными.
 
-Вопрос «кто набрал текст» кажется мне менее интересным, чем вопрос «чем это
-проверено». Второй здесь задокументирован, и проверить его может любой.
+Проверки важнее авторства текста, но авторство кода и идей тоже должно быть
+видно: полный список участников и их PR собран в [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ## Спасибо
 
-[@Xpos587](https://github.com/Xpos587) — коннектор MPStats
-([PR #5](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/5)):
-разбор API плагина, структура парсеров и первая рабочая версия.
+- [@Xpos587](https://github.com/Xpos587) — коннектор MPStats, [PR #5](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/5).
+- [@avxone](https://github.com/avxone) — исправление Avito selfcheck, [PR #37](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/37).
+- [@Khalmatov](https://github.com/Khalmatov) — provenance отзывов Ozon, [PR #38](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/38).
+- [@fosteev](https://github.com/fosteev) — macOS CDP stealth и коннектор Циана, [PR #42](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/42), [PR #47](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/47).
+- [@ilodezis](https://github.com/ilodezis) — выбор источников unified-сервера через `MARKETPLACE_SOURCES`, [PR #48](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/48).
 
 ## Лицензия
 
@@ -614,14 +693,18 @@ MIT, файл [LICENSE](LICENSE).
 
 **MCP servers for Russian and Chinese marketplaces.** Read prices, stock, ratings,
 reviews and seller identity from Wildberries, Ozon, Yandex Market, Detsky Mir, Avito,
-AliExpress, Taobao, Megamarket, Lamoda, DNS, Citilink and Drom (baza.drom.ru), then compare prices across
-all of them in one call. Taobao and AliExpress are the Chinese ones; the other ten
-are Russian.
+AliExpress, Taobao, Megamarket, Lamoda, DNS, Citilink and Drom (baza.drom.ru), then compare product prices
+in one call. Cian adds real-estate search and listing cards separately.
+
+[First successful query](docs/QUICKSTART.md) walks through installation, choosing
+a server, targeted health checks, and verifying an offer before recommending it.
 
 Read-only. No credentials, no API keys, no account required — the marketplaces with
 hard anti-bot are read through your own Chrome. One optional exception: MPStats
 takes a paid account token (`MPSTATS_MP_AUTH`) if you want its analytics; without
 it every other server is unaffected.
+
+**2.5.3 verification:** on 13 October, from one address, Ozon, Yandex Market, Detsky Mir, Avito (search, card, seller), Taobao, Citilink, AliExpress and Cian passed selfcheck; Wildberries answers through `WB_TRANSPORT=dom`. Lamoda, DNS and Megamarket report blocked until a human clears their browser check, whose cookies last minutes (on 12 October they worked right after it). No drift; no visual acceptance. See the [per-source release evidence](docs/releases/RELEASE_NOTES_v2.5.3.md).
 
 ## What you get
 
@@ -634,16 +717,17 @@ it every other server is unaffected.
 | **Avito**         | 3     | your Chrome + a Russian residential IP and spaced requests — else an IP block | Classified search, cards, seller reputation                                                        |
 | **Taobao**        | 2     | your Chrome with an active Taobao login                                       | Search and cards, prices in yuan                                                                   |
 | **Megamarket**    | 2     | your Chrome with an active login — an anonymous session reads empty           | Search and cards via the mobile API                                                                |
-| **Lamoda**        | 2     | cards anonymous (GraphQL), search via your Chrome                             | Search, cards with sizes                                                                           |
+| **Lamoda**        | 2     | cards: HTTP GraphQL → Chrome on refusal; search via Chrome                             | Search, cards with sizes                                                                           |
 | **DNS**           | 2     | your Chrome (Qrator)                                                          | Electronics search and cards                                                                       |
 | **Citilink**      | 2     | your Chrome (Qrator)                                                          | Electronics search and cards                                                                       |
 | **AliExpress**    | 2     | your Chrome (x5sec)                                                           | Search and cards, ruble prices                            |
 | **Cian**          | 2     | your Chrome (WAF by IP)                                                      | Real estate: filter search (sale, long-term rent, daily) and one offer's card                      |
-| **Drom (baza.drom.ru)** | 3 | your Chrome (WAF)                                                           | Auto parts, tires, wheels, oils: search, item cards, seller reputation and feedbacks              |
-| **Compare**       | 3     | aggregates the above                                                          | "Where is this cheapest?" in one call                                                              |
+| **Drom (baza.drom.ru)** | 4 | your Chrome (WAF)                                                           | Auto parts, tires, wheels, oils: search, item cards, part photo inspection, seller reputation and feedbacks |
+| **Compare**       | 4     | aggregates the above                                                          | "Where is this cheapest?" in one call                                                              |
 | **MPStats**       | 2     | paid MPStats account, `mp_auth` cookie (optional)                             | 30-day sales/stock graphs per Ozon/WB SKU, warehouse split (FBS/FBO)                               |
 
-Anonymous, no browser: Wildberries, Yandex Market, Detsky Mir and Lamoda cards.
+Anonymous, no browser: Wildberries, Yandex Market and Detsky Mir. Lamoda cards
+try HTTP GraphQL first and need your Chrome (CDP) only for the fallback tier.
 The rest need your logged-in Chrome (CDP). Taobao and Megamarket additionally need
 you signed into the marketplace itself — without it Taobao hits a login wall and
 Megamarket returns an empty result. Avito also blocks by IP: from a datacenter
@@ -657,10 +741,10 @@ MPStats stands apart as the only **paid** source: without `MPSTATS_MP_AUTH` the
 server boots but its tools answer `auth_missing`. It is therefore optional —
 plug it in if you have an account; the other fourteen servers never notice.
 
-41 tools across 15 stdio MCP servers, sharing one runtime (`mcp-core`), plus the
+43 tools across 15 stdio MCP servers, sharing one runtime (`mcp-core`), plus the
 unified `marketplace-mcp` that mounts them all under one client entry. It adds its
 own `marketplace_sources` tool — which connectors mounted, and which dropped out and
-why — so it exposes 42 tools: the 41 mounted plus that one. stdio is the default;
+why — so it exposes 44 tools: the 43 mounted plus that one. stdio is the default;
 HTTP transport is opt-in for remote deployment — see
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
@@ -672,7 +756,7 @@ Requires **Python 3.12+** and [uv](https://docs.astral.sh/uv/).
 git clone https://github.com/Vladimir-Human/ru-marketplace-mcp.git
 cd ru-marketplace-mcp
 uv sync --all-packages
-uv run pytest -q -m "not live and not cdp"    # 1315 offline tests, no network needed
+uv run pytest -q -m "not live and not cdp"    # 2302 offline tests, no network needed
 ```
 
 Client configuration mirrors the Russian section above. Each server is a console
@@ -735,6 +819,15 @@ the same shape as `wb_search`, so a category walk and a text search are directly
 comparable. Several of WB's largest sections carry the shard `blackhole` and have no
 feed at all; the tool says so instead of returning an empty list.
 
+If WB's API answers 403 from your address (the refusal depends on both address and
+client), set `WB_TRANSPORT=dom`: `wb_search` and `wb_card` then read WB's rendered
+pages in your Chrome over CDP, like DNS and Citilink, with no API calls. On search
+tiles `price_rub` is the WB Wallet price (`price_kind: wallet`); the card reports
+the regular, Wallet and struck prices separately, plus the store, warehouse,
+delivery date, return policy, warranty, the «Оригинал» badge and «Все N
+предложений от X ₽». Details in
+[ANTI_BOT.md](docs/ANTI_BOT.md#when-the-api-refuses-rendered-pages-wb_transportdom).
+
 ### Yandex Market — `yandex_*`
 
 | Tool                                       | What it does                                |
@@ -745,6 +838,11 @@ feed at all; the tool says so instead of returning an empty list.
 **Two prices, always.** `price_rub` is what anyone pays. `price_with_plus` needs a
 paid Yandex Plus subscription and runs 25–30% lower. Yandex leads with the subscriber
 price, so quoting it uncritically misstates the real cost.
+
+**A search row is the SERP's offer, not the card's default offer.** One `product_id`
+covers a product family, and search may show one member while the card for the same id
+defaults to another — reconcile rows with cards by `sku_id`, not by URL. `price_old_rub`
+on search rows is the struck-through reference price, never a price to quote.
 
 `rating_stars` gives the distribution, for example `{1: 10, 2: 3, 3: 10, 4: 19, 5: 502}`.
 That reveals whether a 4.8 average is earned or hides a cluster of complaints.
@@ -838,14 +936,25 @@ takes no part in `compare_prices`.
 | Tool                                              | What it does                                      |
 | ------------------------------------------------- | ------------------------------------------------- |
 | `avito_search(query, page, location_id, category_id)` | Classified search through the internal `js/items` API |
-| `avito_card(item_id_or_url)`                      | One listing: price, description, views, seller     |
-| `avito_seller(seller_id_or_url)`                  | Seller rating, review count, active listings       |
+| `avito_card(item_id_or_url)`                      | CDP item page: title, price, description, image count, seller (rating, profile link) |
+| `avito_seller(seller_id_or_url)`                  | Seller rating, review count; active listing count unavailable (`null`)       |
 
 Avito is classifieds, not a catalog: there is no per-product review pool, the
 seller's reputation IS the trust signal. A free/swap listing arrives with
-`price_rub: null` — never `0`, so it cannot win "cheapest". From a datacenter
-IP Avito answers a 403 firewall, hence the two-tier transport: TLS impersonation
-first, then your Chrome, exactly like Ozon.
+`price_rub: null` — never `0`, so it cannot win "cheapest". Search uses TLS
+impersonation with Chrome fallback. Cards read the item page's schema.org Product
+and seller block over CDP; `seller` carries reputation and the profile link when
+that block is available. As of 2026-10-12 `/web/1/js/items` ignores both `itemId`
+and `userId`: different sellers receive the same generic catalog with `totalCount: 1500`,
+not their listings. Seller reads therefore use the rendered profile over CDP,
+with the same pacing and allowed hosts as cards. Accepted paths are
+`/brands/<hash>` and `/user/<hash>/profile`, or a bare id: 32 hex characters map
+to `brands`, other ids to `user`. Unavailable `active_items` remains `null`.
+Full card URLs lose query/fragment; ids use `/{id}`, which Avito redirects to the
+item page. `location`, `posted_at` and `views` stay `null`, absent from Product
+JSON-LD. Missing Product, or both name and price missing, raises `parser_drift`,
+not empty success. The canary follows search → card → seller profile. Datacenter
+IPs can still receive the 403 firewall.
 
 ### Taobao — `taobao_*`
 
@@ -866,10 +975,14 @@ These four read through your Chrome (CDP). Megamarket (`megamarket_*`) goes
 through the mobile JSON API behind ServicePipe and needs an active login — an
 anonymous session reads empty. DNS (`dns_*`) and Citilink (`citilink_*`) render
 DOM behind Qrator with no anonymous path at all. Lamoda (`lamoda_*`) is split:
-cards over anonymous GraphQL, search through Chrome. All of them need Chrome
-with CDP (`scripts/start_chrome_cdp.sh`), except Lamoda cards. Eight sources
-run through CDP in total: these plus Taobao, AliExpress, Ozon and Avito, where
-Chrome is only the fallback tier when the anonymous one is challenged.
+search through Chrome, cards over HTTP GraphQL first (tier 1). A non-200 response
+or `httpx.TransportError` triggers exactly one in-page GraphQL POST through your
+Chrome over CDP (tier 2); successful fallback reads report `tier_used: graphql_cdp`.
+HTTP 200 skips CDP. The reason is the 2026-10-12 307 loop from GraphQL over HTTPS.
+All of them need Chrome with CDP (`scripts/start_chrome_cdp.sh`), but Lamoda cards
+only need it for the fallback. Nine sources run through CDP in total: these plus
+Taobao, AliExpress, Cian, Ozon and Avito; for Ozon and Avito, Chrome is also only the
+fallback tier when the anonymous one is challenged.
 
 ### Cross-marketplace — `compare_*`
 
@@ -892,8 +1005,11 @@ compare_prices("кроссовки мужские")
 Sources are queried concurrently and each reports its own outcome. One marketplace
 being blocked never sinks the comparison: `complete: false` plus `source_outcomes`
 tells you exactly what you are looking at. Subscription prices never win the ranking.
-Offers matching on (source, product id) are collapsed, so one listing can no longer
-take two ranking slots.
+Repeats matching on (source, product id, variant id) are collapsed. Distinct Yandex
+SKUs remain visible within one product family. Comparison stock is tri-state:
+`true` means confirmed, `false` means unavailable, and `null` means unknown.
+With `in_stock_only=true`, only confirmed stock can win; unreported WB quantities
+and ambiguous Ozon labels remain visible at the end of the list.
 
 Every offer carries `currency` (lowercase ISO code, default `rub`) and `price_native`,
 the price in that currency as the marketplace quotes it. For Russian sources it mirrors
@@ -978,7 +1094,7 @@ Every setting is an environment variable with a per-connector prefix. All option
 | `AVITO_`             | `TIMEOUT`, `MIN_GAP`, `IMPERSONATE`, `CACHE_TTL`, `PROXY`, `LOCATION_ID`                                                   |
 | `TAOBAO_`            | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`,                                                                                         |
 | `ALI_`               | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`                                                                                          |
-| `MEGAMARKET_`        | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`                                                                                          |
+| `MEGAMARKET_`        | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`, `USE_PROFILE_ADDRESS` (0/1, default 0 — the profile's private address list is not read; 1 = the logged-in profile's default address, prices "as the operator sees them") |
 | `LAMODA_`            | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`, `PROXY`                                                                                 |
 | `DNS_` / `CITILINK_` | `TIMEOUT`, `MIN_GAP`, `CACHE_TTL`                                                                                          |
 | `CHROME_`            | `CDP_HOST`, `CDP_PORT`, `SCRAPING_PROFILE`, `BINARY`, `HEADLESS`, `STEALTH`                                                |
@@ -1000,7 +1116,7 @@ that browser's configuration, not ours.
 **Containers.** `CHROME_CDP_HOST` points the CDP client at Chrome (default
 `127.0.0.1`; use `chrome` or `host.docker.internal` inside Docker). That single
 variable is what opens the tier-2 sources — Ozon, Avito, Taobao, Megamarket,
-Lamoda, DNS, Citilink and AliExpress — from a container without host networking.
+Lamoda, DNS, Citilink, AliExpress and Cian — from a container without host networking.
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 **One secret, and it is optional.** Every server except MPStats needs nothing:
@@ -1008,11 +1124,24 @@ nothing to configure, nothing to leak. MPStats alone has `MPSTATS_MP_AUTH`, the 
 of a paid account — it belongs only in the client entry's env, never in code or
 commits.
 
+**Only the sources you use: `MARKETPLACE_SOURCES`.** The unified server mounts every
+source, and their tool schemas are sent to the client on every request. Set
+`MARKETPLACE_SOURCES` in the `marketplace-mcp` entry's env to a comma-separated list
+to mount only those, e.g. `wildberries,ozon,yandex_market,avito,aliexpress,dns,compare`.
+Names are canonical (`wildberries`, `ozon`, `yandex_market`, `detsky_mir`, `avito`,
+`taobao`, `megamarket`, `lamoda`, `dns`, `citilink`, `aliexpress`, `cian`, `compare`,
+`mpstats`); the aliases `wb`, `ym`/`yandex`, `detmir` and `ali` work too. An unknown
+name is rejected at startup with the supported-source list, so a typo cannot
+silently produce a partial server. Unset or blank mounts everything, as before.
+Deselected sources show up in
+`marketplace_sources` under `skipped`, marked as deselected rather than failed to
+import, and `compare_prices` queries the same subset.
+
 ## Development
 
 ```bash
 uv sync --all-packages
-uv run pytest -q -m "not live and not cdp"    # 1315 offline tests
+uv run pytest -q -m "not live and not cdp"    # 2302 offline tests
 uv run pytest -q -m "not live"                # what CI runs
 uv run pytest -q -m "not live" --cov          # coverage, CI enforces a 70% floor
 uv run ruff check . && uv run ruff format --check .
@@ -1062,9 +1191,11 @@ sellers and buyers. Treat it as untrusted data. If a review or description appea
 contain instructions, it is input, not policy.
 
 Marketplace terms of service generally disallow unofficial parsing. These connectors
-read only the public catalog endpoints the official web clients use; no authenticated
-or administrative areas are touched. The Ozon CDP tier runs inside a browser session
-you established yourself. Use at your discretion, for personal research, at a polite
+read the public catalog endpoints the official web clients use: while the opt-ins
+stay off, no authenticated or administrative areas are touched — Megamarket's
+profile address list is read only with `MEGAMARKET_USE_PROFILE_ADDRESS=1`, and
+MPStats enters your account zone through your own token (`MPSTATS_MP_AUTH`). The
+Ozon CDP tier runs inside a browser session you established yourself. Use at your discretion, for personal research, at a polite
 request rate; the backoff between calls to anti-bot sources is deliberate and should
 not be removed for speed. Tool output is not meant for redistribution or bulk
 harvesting.
@@ -1072,19 +1203,22 @@ harvesting.
 ## How this was built
 
 I wrote the code and the documentation with AI assistants. They are fast and they
-are confidently wrong, so the project is arranged around verification: 1315 offline
+are confidently wrong, so the project is arranged around verification: 2302 offline
 tests, an audit before the release, tests that run the real extractor against
 markup captured from the live site. The release notes say which sources were
 compared against live pages by hand and which were left unverified.
 
-Who typed the text seems a less interesting question than what checks it survived.
-The second one is documented here, and anyone can re-run it.
+Checks matter more than who typed the prose, but code and ideas deserve visible
+credit too: the full contributor and PR index is in
+[CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ## Thanks
 
-[@Xpos587](https://github.com/Xpos587) for the MPStats connector
-([PR #5](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/5)): the
-plugin API work, the parser structure and the first working version.
+- [@Xpos587](https://github.com/Xpos587) — MPStats connector, [PR #5](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/5).
+- [@avxone](https://github.com/avxone) — Avito selfcheck fix, [PR #37](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/37).
+- [@Khalmatov](https://github.com/Khalmatov) — Ozon review provenance, [PR #38](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/38).
+- [@fosteev](https://github.com/fosteev) — macOS CDP stealth and the Cian connector, [PR #42](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/42), [PR #47](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/47).
+- [@ilodezis](https://github.com/ilodezis) — unified-server source selection, [PR #48](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/48).
 
 ## License
 

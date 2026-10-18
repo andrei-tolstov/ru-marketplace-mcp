@@ -1,24 +1,42 @@
 """Lamoda MCP connector.
 
-Lamoda's anti-bot wall splits the catalog in two. One channel answers plain
-anonymous HTTPS: the GraphQL product endpoint, which enriches a SKU you already
-have with real prices, brands, sizes and availability. Everything that would
-let you *find* a SKU — search, catalog, HTML pages — sits behind the same
-self-referential 307 redirect loop as Ozon, so discovery runs in the operator's
-Chrome over CDP.
+Lamoda's GraphQL product endpoint enriches a known SKU with real prices,
+brands, sizes and availability. Discovery — search, catalog, HTML pages —
+runs in the operator's Chrome over CDP because plain HTTPS is blocked.
 
 Verified live July 2026 from a datacenter IP (docs/ANTI_BOT.md):
-  - ``POST /goapi/v2/catalog/graphql/products/`` — 200, real JSON (tier 1)
+  - ``POST /goapi/v2/catalog/graphql/products/`` — then 200, real JSON (tier 1)
   - catalog/search GET paths — 307 loop; HTML — 403; mobile API — 403
   - ``rating`` is not in the GraphQL schema (introspection disabled), so this
     connector reports no review data — Lamoda hides it entirely
 
-Two tiers, tried in cost order: GraphQL first for cards, CDP for search. The
-CDP route needs verification from the operator's machine for the same reason
-as Megamarket — run lamoda_selfcheck from your Chrome first.
+2026-10-12: the GraphQL endpoint answers plain HTTPS with a 307 loop too;
+the card falls back to an in-page POST in the operator's Chrome, which
+answers 200 with the normal Lamoda envelope.
+
+Two tiers, tried in cost order: HTTPS GraphQL first for cards, then one CDP
+GraphQL POST on transport failure. Search uses CDP directly. Run
+lamoda_selfcheck from your Chrome to check both paths.
 
 NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Expose Lamoda product discovery and SKU enrichment.
+# SCOPE: Read-only HTTPS GraphQL cards with CDP POST fallback; browser search and challenge recovery handoffs.
+# DEPENDS: FastMCP; httpx; mcp_core DOM/CDP/handoff/cache; models_output; settings; shape_reference.
+# LINKS: M-LAMODA; M-COMPARE; M-MARKETPLACE; packages/lamoda-connector/tests.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# _extract_sku: Resolve and normalize SKU handles or product URLs.
+# _search_item_from_tile: Normalize rendered price/title fields.
+# _graphql_via_https: POST the SKU query over plain HTTPS and return status/body.
+# _graphql_via_cdp: POST the query inside the operator's Chrome with bounded transport.
+# _graphql_card: Try HTTPS then CDP; parse and cache GraphQL product details, sizes and stock.
+# _cdp_render_search: Read browser search and recover explicit challenge handoffs.
+# lamoda_search: Return rendered catalog tiles with nullable prices.
+# lamoda_card: Return GraphQL-backed SKU details and availability.
+# lamoda_selfcheck: Diagnose operator endpoint/parser health; not an MCP tool.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
@@ -38,6 +56,7 @@ from mcp_core.cache import TTLCache
 from mcp_core.dom import JS_HELPERS, prices_from_tile, title_from_tile
 from mcp_core.errors import (
     BadRequestError,
+    ChallengeRequiredError,
     NotFoundError,
     ParserDriftError,
     ToolError,
@@ -48,7 +67,9 @@ from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.runtime import browser_handoff_lifespan, current_mcp_session_id
 from mcp_core.transport import build_client
+from mcp_core.transport.browser_handoff import get_handoff_id, has_pending_handoff, read_with_handoff
 from mcp_core.transport.chrome_cdp import NavBlocked, open_page
 from pydantic import Field
 
@@ -65,7 +86,7 @@ from lamoda_connector.shape_reference import SEARCH_SHAPE_REFERENCE, missing_req
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.5.3"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://www.lamoda.ru"
@@ -99,11 +120,12 @@ _HEADERS = {
 
 mcp = FastMCP(
     name="lamoda-connector",
+    lifespan=browser_handoff_lifespan,
     version=SERVER_VERSION,
     instructions=(
         "Lamoda fashion catalog: text search runs in the operator's Chrome over "
         "CDP (discovery is behind a redirect loop); product cards come from the "
-        "anonymous GraphQL endpoint and work tier 1. Lamoda exposes no ratings. "
+        "GraphQL endpoint: HTTPS first, then an in-page Chrome POST if blocked. Lamoda exposes no ratings. "
         "Start with lamoda_search; lamoda_card takes a SKU or product URL."
     ),
 )
@@ -188,15 +210,50 @@ _SEARCH_EXTRACT_TEMPLATE = """
         });
         if (out.length >= 48) break;
     }
-    const bodyText = (document.body && document.body.textContent || '').toLowerCase();
-    const blocked = /проверку|не робот|бота|captcha|are you human|access denied/.test(bodyText);
-    return JSON.stringify({items: out, title: blocked ? '__BLOCKED__' : (document.title || '')});
+    // Challenge words also occur in scripts, hidden anti-bot widgets and even
+    // product copy. Keep this as raw transport data; the Python classifier
+    // decides whether an empty page is a challenge. In particular, never let
+    // a hidden/script marker override a healthy product grid.
+    const bodyCopy = document.body ? document.body.cloneNode(true) : null;
+    if (bodyCopy) {
+        for (const node of bodyCopy.querySelectorAll('script, style, noscript, [hidden]')) node.remove();
+        for (const node of bodyCopy.querySelectorAll('[style]')) {
+            const style = node.getAttribute('style') || '';
+            if (/display\\s*:\\s*none|visibility\\s*:\\s*hidden/i.test(style)) node.remove();
+        }
+    }
+    const bodyText = (bodyCopy && bodyCopy.textContent || '').replace(/\\s+/g, ' ').trim();
+    return JSON.stringify({items: out, title: document.title || '', body_snippet: bodyText.slice(0, 2000)});
 }
 """
 
 # Spliced rather than duplicated: one fix to tile resolution or price selection
 # lands on every CDP source at once.
 _SEARCH_EXTRACT_JS = _SEARCH_EXTRACT_TEMPLATE.replace("//__SHARED_HELPERS__", JS_HELPERS)
+
+
+# The extractor only transports a bounded visible-text sample. Keep challenge
+# wording in one Python classifier so product copy and hidden widgets cannot
+# change the verdict while a healthy grid is present. ``бота`` on its own is
+# deliberately absent: it occurs in ordinary product copy and is not evidence
+# of a challenge.
+_CHALLENGE_TEXT_RE = re.compile(r"провер|не\s+робот|captcha|are\s+you\s+human|access\s+denied", re.IGNORECASE)
+
+
+def _anti_bot_challenge(data: dict[str, Any]) -> bool:
+    """Return whether an empty rendered page is an anti-bot challenge.
+
+    ``__BLOCKED__`` is retained only for the legacy cached payload shape and
+    only when it carried no items. Current extractor payloads carry a raw
+    ``body_snippet`` and the wording is classified here in Python.
+    """
+    items = data.get("items")
+    if isinstance(items, list) and items:
+        return False
+    if str(data.get("title") or "") == "__BLOCKED__":
+        return True
+    snippet = data.get("body_snippet")
+    return isinstance(snippet, str) and bool(_CHALLENGE_TEXT_RE.search(snippet))
 
 
 def _search_item_from_tile(tile: dict[str, Any]) -> LamodaSearchItemOut:
@@ -216,38 +273,124 @@ def _search_item_from_tile(tile: dict[str, Any]) -> LamodaSearchItemOut:
     )
 
 
+# Transport only, following Cian's in-page POST pattern. Read in bounded chunks
+# before serialising through CDP, not with res.text() on an unbounded response.
+# Lamoda's anti-bot interstitial lives under this path (seen live 2026-10-12, also on
+# Megamarket); the wording check above only counts on a near-empty page.
+_CHALLENGE_PATH = "/xpvnsulc/"
+_JS_BODY_SNIPPET = "() => ((document.body && document.body.innerText) || '').slice(0, 2000)"
+
+_JS_POST = """async (args) => {
+    const res = await fetch(args.url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+        body: JSON.stringify(args.body)
+    });
+    const reader = res.body.getReader();
+    let total = 0;
+    const chunks = [];
+    while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        total += value.length;
+        if (total > args.cap) {
+            await reader.cancel();
+            return JSON.stringify({status: 0, text: 'BODY_CAP_EXCEEDED'});
+        }
+        chunks.push(value);
+    }
+    const buf = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { buf.set(c, off); off += c.length; }
+    return JSON.stringify({status: res.status, text: new TextDecoder().decode(buf)});
+}"""
+
+
+async def _graphql_via_https(query: str, sku: str) -> tuple[int, str]:
+    """Tier 1: return the status and body of a plain HTTPS GraphQL POST."""
+    headers = dict(_HEADERS)
+    headers["Referer"] = f"{SITE_BASE}/p/{sku.lower()}/"
+    async with build_client(timeout_s=TIMEOUT, headers=headers, proxy=_proxy()) as client:
+        response = await client.post(GRAPHQL_URL, json={"query": query})
+    if response.status_code == 200 and len(response.content) > MAX_BODY_BYTES:
+        raise_tool_error(TransportDownError("GraphQL body over the cap"))
+    return response.status_code, response.text
+
+
+async def _graphql_via_cdp(query: str, ctx: Context | None) -> tuple[int, str]:
+    """Tier 2: POST from a loaded Lamoda tab carrying the operator's cookies."""
+
+    async def _attempt() -> tuple[int, str]:
+        # open_page defaults to the origin host (www.lamoda.ru); no extra hosts.
+        async with _cdp_lock, open_page(f"{SITE_BASE}/", wait_ms=4000) as page:
+            # A landing that stopped on the anti-bot page cannot post anything; say
+            # so at once instead of waiting out the fetch timeout (live 2026-10-12).
+            snippet = await asyncio.wait_for(page.evaluate(_JS_BODY_SNIPPET), timeout=10.0)
+            if _CHALLENGE_PATH in str(page.url) or (
+                isinstance(snippet, str) and len(snippet) < 1000 and _CHALLENGE_TEXT_RE.search(snippet)
+            ):
+                raise_tool_error(
+                    ChallengeRequiredError(
+                        "Lamoda requires user action in the connected Chrome. Complete the visible "
+                        "challenge on lamoda.ru, then retry.",
+                        provider="lamoda",
+                    )
+                )
+            raw = await asyncio.wait_for(
+                page.evaluate(_JS_POST, {"url": GRAPHQL_URL, "body": {"query": query}, "cap": MAX_BODY_BYTES}),
+                timeout=30.0,
+            )
+        result = json.loads(raw) if isinstance(raw, str) else raw
+        return int(result["status"]), str(result["text"])
+
+    try:
+        return await asyncio.wait_for(_attempt(), timeout=max(0.01, float(TIMEOUT)))
+    except TimeoutError:
+        return 0, f"CDP timeout after {TIMEOUT}s"
+    except NavBlocked as exc:
+        return exc.status or 0, _redact(str(exc))
+
+
 async def _graphql_card(sku: str, ctx: Context | None) -> dict[str, Any]:
-    """Tier-1: POST the SKU-enrichment query over plain HTTPS."""
+    """Fetch and cache SKU enrichment: HTTPS first, one CDP fallback if refused."""
     cache_key = f"graphql:{sku}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
     await _polite_wait()
     query = _GRAPHQL_QUERY % json.dumps(sku)
+    tier = "graphql"
     try:
-        # Requests that work in a browser carry the product page as Referer.
-        # Tested against the live endpoint it made no difference either way, so
-        # this is alignment with a known-good request rather than a fix — kept
-        # because it costs nothing and removes one variable.
-        headers = dict(_HEADERS)
-        headers["Referer"] = f"{SITE_BASE}/p/{sku.lower()}/"
-        async with build_client(timeout_s=TIMEOUT, headers=headers, proxy=_proxy()) as client:
-            response = await client.post(GRAPHQL_URL, json={"query": query})
+        status_code, text = await _graphql_via_https(query, sku)
+        https_outcome = f"HTTP {status_code} over HTTPS. Body preview: {_redact(text[:200]) or '<empty>'}"
     except httpx.TransportError as exc:
-        raise_tool_error(TransportDownError(f"Lamoda GraphQL unreachable: {exc}"))
-    if response.status_code != 200:
-        raise_tool_error(
-            TransportDownError(
-                f"Lamoda GraphQL answered HTTP {response.status_code}. "
-                f"Body preview: {_redact(response.text[:200]) or '<empty>'}"
+        status_code, text = 0, ""
+        https_outcome = f"{type(exc).__name__} over HTTPS: {_redact(str(exc))}"
+    if status_code != 200:
+        tier = "graphql_cdp"
+        try:
+            status_code, text = await _graphql_via_cdp(query, ctx)
+        except ToolError:
+            raise
+        except Exception as exc:
+            status_code, text = 0, _redact(f"{type(exc).__name__}: {exc}")
+        if status_code != 200:
+            chrome_outcome = f"HTTP {status_code} via Chrome" if status_code else "transport failure via Chrome"
+            raise_tool_error(
+                TransportDownError(
+                    f"Lamoda GraphQL: {https_outcome}; {chrome_outcome}. "
+                    f"Body preview: {_redact(text[:200]) or '<empty>'}",
+                    status_code=status_code or None,
+                )
             )
-        )
-    if len(response.content) > MAX_BODY_BYTES:
+    log_event("lamoda_graphql.answered", tier_used=tier, status_code=status_code)
+    if len(text.encode()) > MAX_BODY_BYTES:
         raise_tool_error(TransportDownError("GraphQL body over the cap"))
     try:
-        payload = response.json()
+        payload = json.loads(text)
     except json.JSONDecodeError:
-        raise_tool_error(ParserDriftError(f"non-JSON GraphQL body; preview: {response.text[:200]}"))
+        raise_tool_error(ParserDriftError(f"non-JSON GraphQL body; preview: {text[:200]}"))
     # Lamoda does not use the standard GraphQL envelope. Captured live in July
     # 2026 against the real endpoint:
     #   found      {"error": null, "result": [{…}]}
@@ -288,6 +431,9 @@ async def _graphql_card(sku: str, ctx: Context | None) -> dict[str, Any]:
     product = products[0]
     if not isinstance(product, dict):
         raise_tool_error(ParserDriftError("GraphQL product entry is not an object"))
+    # Keep the answered tier with the successful product so cache hits do not
+    # misreport a browser-backed card as a plain HTTPS response.
+    product = {**product, "_tier_used": tier}
     _cache.set(cache_key, product)
     return product
 
@@ -295,28 +441,55 @@ async def _graphql_card(sku: str, ctx: Context | None) -> dict[str, Any]:
 async def _cdp_render_search(query: str, ctx: Context | None) -> dict[str, Any]:
     """Tier-2: render the search page in the operator's Chrome, extract tiles."""
     cache_key = f"search:{query}"
-    cached = _cache.get(cache_key)
+    url = f"{SITE_BASE}/catalogsearch/result/?q={urllib.parse.quote(query)}"
+    scope = current_mcp_session_id(ctx)
+    pending = has_pending_handoff(scope=scope, operation="lamoda_search", url=url)
+    cached = None if pending else _cache.get(cache_key)
     if cached is not None:
         return cached
-    url = f"{SITE_BASE}/catalogsearch/result/?q={urllib.parse.quote(query)}"
 
     async def _attempt() -> dict[str, Any]:
+        async def read(page):
+            raw = await asyncio.wait_for(page.evaluate(_SEARCH_EXTRACT_JS), timeout=30.0)
+            if not isinstance(raw, str) or len(raw.encode()) > MAX_BODY_BYTES:
+                raise_tool_error(TransportDownError("extracted page data missing or over the body cap"))
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise_tool_error(ParserDriftError("search extractor returned a non-object payload"))
+            data.pop("_handoff_expires_at", None)
+            data.pop("_handoff_id", None)
+            return data
+
         async with _cdp_lock:
             await _polite_wait()
-            async with open_page(url, wait_ms=8000) as page:
-                raw = await asyncio.wait_for(page.evaluate(_SEARCH_EXTRACT_JS), timeout=30.0)
-        if not isinstance(raw, str) or len(raw.encode()) > MAX_BODY_BYTES:
-            raise ToolError(TransportDownError("extracted page data missing or over the body cap"))
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ToolError(ParserDriftError("search extractor returned a non-object payload"))
-        return data
+            if scope is None:
+                async with open_page(url, wait_ms=8000) as page:
+                    return await read(page)
+            note: dict = {}
+            data, expires_at = await read_with_handoff(
+                url=url,
+                wait_ms=8000,
+                scope=scope,
+                operation="lamoda_search",
+                read=read,
+                challenge=lambda payload: "captcha" if _anti_bot_challenge(payload) else None,
+                note_out=note,
+            )
+            if note.get("resumed"):
+                # R3: a resumed read states what changed (challenge cleared, data
+                # moved) rather than making the caller diff two payloads.
+                data["_resume"] = note
+            if expires_at:
+                data["_handoff_expires_at"] = expires_at
+                data["_handoff_id"] = get_handoff_id(scope=scope, operation="lamoda_search", url=url)
+            return data
 
     try:
         payload = await asyncio.wait_for(_attempt(), timeout=max(0.01, float(TIMEOUT)))
     except TimeoutError:
         raise_tool_error(TransportDownError(f"CDP timeout after {TIMEOUT}s"))
-    _cache.set(cache_key, payload)
+    if not _anti_bot_challenge(payload):
+        _cache.set(cache_key, payload)
     return payload
 
 
@@ -339,8 +512,9 @@ async def lamoda_search(
 
     ## Error Format
 
-    ToolError: TransportDownError on CDP/nav failures; ParserDriftError when a
-    rendered page yields zero SKUs, which means the tile shape moved.
+    ToolError: challenge_required on a visible challenge (not cached);
+    TransportDownError on CDP/nav failures; ParserDriftError when a rendered
+    page yields zero SKUs without challenge evidence.
     """
     log_event("lamoda_search.start", query=query[:60])
     try:
@@ -348,9 +522,14 @@ async def lamoda_search(
             payload = await _cdp_render_search(query.strip(), ctx)
         except NavBlocked as exc:
             raise_tool_error(TransportDownError(f"Lamoda navigation blocked (HTTP {exc.status})."))
-        if payload.get("title") == "__BLOCKED__":
+        if _anti_bot_challenge(payload):
             raise_tool_error(
-                TransportDownError("Lamoda search is behind an anti-bot challenge in the connected Chrome.")
+                ChallengeRequiredError(
+                    "Lamoda requires user action in the connected Chrome. Complete the visible challenge, then retry.",
+                    provider="lamoda",
+                    handoff_expires_at=payload.get("_handoff_expires_at"),
+                    handoff_id=payload.get("_handoff_id"),
+                )
             )
         items_raw = payload.get("items") if isinstance(payload.get("items"), list) else []
         if not items_raw:
@@ -386,7 +565,7 @@ async def lamoda_card(
     ],
     ctx: Context | None = None,
 ) -> LamodaCardResponse:
-    """Fetch one Lamoda product card via the anonymous GraphQL endpoint (tier 1).
+    """Fetch a GraphQL card over HTTPS, falling back to an in-page Chrome POST.
 
     ## Return Format
 
@@ -396,7 +575,8 @@ async def lamoda_card(
     ## Error Format
 
     ToolError: BadRequestError when no SKU can be extracted; NotFoundError when
-    the SKU has no product; TransportDownError on HTTP failures; ParserDriftError
+    the SKU has no product; ChallengeRequiredError when the Chrome fallback lands on
+    Lamoda's anti-bot page (complete it, then retry); TransportDownError on HTTP failures; ParserDriftError
     when the GraphQL envelope changed.
     """
     log_event("lamoda_card.start", input=sku_or_url[:80])
@@ -423,7 +603,7 @@ async def lamoda_card(
             is_available=product.get("is_available"),
             sizes=sizes,
             url=f"{SITE_BASE}/p/{sku.lower()}/",
-            tier_used="graphql",
+            tier_used=product.get("_tier_used", "graphql"),
         )
         attached = R.attach_meta(result.model_dump(by_alias=True, exclude={"meta"}), [], source="lamoda_card")
         result.meta = MetaOut(**attached["_meta"])
@@ -441,7 +621,7 @@ async def lamoda_card(
 # client request.
 async def lamoda_selfcheck(ctx: Context | None = None) -> LamodaSelfcheckResponse:
     """Structural drift canary for Lamoda (tri-state). Probes the GraphQL card
-    path (tier 1) and the CDP search path (tier 2).
+    path (HTTPS with CDP fallback) and the CDP search path.
 
     GraphQL down is inconclusive for the card check; CDP down / a redirect loop
     is inconclusive for the search check. Only a reached payload that fails its
@@ -495,44 +675,43 @@ async def _lamoda_selfcheck_impl(ctx: Context | None) -> LamodaSelfcheckResponse
     try:
         async with asyncio.timeout(90):
             payload = await _cdp_render_search("кроссовки", ctx)
-        if payload.get("title") == "__BLOCKED__":
+        if _anti_bot_challenge(payload):
             checks["search"] = R.selfcheck_entry(
                 "inconclusive", baseline=baseline, reason="blocked", notes=["anti-bot challenge in rendered page"]
             )
-            items_raw = []
         else:
             items_raw = [*payload.get("items", [])] if isinstance(payload.get("items"), list) else []
-        if items_raw:
-            # Tiles extract — now ask the second question: did the SHAPE move?
-            # The registry was measured on the captured page (2026-08-07); a
-            # live payload that loses a parser-critical key family is
-            # structural drift even while tiles still come back.
-            live_signature = R.shape_signature(payload)
-            drift = R.diff_keys(SEARCH_SHAPE_REFERENCE, live_signature)
-            missing = missing_required_families(live_signature)
-            if missing:
-                checks["search"] = R.selfcheck_entry(
-                    "drift",
-                    baseline=baseline,
-                    reason="shape_drift",
-                    notes=[
-                        f"{len(items_raw)} tiles extracted",
-                        "required key families missing: " + "; ".join(", ".join(family) for family in missing),
-                    ],
-                    shape_missing=drift["missing"],
-                    shape_added=drift["added"],
-                )
+            if items_raw:
+                # Tiles extract — now ask the second question: did the SHAPE move?
+                # The registry was measured on the captured page (2026-08-07); a
+                # live payload that loses a parser-critical key family is
+                # structural drift even while tiles still come back.
+                live_signature = R.shape_signature(payload)
+                drift = R.diff_keys(SEARCH_SHAPE_REFERENCE, live_signature)
+                missing = missing_required_families(live_signature)
+                if missing:
+                    checks["search"] = R.selfcheck_entry(
+                        "drift",
+                        baseline=baseline,
+                        reason="shape_drift",
+                        notes=[
+                            f"{len(items_raw)} tiles extracted",
+                            "required key families missing: " + "; ".join(", ".join(family) for family in missing),
+                        ],
+                        shape_missing=drift["missing"],
+                        shape_added=drift["added"],
+                    )
+                else:
+                    notes = [f"{len(items_raw)} tiles extracted", "shape matches the captured reference"]
+                    if drift["added"]:
+                        notes.append(f"{len(drift['added'])} new paths vs baseline (informational)")
+                    checks["search"] = R.selfcheck_entry(
+                        "healthy", baseline=baseline, notes=notes, shape_added=drift["added"]
+                    )
             else:
-                notes = [f"{len(items_raw)} tiles extracted", "shape matches the captured reference"]
-                if drift["added"]:
-                    notes.append(f"{len(drift['added'])} new paths vs baseline (informational)")
                 checks["search"] = R.selfcheck_entry(
-                    "healthy", baseline=baseline, notes=notes, shape_added=drift["added"]
+                    "drift", baseline=baseline, reason="parse_smoke_failed", notes=["zero SKUs"]
                 )
-        elif payload.get("title") != "__BLOCKED__":
-            checks["search"] = R.selfcheck_entry(
-                "drift", baseline=baseline, reason="parse_smoke_failed", notes=["zero SKUs"]
-            )
     except ToolError as exc:
         checks["search"] = R.selfcheck_entry(
             "inconclusive", baseline=baseline, reason="transport_down", notes=[str(exc)[:160]]

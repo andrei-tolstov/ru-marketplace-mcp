@@ -7,8 +7,24 @@ that logic is testable without touching a network.
 from __future__ import annotations
 
 import json
+import pathlib
+import re
+import sys
+from types import SimpleNamespace
 
+import pytest
 from marketplace_connector import cli
+
+
+@pytest.fixture(autouse=True)
+def offline_cdp_probe(monkeypatch):
+    """Even successful doctor runs must not depend on a local Chrome session."""
+    from mcp_core.transport import chrome_cdp
+
+    async def fake_probe():
+        return {"reachable": False, "reason": "offline test"}
+
+    monkeypatch.setattr(chrome_cdp, "probe_session", fake_probe)
 
 
 def test_install_prints_a_config_block_for_every_source(capsys):
@@ -18,6 +34,10 @@ def test_install_prints_a_config_block_for_every_source(capsys):
     out = capsys.readouterr().out
     assert '"wildberries"' in out
     assert '"taobao"' in out
+    assert '"aliexpress"' in out
+    assert '"mpstats"' in out
+    assert "optional paid analytics" in out
+    assert "MPSTATS_MP_AUTH" in out
     assert "marketplace-mcp" in out
 
 
@@ -70,6 +90,22 @@ def test_dsh_patch_block_falls_back_to_console_scripts_outside_a_checkout(monkey
     assert "enable switch" in note
     assert "console script compare-mcp" in note
     assert "console script marketplace-mcp" in note
+
+
+def test_generated_dsh_modes_match_the_committed_patch():
+    root = pathlib.Path(__file__).resolve().parents[3]
+    committed = (root / "dsh" / "cordis.patch.yml").read_text(encoding="utf-8")
+    generated, _ = cli._dsh_patch_block()
+
+    # Mode precedence and disabled-row directory fallback must survive copying
+    # the install output instead of installing the bundled DSH patch.
+    for pattern in (r'disabled: !!js "([^"]+)"', r'- !!js "(process.env.[^"]+)"'):
+        assert re.findall(pattern, generated) == re.findall(pattern, committed)
+    assert re.findall(r"          - ([\w-]+-mcp)\n", generated + "\n") == [
+        "compare-mcp",
+        "decision-mcp",
+        "marketplace-mcp",
+    ]
 
 
 def test_doctor_reports_per_source_status(monkeypatch, capsys):
@@ -148,6 +184,76 @@ def test_install_rejects_an_unknown_client(capsys):
     assert "unknown client" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("argv", [["claude", "--bogus"], ["dsh", "cursor"], ["--bogus"]])
+def test_install_rejects_extra_arguments_and_unknown_flags(argv, capsys):
+    assert cli.cmd_install(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err
+    assert not captured.out
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["ozno"], "unknown source"),
+        (["wildberries", "ozno"], "unknown source"),
+        ([" "], "unknown source"),
+        (["--bogus"], "unknown doctor option"),
+        (["wildberries", "--bogus"], "unknown doctor option"),
+        (["--status-file"], "requires a path"),
+        (["--status-file", ""], "requires a path"),
+        (["--status-file", "--bogus"], "requires a path"),
+        (["--status-file", "status.json", "--status-file", "other.json"], "only be supplied once"),
+    ],
+)
+def test_invalid_doctor_arguments_fail_before_any_checks(argv, message, monkeypatch, capsys):
+    from mcp_core.transport import chrome_cdp
+
+    def unexpected_call(*args):
+        pytest.fail("invalid arguments must not perform network checks")
+
+    monkeypatch.setattr(cli, "_run_one_selfcheck", unexpected_call)
+    monkeypatch.setattr(chrome_cdp, "probe_session", unexpected_call)
+
+    assert cli.cmd_doctor(argv) == 2
+    captured = capsys.readouterr()
+    assert message in captured.err
+    assert not captured.out
+
+
+def test_doctor_accepts_install_source_names_and_includes_aliexpress(monkeypatch):
+    checked = []
+
+    async def fake_selfcheck(name, module_path, tool_name):
+        checked.append((name, module_path, tool_name))
+        return name, "success", "ok"
+
+    monkeypatch.setattr(cli, "_run_one_selfcheck", fake_selfcheck)
+
+    assert cli.cmd_doctor(["WB", "yandex-market", "ym", "detsky-mir", "detmir", "ali", "aliexpress"]) == 0
+    assert [name for name, _, _ in checked] == ["wildberries", "yandex_market", "detsky_mir", "aliexpress"]
+    assert checked[-1] == ("aliexpress", "aliexpress_connector.server", "aliexpress_selfcheck")
+
+
+@pytest.mark.parametrize("as_dict", [True, False])
+async def test_run_one_selfcheck_reads_dict_and_model_responses(as_dict, monkeypatch):
+    payload = {
+        "status": "inconclusive",
+        "checks": {"search": {"state": "inconclusive", "reason": "blocked", "code": 403}},
+    }
+
+    async def selfcheck():
+        return payload if as_dict else SimpleNamespace(**payload)
+
+    monkeypatch.setitem(sys.modules, "cli_test_connector", SimpleNamespace(selfcheck=selfcheck))
+
+    assert await cli._run_one_selfcheck("test", "cli_test_connector", "selfcheck") == (
+        "test",
+        "inconclusive",
+        "search:inconclusive (blocked http 403)",
+    )
+
+
 def test_install_accepts_every_documented_client():
     for client in sorted(cli.KNOWN_CLIENTS):
         assert cli.cmd_install([client]) == 0
@@ -205,6 +311,33 @@ def test_doctor_shows_why_a_check_was_inconclusive():
 
 def test_a_healthy_check_stays_terse():
     assert cli._check_detail({"state": "healthy", "reason": None}) == "healthy"
+    assert cli._check_detail({"state": "healthy", "detail": "42 valid products", "notes": ["ok"]}) == "healthy"
+
+
+def test_doctor_preserves_yandex_empty_shell_diagnosis():
+    from yandex_connector.models_output import YandexSelfcheckEntry
+
+    check = YandexSelfcheckEntry(
+        state="inconclusive",
+        detail='{"error": "transport_down", "message": "yandex_card: empty_product_shell',
+        notes=["product frame arrived hollow: degraded serving or a delisted product"],
+    )
+    assert "empty_product_shell" in cli._check_detail(check)
+    assert cli._check_detail(check).startswith("inconclusive (")
+
+
+def test_doctor_uses_notes_if_no_reason_or_detail():
+    assert cli._check_detail({"state": "drift", "notes": ["price field vanished", "inspect the parser"]}) == (
+        "drift (price field vanished; inspect the parser)"
+    )
+
+
+def test_doctor_keeps_diagnostics_on_one_bounded_line():
+    detail = "empty_product_shell\n" + "unavailable " * 100
+    rendered = cli._check_detail({"state": "inconclusive", "detail": detail})
+    assert "\n" not in rendered
+    assert len(rendered) <= len("inconclusive ()") + 240
+    assert rendered.endswith("...)")
 
 
 def test_detail_survives_a_reason_without_a_code():

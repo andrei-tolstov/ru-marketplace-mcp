@@ -29,6 +29,22 @@ Sporadic 502s and read timeouts are normal here; transport retries absorb them.
 NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC. Use
 ``log_event`` (stderr) or the ``Context`` logging methods.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Expose Detsky Mir cards, category listings and category discovery.
+# SCOPE: Read-only anonymous JSON; region-aware caching; no text-search tool.
+# DEPENDS: FastMCP; httpx; mcp_core transport/cache; models_output; settings.
+# LINKS: M-DETMIR; M-COMPARE; M-MARKETPLACE; packages/detmir-connector/tests.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# _resolve_region: Validate and normalize explicit or configured region codes.
+# _fetch_json: Perform bounded, retried API reads and classify failures.
+# _body_error_status: Detect error status embedded inside HTTP-success JSON.
+# _parse_product: Normalize product fields and preserve missing-price semantics.
+# detmir_card: Read one product with a region filter.
+# detmir_category: List a validated category alias with pagination.
+# detmir_categories: Discover category rows, optionally by parent.
+# detmir_selfcheck: Probe operator endpoint/parser health; not an MCP tool.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
@@ -73,7 +89,7 @@ from detmir_connector.settings import get_settings
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.5.3"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 API_BASE = "https://api.detmir.ru"
@@ -148,7 +164,8 @@ async def _fetch_json(url: str, label: str, ctx: Context | None) -> Any:
                     limiter=_limiter,
                 )
             except httpx.TransportError as exc:
-                raise_tool_error(TransportDownError(f"{label}: {_redact(str(exc))}", provider="detmir"))
+                detail = _redact(str(exc)).strip() or "(no message)"
+                raise_tool_error(TransportDownError(f"{label}: {type(exc).__name__}: {detail}", provider="detmir"))
                 raise AssertionError("unreachable") from exc  # pragma: no cover
 
         if status == 429:
@@ -156,6 +173,21 @@ async def _fetch_json(url: str, label: str, ctx: Context | None) -> Any:
         if status >= 500:
             raise_tool_error(
                 TransportDownError(f"{label}: upstream HTTP {status}", provider="detmir", status_code=status)
+            )
+        if status == 418:
+            # DDoS-Guard answers 418 for the whole domain from an address it does
+            # not like, before any parser runs. Verified live on 2026-09-21: the
+            # same 418 came back for httpx with the connector's own headers, for
+            # httpx with no headers at all, and for curl_cffi's Chrome
+            # impersonation — so this is an address refusal, not request shaping
+            # and not drift. Say so instead of "unexpected HTTP 418".
+            raise_tool_error(
+                TransportDownError(
+                    f"{label}: refused by the DDoS-Guard edge (HTTP 418) — this address is blocked, "
+                    "the parser never ran",
+                    provider="detmir",
+                    status_code=status,
+                )
             )
         if status != 200:
             raise_tool_error(
@@ -676,12 +708,17 @@ async def detmir_selfcheck(ctx: Context | None = None) -> DetmirSelfcheckRespons
         except Exception as exc:
             text = _redact(str(exc))
             drift = "parser_drift" in text or "not valid JSON" in text
+            blocked = "DDoS-Guard" in text or "HTTP 418" in text
+            if drift:
+                notes = ["upstream reachable but unparseable"]
+            elif blocked:
+                notes = ["blocked at the edge (HTTP 418) — this address is refused; parsers untested"]
+            else:
+                notes = ["transport or geo block — parsers untested"]
             checks[name] = DetmirSelfcheckEntry(
                 state="drift" if drift else "inconclusive",
                 detail=text[:200],
-                notes=["upstream reachable but unparseable"]
-                if drift
-                else ["transport or geo block — parsers untested"],
+                notes=notes,
             )
             return
         ok, detail = verify(result)

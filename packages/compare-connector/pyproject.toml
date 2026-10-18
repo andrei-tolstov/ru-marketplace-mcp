@@ -1,6 +1,6 @@
 [project]
 name = "compare-connector"
-version = "2.1.0"
+version = "2.5.3"
 description = "Cross-marketplace price comparison MCP server — queries every configured marketplace at once"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -10,7 +10,7 @@ dependencies = [
     # unrelated project. Unpinned, a wheel installed straight from a GitHub
     # Release resolves to that stranger's package and the server dies on
     # import. A pin turns a silent wrong install into a loud resolve failure.
-"mcp-core==2.1.0",
+"mcp-core==2.5.3",
     "wb-connector",
     "detmir-connector",
     "yandex-connector",
@@ -28,6 +28,7 @@ megamarket = ["megamarket-connector"]
 lamoda = ["lamoda-connector"]
 dns = ["dns-connector"]
 citilink = ["citilink-connector"]
+aliexpress = ["aliexpress-connector"]
 drom = ["drom-connector"]
 all = [
     "ozon-connector",
@@ -37,6 +38,7 @@ all = [
     "lamoda-connector",
     "dns-connector",
     "citilink-connector",
+    "aliexpress-connector",
     "drom-connector",
 ]
 
@@ -63,4 +65,5 @@ megamarket-connector = { workspace = true }
 lamoda-connector = { workspace = true }
 dns-connector = { workspace = true }
 citilink-connector = { workspace = true }
+aliexpress-connector = { workspace = true }
 drom-connector = { workspace = true }

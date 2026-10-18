@@ -9,6 +9,439 @@
 
 ## [Unreleased]
 
+## [2.5.3] - 2026-10-13
+
+### Fixed
+
+- `wb_search` with `WB_TRANSPORT=dom`: a narrow tile drops the «с WB Кошельком»
+  caption but keeps the Wallet icon beside the price. Such tiles were read as
+  the regular price; on 13 October that was 43 tiles of 214 (for nm 471317158
+  the tile's 4 341 ₽ is the Wallet price, the regular price is 4 430 ₽). The
+  icon now marks the Wallet price.
+- WB product pages strike the old price with CSS, not `<del>`, so the struck
+  hint was empty and the original price was guessed as the largest figure.
+  The extractor now reads CSS line-through; without strike evidence, several
+  figures are no longer guessed — `price_rub`/`price_original_rub` stay null
+  with a warning (a Wallet caption still marks the lowest figure).
+
+## [2.5.2] - 2026-10-13
+
+### Fixed
+
+- DNS and Citilink: a Qrator page served with HTTP 200 was cached before any
+  check, and a card took the page's own title («Доступ ограничен») as the
+  product name and answered success. The wall check existed but was never
+  called. Walls are now recognised from positive evidence (document title or
+  Qrator markup, never an empty title alone) before mapping and caching, answer
+  `challenge_required`, and selfcheck reports them as blocked, not drift.
+- Taobao cards check for a challenge before mapping, whatever the title or
+  price; text inside hidden widgets cannot fake one.
+- `wb_search`: when v9 failed and the legacy fallback failed too (429, HTTP
+  error, bad JSON), the answer was `no_results`. It is now `rate_limited`,
+  `parser_drift` or `transport_down`; `no_results` needs a positive empty
+  answer, and an unknown total stays `null`. With `WB_TRANSPORT=dom` an empty
+  search keeps the warning that Chrome's region was used instead of `dest`, a
+  «-500 ₽» badge is no longer read as a price, and kopecks are kept.
+- Avito search: an HTTP-200 error envelope raises `challenge_required`,
+  `rate_limited` or `transport_down`; a body without an items list is
+  `parser_drift`. Previously both were an empty successful search.
+- `avito_card` reads shop listings that carry no schema.org Product from the
+  page markers (title, a price with an explicit ₽, description); the page's
+  item id must match. On 2026-10-13 one listing in six had no Product, and the
+  canary reported drift whenever such a listing came first. `images` is `null`
+  when the page does not say, not 0.
+- `wb_search` no-results answers carry `meta: null` unless there are warnings.
+- Ozon: a body without `widgetStates` is `parser_drift`, not an empty card;
+  a later review page without it still returns the collected reviews as
+  partial. Megamarket: a `success: false` envelope no longer becomes a card
+  stamped with the requested id, and is never cached.
+- Browser tier: an attach timeout reports how many tabs are open in the
+  scraping Chrome instead of blaming the Chrome version; an idle-expired
+  handoff frees its tab at the idle deadline; `aliexpress_card` matches the
+  full item id, closes only the popup it opened and bounds every close;
+  a cancellation during tab hand-over closes the tab. When the raw-CDP
+  fallback fails after an attach timeout, the error keeps the tab count, and
+  `doctor` advises closing unused tabs.
+- `scripts/start_chrome_cdp.ps1` parses in Windows PowerShell 5.1 (it had
+  non-ASCII dashes in a file without a BOM).
+
+### Changed
+
+- The CI coverage floor is 80 % (was 70 %); the offline suite measures 84.7 %.
+
+## [2.5.1] - 2026-10-12
+
+### Fixed
+
+- `avito_card` reads the item page's schema.org Product over CDP because
+  `/web/1/js/items` now ignores `itemId` and answered a catalog envelope that
+  was returned as an empty successful card. Its seller block now supplies
+  reputation and the profile link instead of leaving `seller` empty.
+- `avito_seller` reads the rendered profile over CDP with the same pacing and
+  allowed hosts as cards. On 2026-10-12 `/web/1/js/items` ignored `userId` too:
+  different sellers received the same generic catalog with `totalCount: 1500`, falsely
+  reported as their active listings. `/brands/<hash>`, `/user/<hash>/profile` and
+  bare ids are accepted (32 hex characters select `brands`, other ids `user`);
+  unavailable `active_items` stays `null`, not the generic catalog total.
+- Avito's canary follows search → card → seller, taking the profile link from
+  the card rather than relying on a seller id that search may not expose.
+- Lamoda cards try HTTP GraphQL first (tier 1), then make one in-page GraphQL
+  POST through the operator's Chrome over CDP (tier 2) on a non-200 response or
+  `httpx.TransportError`. On 2026-10-12 GraphQL over HTTPS returned a 307 loop,
+  so the HTTP-only path failed while the browser could read the card. Successful
+  fallback reads report `tier_used: graphql_cdp`; HTTP 200 keeps the browser out
+  of the request. A landing that stops on Lamoda's anti-bot page reports
+  `challenge_required` at once instead of waiting out the fetch timeout.
+- Yandex Market cards are read from `/card/{slug}/{id}`. Yandex retired
+  `/product/{id}`, which now answers with an empty page frame, so every
+  `yandex_card` and `compare_verify_offer` for Yandex came back as
+  `empty_product_shell` while the product was live; built fallback links use the
+  new path too (#105).
+
+## [2.5.0] - 2026-10-12
+
+### Added
+
+- `cian_card` returns `photo_urls`: the full-size image URLs in Cian's order,
+  with floor plans flagged `is_layout`. The count in `photos` stays; the URLs
+  let a client download and inspect the photos, which the CDN serves without
+  the browser session.
+- Wildberries can read rendered pages instead of the API: `WB_TRANSPORT=dom`
+  (default `api`) makes `wb_search` and `wb_card` open the search grid and the
+  product page in the operator's Chrome over CDP and parse their text, for
+  addresses where `card.wb.ru` / `search.wb.ru` and the site's own `/__internal/`
+  API answer 403 to every client (#101). Search tiles report the WB Wallet price
+  (`price_kind: wallet`, flagged in `meta.warnings`); cards report the regular,
+  Wallet and struck prices separately, plus the store and its rating, warehouse,
+  delivery date, return policy, cross-border flag with the seller's legal entity
+  and country, warranty, the «Оригинал» badge, and «Все N предложений от X ₽»
+  with a counterfeit-risk warning below 60 % of the card's price. «Подозрительная
+  активность» and a visible captcha stop without retries. New settings:
+  `WB_TRANSPORT`, `WB_DOM_WAIT_S`, `WB_DOM_MIN_GAP`, `WB_DOM_SETTLE_MS`,
+  `WB_DOM_STORE_WAIT_S`, `WB_DOM_OFFERS_WAIT_S`, `WB_DOM_MAX_CARDS`. New
+  `WbCardItem` fields are optional and empty on the API path. An empty first search
+  page without WB's own «ничего не нашлось» notice is reported as `parser_drift`,
+  not as no results.
+
+### Fixed
+
+- Wildberries search reports a refusal of `search.wb.ru` v9 or of the legacy path
+  as `transport_down` instead of falling back to stale unpriced results or an
+  empty answer (#101).
+- Review health no longer reports content key drift for a small sample of
+  rating-only reviews: the all-empty-text alarm needs at least 10 returned
+  reviews (#111).
+- `WB_TRANSPORT=dom` reads the other-offers header for a single other seller.
+  With one offer WB writes «1 предложение от 4 735 ₽» (singular, no «Все»), which
+  the «Все N предложений» pattern missed: nm 1345073040 listed its one other offer
+  (nm 1552408950) in `other_offers` while `other_offers_count` and
+  `other_offers_from_rub` stayed empty and the block's text was not cut out of
+  the card's own lines. Both forms are recognised now, and the render wait for
+  the block accepts the singular header too.
+- `WB_TRANSPORT=dom` no longer glues another seller's offer onto a card whose
+  own offer is unavailable. nm 164379765 (main seller Modern Device, no «Купить»
+  button) came back with supplier UJII, 7 413 ₽ and `in_stock: false`: those
+  belong to nm 1605653581, listed in the page's «Все N предложений» block, which
+  the price and store fallbacks mistook for the buy block. Without a buy block
+  the card now reports `in_stock: false` and empty price, Wallet and struck
+  prices, supplier, supplier rating, delivery and warehouse, plus a warning
+  `main offer unavailable; N other sellers from X ₽ (cheapest nm Y)`. The other
+  sellers are kept in the new optional `other_offers` (up to five cheapest: `nm_id`
+  from the tile's link, `supplier`, `price_rub`, `price_kind`, `delivery`; empty on
+  the API path), and the 60 % counterfeit-risk comparison runs only when the card
+  has its own offer.
+- Citilink search sends the query as `text`, the parameter citilink.ru reads.
+  With `?q=` the site renders its generic search landing, so every search parsed
+  zero tiles and was reported as drift while the site itself answered normally;
+  the self-check probe built the same URL (#104).
+- Wildberries reads `card.wb.ru`, `search.wb.ru` and `catalog.wb.ru` through
+  browser impersonation. Those three answer the default client's TLS handshake
+  with a 403 HTML page on a network where curl and curl_cffi get a 200 from the
+  identical URL, so `wb_card` and `wb_category_products` failed outright while
+  `wb_search` fell through to the legacy stale-id path and returned unrelated
+  products instead of an error. Hosts without the gate, including `feedbacks2.wb.ru`
+  on the same apex, keep the shared budget and retry path.
+- Comparison preserves native source warnings alongside valid offers, including
+  fallback extraction, missing fields, coupon pricing, and result truncation.
+  Successful source access no longer hides those data-quality limitations.
+- The nightly live canary no longer shares a concurrency slot with pushes to
+  `main`: the group carries the event name and a scheduled run is never
+  cancelled, so a routine commit can no longer delete the only automatic live
+  evidence, and the canary can no longer cancel a merge verification. The
+  contract is pinned by `scripts/test_ci_concurrency.py`.
+- Wildberries refusals now reach the request pacer, so the longer post-refusal
+  gap applies and the "standing block, not a blip" hint can reach an operator;
+  an HTML wall page served with HTTP 200 counts as a refusal instead of being
+  cached as a success. `wb_selfcheck` probes `search.wb.ru` v9 directly, so a
+  refusal of the primary search path is visible rather than hiding behind the
+  legacy fallback's answers.
+- The impersonated transport streams its body through the same cap as the shared
+  path, and the gated-host note records the dated re-measurement: the 403s did
+  not reproduce from a different address, while impersonation remained the
+  difference on `catalog.wb.ru`.
+- Transport failures name the exception class instead of surfacing an empty
+  detail, and Detsky Mir reports an HTTP 418 from its edge as an address block
+  rather than an unexplained status. A dated [live record](docs/LIVE_STATUS.md)
+  states what was verified against the marketplaces, and the Detsky Mir note in
+  `docs/ANTI_BOT.md` carries the dated correction.
+- The gated Wildberries hosts prefer impersonation and fall back once to the
+  shared client, because a second measurement showed the split is not a property
+  of the host: from one address the impersonated path timed out on the primary
+  search endpoint while the shared client answered it, and from the next
+  `card.wb.ru` refused both. Canary probes read past the cache, so a `healthy`
+  verdict cannot describe a read that already happened.
+- Cian works from a Chrome profile that remembers a region. `www.cian.ru`
+  redirects such a profile to a regional subdomain (`rostov.cian.ru`), which the
+  exact-host navigation policy rejected, so every `cian_search` and `cian_card`
+  failed with `transport_down`. A policy entry with a leading dot (`.cian.ru`)
+  now admits subdomains of that host, and only the Cian connector uses one;
+  `cian.ru` itself and look-alike hosts stay outside it.
+
+## [2.4.2] - 2026-09-19
+
+### Fixed
+
+- Yandex search keeps distinct reported SKUs within a product family before
+  applying its result limit, including zone payloads with no `wareId`.
+- Comparison preserves unknown Wildberries quantities as unknown stock and
+  interprets Ozon availability conservatively: negative labels cannot win an
+  in-stock-only comparison, and pack sizes or ambiguous counts remain unknown.
+- Doctor retains failure explanations supplied through a canary's `detail`
+  or `notes` when no standard `reason` is present, including Yandex empty-card
+  responses; healthy checks stay terse.
+
+- Operator CLI: installation includes AliExpress and optional MPStats; doctor
+  includes AliExpress, accepts documented source aliases, and rejects invalid
+  arguments before querying sources. Unknown subcommands no longer start a
+  waiting stdio server.
+- Comparison and shortlist inspection share the native card dispatcher:
+  Megamarket receives the correct argument, and Wildberries/Detsky Mir IDs and
+  canonical URLs use the same validation in both profiles.
+- Sources deliberately excluded by `MARKETPLACE_SOURCES` are distinguished from
+  missing installations and do not make default comparisons falsely partial.
+- Startup, wire-budget, and Docker probes enforce response deadlines, drain
+  stderr, reject JSON-RPC errors, and clean up their processes. The local stdio
+  gate now checks the running release version and complete source inventory.
+- A failed pytest collection cannot satisfy the documented-test-count gate.
+  Operational regression tests run in CI, Node tests use the lockfile, and the
+  pre-commit Ruff version matches the workspace lock.
+
+### Documentation
+
+- Added a task-oriented [first-query guide](docs/QUICKSTART.md) covering client
+  setup, targeted diagnostics, offer verification, and access limitations.
+- Updated the release checklist to cover sixteen servers and 32 artifacts.
+- Standalone installation uses GitHub Release wheels or a source checkout,
+  rather than unavailable PyPI package names. The comparison `all` extra now
+  includes AliExpress; instructions retain the explicit AliExpress install
+  needed by the previously published v2.4.1 wheels.
+
+## [2.4.1] - 2026-09-18
+
+**Withdrawn: 2.4.0.** Its source distributions carried third-party personal data in
+the test fixtures — two Yandex reviewer accounts (including one encoded inside a
+base64 protobuf) and three named private individuals from Cian listings, with
+account ids and a resolvable agent profile URL. The fixtures are scrubbed here, and
+the 2.4.0 release and tag were withdrawn rather than left downloadable.
+
+### Fixed
+
+- Fixture privacy: the reviewer identity in `card_washer.html` is masked in all four
+  carriers (`uidPublicId`, `avatarMediaId`, `analyticsData.uid`, and the
+  `authorComplaintContext` protobuf that encoded the same UID); the Cian fixtures no
+  longer name private realtors, while agency records stay as business data.
+- Provenance prose no longer points at the operator's private capture workspace, and
+  the fixture pins are recomputed.
+- `ARCHITECTURE.md` now documents nine error codes, not eight - `challenge_required`
+  was missing from a contract integrators branch on.
+- `CDP_SETUP.md` lists Cian among the sources that need a browser, and the CDP-only
+  set is six, not five.
+- `DEEP_RESEARCH_V2.0.0.md` carries a superseded notice: the four security items it
+  listed as open work all shipped since (`a7b3f86`, `ca846fe`).
+
+## [2.4.0] - 2026-09-18 — WITHDRAWN (see 2.4.1)
+
+### Reliability
+
+- CDP navigations are bounded: at most three in flight process-wide and one per
+  host, with a per-host breaker that pauses a host after repeated refusals instead
+  of letting the rest of a fan-out queue behind it. The budget covers the
+  navigation, not the page - a retained challenge page waits for a human and must
+  not hold its host's slot.
+- Refusal backoff is jittered, so sources refused at the same moment no longer
+  retry in lockstep.
+- The browser-handoff registry holds eight leases, bounds a lease by lifetime
+  (900 s, never extended by a retry) and by idleness (600 s), and the handle issuer
+  and consumer now agree on what "live" means.
+
+### Reporting
+
+- A resumed read says what happened: whether the retained page was resumed,
+  whether the challenge cleared, and whether the data moved (tri-state - "nothing
+  to compare with" is not "nothing changed"), compared by digest rather than by
+  keeping the payload.
+- Refusals explain themselves: busy names the reason and a retry hint, a full
+  registry says so, and a caller's own expired handle says it expired while a
+  foreign handle stays opaque.
+
+### Correctness
+
+- Yandex zone snippets are found with a quote-aware tag scanner; a raw `>` inside
+  an attribute value no longer makes a snippet disappear from the parse.
+- The routing-eval runner's verdict is machine-checkable: a partial run is not
+  `ok`, missing answers count as failed, and the exit code follows the verdict.
+
+### Privacy
+
+- Fixtures no longer carry third-party contact phone numbers, a logged-in account
+  nick, per-request identifiers, reviewer display names, account ids or order
+  numbers; the operator's egress IP was replaced with documentation space.
+- Every fixture pin is verified against its file by a CI gate.
+
+### Tooling
+
+- `scripts/check_provenance.py` checks all fixture pins and refuses to let a
+  quarantined pin stay quarantined once it matches again.
+
+## [2.3.0] - 2026-09-13
+
+- `compare_browser_snapshot(handoff_id)` exposes the retained browser viewport as
+  standard MCP image content for native-vision clients. The handle is bound to the
+  MCP session and lease expiry; no OCR or external vision service is invoked.
+- DSH profile selection is mutually exclusive (`full > decision > compare`), and
+  the stored wire baselines cover all three profiles.
+- Offer verification now selects the requested WB row, unwraps Detsky Mir cards,
+  checks Ozon's regular price, and can require the Yandex search-row `sku_id`
+  before comparing a card price. Seller article fields remain non-MPN evidence.
+- WB preserves unambiguous typed color evidence. MPN/GTIN remain `unknown` when
+  the source does not provide manufacturer identifiers.
+
+### Browser recovery
+
+- Optional `CHROME_CHALLENGE_HANDOFF_S` retains DOM-detected Lamoda search and
+  Taobao search/card challenge tabs. Same-session repeats read the owned page
+  without navigating again. Expiry is capped at 300 seconds from initial attach,
+  does not extend, and at most four leases are active. Error/comparison metadata
+  exposes `handoff_expires_at` and an opaque `handoff_id` only when retained.
+- New `compare_browser_snapshot(handoff_id)` returns a bounded JPEG viewport and
+  capture metadata through standard MCP image content. It never navigates or
+  invokes an OCR/vision service; a capable MCP client can use its own native
+  vision. Handles are same-session and expire with the retained lease.
+- DSH mounts exactly one profile with precedence full, decision, compare. This
+  fixes duplicate compare/decision mounts and the full+decision flag conflict.
+- The snapshot tool costs 370 wire tokens in the stored baseline; the profiles it
+  belongs to total compare 2023, decision 2278, unified 16549
+  (`work/performance/wire-baseline.json`, enforced by the CI wire gate). Baselines and the public tool contract were
+  updated for this addition; CI now gates the middle profile too.
+- Owned tabs close on success, failure, expiry, caller cancellation and graceful
+  shutdown. Active handoffs suppress profile hiding; owned-window foreground
+  activation is best-effort. Default behavior, browser-less compare installations,
+  and headless operation retain their existing behavior. Hard process-kill expiry
+  and HTTP failures rejected before DOM extraction are outside this feature.
+- Raw CDP now attempts bounded cleanup of its exact owned target even when
+  target discovery or page-websocket attachment fails. Cancellation and cleanup
+  errors preserve the original failure. Concurrent ownership tests now use six
+  distinct targets and a foreign tab rather than a single shared fake target.
+- Taobao search/card failures no longer enter the successful-result cache, and
+  Lamoda search does not cache detected challenge pages. After browser action,
+  a new call reads fresh evidence instead of replaying a cached block for up to
+  the default 120-second TTL. Successful payloads still use the normal cache.
+- Taobao search now uses its existing CAPTCHA detector in the public tool, not
+  only in selfcheck. Empty cards with challenge evidence return the same
+  structured error; ordinary product cards mentioning CAPTCHA remain data.
+- Taobao login/CAPTCHA walls and Lamoda search challenges return
+  `challenge_required`. Comparison outcomes now retain `error_code`, `retryable`,
+  `requires_user_action`, and `challenge_type`, even when error detail is truncated.
+  Successful sources remain available while the client waits for browser action.
+- DSH guidance retries only affected sources after action completes, preserving
+  query settings and disclosing that old and retried offers have different
+  observation times. Opt-in retention now supports explicit same-session repeats;
+  autonomous challenge completion remains outside this implementation.
+- Corrected the documented offline-test count that failed the previous CI run.
+
+### Идентификация / Identity
+
+- `compare_verify_offer` принимает необязательный `expected_identity` и
+  возвращает сведения из карточки вместе с вердиктом сопоставления. Артикул
+  продавца не считается MPN; совпадение MPN требует марки. Отсутствующие
+  характеристики варианта дают `unknown`, кириллические и китайские значения
+  сохраняются при сопоставлении. Проверка формата GTIN отклоняет знаки,
+  дробные числа и нулевой заполнитель; ведущие нули до 14 знаков не меняют
+  идентичность GTIN. Проверка не меняет ранжирование цен; извлечение
+  manufacturer-полей из живых источников ещё не подтверждено.
+- `compare_verify_offer` accepts optional `expected_identity` and returns
+  observed card evidence with a match verdict. Seller articles are not MPNs;
+  MPN equality requires a brand. Incomplete variant evidence stays `unknown`,
+  and non-Latin variant values retain their meaning. Malformed GTINs are
+  rejected and leading-zero GTIN representations compare equally. Price
+  ranking is unchanged; live manufacturer-field extraction remains unverified.
+- The deliberate optional-input expansion adds about 196 estimated tokens:
+  compare profile 1816 → 2023; unified profile 16030 → 16549 (values as stored in `work/performance/wire-baseline.json`). The stored
+  wire baseline is updated for this contract change; the 10% gate is unchanged.
+
+### Исправлено
+
+- Lamoda больше не принимает слова `captcha` и «не робот» внутри скриптов,
+  скрытых виджетов или названий товаров за блокировку; challenge определяется
+  только по видимому тексту пустой выдачи.
+- Параллельные CDP-коннекторы теперь сопоставляют созданную вкладку с её
+  `targetId`, чтобы один вызов не получил вкладку другого.
+- В CI добавлен гейт роста MCP wire-схем относительно сохранённого baseline.
+- Кэш адреса Megamarket теперь разделён по CDP endpoint и scraping profile;
+  смена профиля не использует старый адресный идентификатор.
+- Добавлена датированная матрица model-level routing с отдельной проверкой
+  text/structured capability и явной оговоркой, что one-shot probe не является
+  универсальным рейтингом моделей.
+- Яндекс Маркет: «полая» страница товара (HTTP 200, `pageId market:product`,
+  все товарные коллекции пусты, нет Product ld+json) классифицируется как
+  `empty_product_shell` → retryable `transport_down` у `yandex_card` и
+  `inconclusive` у selfcheck, а не `parser_drift`. Причина живая: ~12–13.09
+  Яндекс перевёл товарные данные поиска и карточек из SSR-состояния в
+  клиентскую ленивую загрузку — знакомые семейства полей не изменили форму,
+  они отсутствуют в отдаче, а по тристейт-доктрине это сервинг/сессия, не
+  парсер. Search-канарейка больше не считает выдачу через ld+json-fallback
+  (`ok_ldjson_only`) здоровой: probe-id для карточной проверки из такой
+  выдачи ненадёжен.
+- Model-level routing eval стал запускаемым: бандл из 38 кейсов
+  (`work/evals/routing-cases-v1.json`, 19 routing + 19 классификаций сбоев,
+  каждый с evidence-цитатой из SKILL.md), детерминированный офлайн-раннер
+  `scripts/model_routing_eval.py run` (оценивает уже собранные ответы моделей,
+  accuracy per-slice, «не схлопывать в одну оценку»), протокол
+  мульти-модельного прогона `work/evals/MODEL_ROUTING_PROTOCOL.md` и
+  single-model пилот `work/evals/pilot-2026-09-13.md`.
+
+### Fixed
+
+- Lamoda no longer treats `captcha` or bot wording in scripts, hidden widgets,
+  or product names as a block; a challenge is classified only from visible text
+  on an empty result.
+- Concurrent CDP connectors now correlate a created page with its `targetId`,
+  preventing one call from claiming another call's tab.
+- CI now gates MCP schema wire-cost growth against the stored baseline.
+- Megamarket address caching is now scoped to the CDP endpoint and scraping
+  profile, so switching profiles cannot reuse the previous address identifier.
+- Added a dated model-level routing matrix with separate text/structured
+  capability checks; the one-shot probe is explicitly not a universal model ranking.
+- Yandex Market: a hollow product page (HTTP 200, `pageId market:product`,
+  every product collection empty, no Product ld+json) is now classified as
+  `empty_product_shell` — a retryable `transport_down` from `yandex_card` and
+  `inconclusive` in the selfcheck, not `parser_drift`. Live cause: around
+  Sep 12–13 Yandex moved search/card product data from the SSR state into
+  client-side lazy loading — the familiar field families did not change
+  shape, they are absent from the served page, which the tri-state doctrine
+  classes as serving/session, not the parser. The search canary no longer
+  treats an ld+json-fallback extraction (`ok_ldjson_only`) as healthy: a
+  card-probe id taken from such a page is unreliable.
+- The model-level routing eval is now runnable: a 38-case bundle
+  (`work/evals/routing-cases-v1.json`, 19 routing + 19 failure-classification
+  cases, each with an evidence citation from SKILL.md), a deterministic offline
+  runner `scripts/model_routing_eval.py run` (scores already-collected model
+  answers, per-slice accuracy, never collapsed into one score), the
+  multi-model run protocol `work/evals/MODEL_ROUTING_PROTOCOL.md`, and a
+  single-model pilot `work/evals/pilot-2026-09-13.md`.
+
+## [2.2.0] — 2026-09-11
+
 ### Добавлено
 
 - `cian_search` умеет посуточную аренду: `deal="daily"` (рядом с `sale` и
@@ -34,6 +467,23 @@
   публикатора. Цена без указания — `None`, не 0. В `compare_prices` источник не
   участвует. Страница агента структурированных данных не отдаёт, поэтому тула
   `cian_agent` нет — агент приходит внутри карточки (`docs/ANTI_BOT.md` § Cian).
+- Переменная `MARKETPLACE_SOURCES` выбирает, какие источники монтирует
+  `marketplace-mcp`: схемы всех тулов уходят клиенту в каждом запросе, и
+  оператор, которому нужны три площадки, не платит за остальные. Имена
+  канонические, псевдонимы `wb`, `ym`/`yandex`, `detmir`, `ali` тоже
+  принимаются. Не задана или пуста — монтируется всё, как раньше. Снятые
+  источники видны в `marketplace_sources` → `skipped` с пометкой
+  `deselected`, а `compare_prices` опрашивает тот же набор.
+
+### Исправлено
+
+- `marketplace_sources`: флаг `mounted` в `capabilities` у Яндекс Маркета и
+  Детского мира всегда был `false`, даже когда они смонтированы, — таблица
+  монтирования называет их `yandex`/`detmir`, а метаданные —
+  `yandex_market`/`detsky_mir`.
+- `MARKETPLACE_SOURCES` теперь отклоняет неизвестные имена при запуске и
+  перечисляет поддерживаемые источники: опечатка больше не создаёт частичный
+  сервер молча.
 
 ### Added
 
@@ -59,6 +509,20 @@
   takes no part in `compare_prices`. The agent page exposes no structured data,
   so there is no `cian_agent` tool — the agent ships inside the card
   (`docs/ANTI_BOT.md` § Cian).
+- `MARKETPLACE_SOURCES` selects which sources `marketplace-mcp` mounts: every
+  tool schema is sent to the client on every request, so an operator who needs
+  three marketplaces does not pay for the rest. Canonical names, plus the
+  aliases `wb`, `ym`/`yandex`, `detmir` and `ali`. Unset or blank mounts
+  everything, as before. Deselected sources appear in `marketplace_sources` →
+  `skipped` marked `deselected`, and `compare_prices` queries the same subset.
+
+### Fixed
+
+- `marketplace_sources`: the `mounted` flag in `capabilities` always read
+  `false` for Yandex Market and Detsky Mir, even when mounted — the mount table
+  names them `yandex`/`detmir`, the metadata `yandex_market`/`detsky_mir`.
+- `MARKETPLACE_SOURCES` now rejects unknown names at startup and lists the
+  supported sources, so a typo cannot silently create a partial server.
 
 ### Исправлено
 
@@ -111,6 +575,8 @@
   `docs/ARCHITECTURE.md`, счётчики навыков (15), источников (14), артефактов
   релиза (32) и мест хранения версии (84) в README, `docs/DEPLOYMENT.md`,
   `docs/RELEASE_CHECKLIST.md`, `release.yml` и dsh-бандле.
+- Офлайн-счётчик тестов в документации обновлён до 1349: двадцать четыре
+  теста login-стены и анти-бот-вердикта Taobao добавились к 1325.
 
 ### Changed
 
@@ -120,6 +586,178 @@
   `docs/ARCHITECTURE.md`, skill (15), source-server (14), release-artifact
   (32) and version-location (84) counts across README, `docs/DEPLOYMENT.md`,
   `docs/RELEASE_CHECKLIST.md`, `release.yml` and the dsh bundle.
+- Documented offline test count is 1349: twenty-four Taobao login-wall and
+  anti-bot-verdict tests on top of 1325.
+
+### Исправлено
+
+- Классификация login-стены Taobao: стена с **пустым** `<title>` (живой замер
+  2026-09-10 — именно так она сейчас и выглядит) раньше доходила до вердикта
+  `drift_detected`, хотя по тристейт-доктрине сессия/IP/капча — это
+  `inconclusive`, а не дрейф парсера. Детектор дополнен структурными
+  маркерами: login-маршруты (`member/login.jhtml`, `register.jhtml`), общее
+  число анкоров (порог `< 40`; здоровая страница несёт 133), видимый текст
+  тела (`/登录|log ?in|sign ?in/i`). Решает Python, экстрактор-JS только
+  передаёт счётчики и сниппет. Тулы отвечают `transport_down` с инструкцией
+  про вход инлайн, `taobao_selfcheck` — `inconclusive` с причиной
+  `login_wall`. Регрессионная фикстура — настоящий снимок стены (trimmed,
+  с provenance и тестом на отсутствие сессионных данных).
+- Вердикт капчи Taobao переехал из экстрактор-JS в Python и гейтится на
+  пустой выдаче: скрытый текст виджета baxia («人机») раньше давал
+  `__BLOCKED__` даже на здоровых страницах с 29–38 товарами, из-за чего
+  shape-drift канарейка никогда не запускалась по-настоящему. Теперь страница
+  с товарами не заблокирована (канарейка работает), а страница без товаров
+  с текстом капчи — `inconclusive(blocked)`; старый JS-маркер
+  `__BLOCKED__` понимается для легаси-payload'ов.
+- Карточка товара, в **названии** которого есть «登录»/«login», больше не
+  принимается за login-стену: title-маркер на card-payload читает заголовок
+  документа (`page_title`), а не имя товара.
+
+### Fixed
+
+- Taobao login-wall classification: a wall with an **empty** `<title>` (the
+  shape observed live on 2026-09-10) used to reach the `drift_detected`
+  verdict, although the tri-state doctrine classes a session wall as
+  `inconclusive`, never drift. The detector gained structural markers —
+  login routes (`member/login.jhtml`, `register.jhtml`), total anchor count
+  (ceiling `< 40`; a healthy page carries 133) and the visible body text
+  (`/登录|log ?in|sign ?in/i`). Python decides; the extractor JS only
+  transports counts and a snippet. Tools answer `transport_down` with the
+  log-in fix inline, `taobao_selfcheck` answers `inconclusive` with reason
+  `login_wall`. The regression fixture is a real trimmed capture of the wall
+  with provenance and a test asserting it carries no session data.
+- Taobao's captcha verdict moved from the extractor JS into Python and is
+  gated on a zero-item extraction: the hidden baxia widget text («人机») used
+  to bake `__BLOCKED__` even into healthy pages rendering 29–38 items, so the
+  shape-drift canary never actually ran. A page with items is now not blocked
+  (the canary runs); a zero-item page carrying captcha text is
+  `inconclusive(blocked)`; the legacy JS `__BLOCKED__` marker is still
+  honored for replayed older-build payloads.
+- A card whose product **name** contains «登录»/«login» is no longer
+  mistaken for a login wall: on card payloads the title marker reads the
+  document title (`page_title`), never the product name.
+
+### Изменено
+
+- Мегамаркет: чтение адресов профиля (`/profileService/address/list` —
+  аккаунтная зона, запрос с `credentials: include` в вашем залогиненном
+  Chrome) стало **opt-in**: `MEGAMARKET_USE_PROFILE_ADDRESS=1`. По умолчанию
+  выключено — адрес резолвится через публичный suggest-эндпоинт из
+  `MEGAMARKET_ADDRESS` (Москва), поиск работает как прежде, но без
+  персонализации профиля. Использование профиля раскрывается в
+  `_meta.warnings` (`address_source:profile` + `profile_address_read`);
+  сырой `addressId` не покидает процесс ни в успешных ответах, ни в ошибках
+  (отказ при нуле офферов называет `address_source`, а не идентификатор).
+  Раньше профильный эндпоинт читался безусловно при каждом старте.
+- Офлайн-счётчик тестов в документации обновлён до 1356: семь тестов
+  приватности Мегамаркета добавились к 1349.
+
+### Исправлено
+
+- `SECURITY.md` (RU+EN) и trust-boundary абзац README (обе половины) больше
+  не утверждают, что MPStats — единственная точка входа в аккаунтную зону:
+  список адресов профиля Мегамаркета документирован как вторая такая
+  поверхность, доступная только через явный opt-in. Раньше пользователь мог
+  включить Мегамаркет, полагая, что читаются лишь публичные каталожные
+  эндпоинты, а сервер читал локационные данные профиля и персонализировал
+  ими выдачу (находка S4 исследования `work/v2-research/security.md`).
+
+### Changed
+
+- Megamarket: reading the profile addresses (`/profileService/address/list` —
+  an account-gated zone, fetched with `credentials: include` inside your
+  logged-in Chrome) is now **opt-in**: `MEGAMARKET_USE_PROFILE_ADDRESS=1`.
+  The default is off — the address resolves through the public suggest
+  endpoint from `MEGAMARKET_ADDRESS` (Moscow), so search keeps working
+  without profile personalization. Profile use is disclosed in
+  `_meta.warnings` (`address_source:profile` + `profile_address_read`); the
+  raw `addressId` never leaves the process, in successful responses or in
+  errors alike (the zero-offers refusal names the `address_source`, not the
+  identifier). Previously the profile endpoint was read unconditionally at
+  startup.
+- Documented offline test count is 1356: seven Megamarket privacy tests on
+  top of 1349.
+
+### Fixed
+
+- `SECURITY.md` (RU+EN) and the README trust-boundary paragraph (both
+  halves) no longer claim MPStats is the only account-gated surface: the
+  Megamarket profile address list is now documented as a second such
+  surface, reachable only through explicit opt-in. Previously a user could
+  enable Megamarket believing only public catalog endpoints were read,
+  while the server read profile location data and personalized results with
+  it (finding S4 of `work/v2-research/security.md`).
+
+### Исправлено
+
+- `yandex_search` возвращал зачёркнутую базовую цену вместо той, что
+  покупатель реально платит: `price_rub` строился из `offer.price.value`
+  SERP-состояния (а на скидочных строках там лежит `initialPrice`) с
+  фолбэком на тот же `initialPrice`. Живой замер 2026-09-11: Tuvio
+  TKP2117S — коннектор отдавал 3698 ₽ при фактических 2367 ₽ (завышение
+  +61%). Теперь `price_rub` берётся из корзины SERP
+  (`productPayload.cartButton.price.valueFmt`), затем из
+  `additionalPrices[withDiscount]`, и лишь в последнюю очередь из цены
+  оффера; `price_with_plus` — из `actualPrice`/`yaBank`; `price_old_rub` —
+  только когда зачёркнутая цена строго больше фактической. Побочный эффект
+  на `compare_prices`: раньше яндекс-строки ранжировались по зачёркнутой
+  цене и систематически проигрывали (завышение +24…+61%), из-за чего
+  «cheapest» мог доставаться другому маркетплейсу при фактически более
+  дешёвом Яндексе.
+- Провенанс июльских фикстур yandex-поиска записывал «displayed» цены с
+  выхода багованного парсера, а не с экрана (washer: записано 22600,
+  страница показывала 16724) — value-pinning тесты фактически пиннили баг.
+  Значения перечитаны из тех же снимков (HTML и sha256 не менялись),
+  provenance-заметка исправлена с явной пометкой о коррекции. Добавлена
+  новая живая фикстура `search_kettle` (снимок 2026-09-11) с тремя
+  строками: регрессия зачёркнутой цены, промежуточная цена продавца,
+  SERP-офер ≠ дефолт карточки.
+- Задокументирован quirk Яндекса (сайт, не коннектор): строка SERP описывает
+  офер сниппета, который может отличаться от дефолтного офера карточки
+  (REDMOND: KM243 sku 4668084807 @2004 в выдаче против KM245 sku
+  103808288420 @4146 на карточке того же pid). Строки поиска сверяются по
+  `sku_id`, а не по product-URL; docstring, SKILL.md (×2) и README (RU+EN)
+  это отражают.
+
+### Изменено
+
+- Офлайн-счётчик тестов в документации обновлён до 1360: четыре теста
+  ценового маппинга yandex-поиска добавились к 1356.
+
+### Fixed
+
+- `yandex_search` returned the strike-through base price instead of what a
+  buyer actually pays: `price_rub` was built from the SERP state's
+  `offer.price.value` (which carries `initialPrice` on discounted rows) with
+  a fallback to `initialPrice` itself. Measured live 2026-09-11: Tuvio
+  TKP2117S — the connector said 3698 ₽ while the real price was 2367 ₽ (a
+  +61 % overstatement). `price_rub` now comes from the SERP cart price
+  (`productPayload.cartButton.price.valueFmt`), then
+  `additionalPrices[withDiscount]`, and only then the offer price;
+  `price_with_plus` from `actualPrice`/`yaBank`; `price_old_rub` only when
+  the strike-through price is strictly greater. Side effect on
+  `compare_prices`: Yandex rows used to rank by the strike-through price and
+  lost systematically (+24…+61 % inflation), so "cheapest" could go to
+  another marketplace while Yandex was actually cheaper.
+- The July search fixtures' provenance recorded "displayed" prices from the
+  buggy parser's output rather than the screen (washer: recorded 22600, the
+  page showed 16724) — the value-pinning tests were pinning the bug. Values
+  re-read from the same captures (HTML and sha256 unchanged), the provenance
+  note corrected with an explicit annotation. New live fixture
+  `search_kettle` (captured 2026-09-11) covers three rows: the
+  strike-through regression, an intermediate seller price, and a SERP offer
+  differing from the card default.
+- Documented a Yandex site-side quirk (not a connector bug): a SERP row
+  describes the snippet's offer, which can differ from the card's default
+  offer (REDMOND: KM243 sku 4668084807 @2004 in search vs KM245 sku
+  103808288420 @4146 on the card for the same pid). Search rows verify
+  against `sku_id`, not the product URL; docstring, SKILL.md (×2) and README
+  (RU+EN) now say so.
+
+### Changed
+
+- Documented offline test count is 1360: four yandex-search price-mapping
+  tests on top of 1356.
 
 ## [2.1.0] — 2026-09-09
 
@@ -558,7 +1196,7 @@ English summary:
 - Живой `doctor` на момент выпуска: wildberries, ozon, yandex, detmir, taobao,
   citilink — healthy; avito (анти-бот), dns (401 сессии), megamarket
   (ServicePipe), mpstats (нет платного токена) — честные inconclusive.
-- Бюджет живых запросов прогона: 25 из 40 (см. `.agent/LIVE-BUDGET.md`).
+- Бюджет живых запросов прогона: 25 из 40 (см. журнал живого прогона).
 
 English summary:
 

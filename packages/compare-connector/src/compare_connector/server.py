@@ -25,41 +25,66 @@ comparison runs with whatever is present.
 
 NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Compare marketplace offers and verify shortlisted source-native cards.
+# SCOPE: Read-only concurrent sources; partial outcomes; RUB ranking and identity evidence.
+# DEPENDS: FastMCP; mcp_core runtime/source_selection; identity; models_output; vision_policy; source servers.
+# LINKS: M-COMPARE; M-WB; M-YANDEX; M-DETMIR; M-OZON; M-AVITO; M-TAOBAO; M-MEGAMARKET; M-LAMODA; M-DNS; M-CITILINK; M-ALIEXPRESS; M-MARKETPLACE.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# _available_sources: Import connectors defensively and report missing installations.
+# _dedupe: Merge duplicate offers while preserving source identity.
+# OfferBatch: Carry normalized offers plus source warnings and health evidence.
+# _run_source: Bound each source query and preserve structured partial failures.
+# _call_card_tool: Dispatch validated source-native card arguments.
+# compare_prices: Rank eligible RUB offers with per-source completeness and warnings.
+# compare_verify_offer: Re-read a card and compare price, identity and stock evidence.
+# compare_sources: Report searchable/installed/deselected source capabilities.
+# compare_browser_snapshot: Deliver a controlled browser snapshot using vision policy.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import math
 import os
 import re
 import time
 from collections.abc import Iterable
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from fastmcp import Context, FastMCP
-from mcp.types import ToolAnnotations
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
+from mcp.types import ImageContent, TextContent, ToolAnnotations
 from mcp_core import resilience as R
-from mcp_core.errors import BadRequestError, raise_tool_error
+from mcp_core.errors import BadRequestError, ConnectorError, ErrorCode, NotFoundError, raise_tool_error
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.runtime import browser_handoff_lifespan, current_mcp_session_id
+from mcp_core.source_selection import selected
 from pydantic import Field
 
+from compare_connector.identity import ProductIdentity, identity_from_mapping, match_product_identity
 from compare_connector.models_output import (
     CompareResponse,
     MarketOffer,
     SourceOutcome,
 )
+from compare_connector.vision_policy import client_vision_hint, resolve_image_delivery
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.5.3"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 # Per-source ceiling. Yandex pages are ~2 MB and WB search occasionally stalls, so
 # a slow source must not hold the whole comparison hostage.
 SOURCE_TIMEOUT_S = float(os.environ.get("COMPARE_SOURCE_TIMEOUT", "45"))
 
-mcp = FastMCP(name="compare-connector", version=SERVER_VERSION)
+mcp = FastMCP(name="compare-connector", version=SERVER_VERSION, lifespan=browser_handoff_lifespan)
 
 _CARD_TOOL_NAMES = {
     "wildberries": "wb_card",
@@ -169,6 +194,10 @@ def _available_sources() -> dict[str, Any]:
     except Exception as exc:
         log_event("compare.source_unavailable", source="drom", error=_redact(str(exc))[:120])
 
+    chosen = selected()
+    if chosen is not None:
+        sources = {name: module for name, module in sources.items() if name in chosen}
+
     return sources
 
 
@@ -201,7 +230,7 @@ FOREIGN_CURRENCY_SOURCES = ("taobao",)
 
 
 def _dedupe(offers: Iterable[MarketOffer]) -> list[MarketOffer]:
-    """Drop repeats of the same listing, keyed on (source, product_id).
+    """Drop repeats of the same listing, retaining explicitly distinct variants.
 
     A marketplace can return the same product twice — colour variants sharing
     an id, a pagination overlap — and every copy would otherwise rank
@@ -213,13 +242,13 @@ def _dedupe(offers: Iterable[MarketOffer]) -> list[MarketOffer]:
     survives. Offers with no product_id cannot be compared this way and are all
     kept: dropping them on a blank key would silently merge distinct listings.
     """
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     out: list[MarketOffer] = []
     for offer in offers:
         if not offer.product_id:
             out.append(offer)
             continue
-        key = (offer.source, offer.product_id)
+        key = (offer.source, offer.product_id, offer.variant_id)
         if key in seen:
             continue
         seen.add(key)
@@ -375,7 +404,7 @@ def _as_price(value: object) -> float | None:
 
     Live evidence for the delegation (Ozon rendered search + card pages captured
     2026-08-07 through the operator's Chrome, raw HTML in
-    ``.agent/captures/``): all 144 distinct price-like strings on the pages
+    the captured pages kept outside the repository): all 144 distinct price-like strings on the pages
     parse identically through ``coerce_price``, except range strings like
     "1 000–2 000 ₽", which the old duplicate concatenated into a fabricated
     price and the shared parser correctly rejects as ambiguous.
@@ -424,10 +453,43 @@ def _stock_from_label(value: object) -> bool | None:
         return value > 0 if math.isfinite(value) else None
     if not isinstance(value, str) or not value.strip():
         return None
-    digits = re.sub(r"[^\d]", "", value)
-    if digits:
-        return int(digits) > 0
-    return True
+    label = " ".join(value.casefold().split()).rstrip(".! ")
+    if label in {"не осталось", "нет в наличии", "нет на складе", "товар закончился", "распродано"}:
+        return False
+    if label in {"в наличии", "есть в наличии", "много шт", "осталось много", "осталось много шт"}:
+        return True
+    # A count alone can describe a pack or sales, rather than available stock.
+    # Anchor the entire label so signs, ranges and unrelated digits cannot be
+    # concatenated into an invented positive quantity.
+    count = r"([0-9]+|[0-9]{1,3}(?: [0-9]{3})+)"
+    quantity = re.fullmatch(rf"осталось {count}(?: шт)?", label) or re.fullmatch(rf"{count} шт осталось", label)
+    if quantity:
+        return int(quantity.group(1).replace(" ", "")) > 0
+    return None
+
+
+class OfferBatch(list[MarketOffer]):
+    """Offers with native diagnostics; no shared state across concurrent sources."""
+
+    def __init__(self, offers: Iterable[MarketOffer], response: object) -> None:
+        super().__init__(offers)
+        meta = getattr(response, "meta", None)
+        raw = meta.get("warnings", []) if isinstance(meta, dict) else getattr(meta, "warnings", [])
+        healthy = meta.get("healthy") if isinstance(meta, dict) else getattr(meta, "healthy", None)
+        self.warnings: list[str] = []
+        if isinstance(raw, list):
+            for warning in raw:
+                if not isinstance(warning, str) or not warning.strip():
+                    continue
+                text = " ".join(_redact(warning).split())
+                if len(text) > 500:
+                    text = text[:497] + "..."
+                if text not in self.warnings:
+                    self.warnings.append(text)
+                if len(self.warnings) == 10:
+                    break
+        if healthy is False and not self.warnings:
+            self.warnings.append("source_unhealthy: native validation did not pass; no diagnostic supplied")
 
 
 async def _search_wildberries(query: str, limit: int) -> list[MarketOffer]:
@@ -453,11 +515,13 @@ async def _search_wildberries(query: str, limit: int) -> list[MarketOffer]:
                 price_rub=item.price_rub,
                 rating=item.review_rating,
                 rating_count=item.feedbacks,
-                in_stock=item.in_stock,
+                # WB's legacy bool also uses False for an unreported quantity.
+                # Preserve that distinction in our nullable stock contract.
+                in_stock=item.in_stock if item.total_quantity is not None else None,
                 url=_wb_product_url(item.nm_id),
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_yandex(query: str, limit: int) -> list[MarketOffer]:
@@ -476,6 +540,7 @@ async def _search_yandex(query: str, limit: int) -> list[MarketOffer]:
             MarketOffer(
                 source="yandex_market",
                 product_id=item.product_id,
+                variant_id=getattr(item, "sku_id", "") or "",
                 title=item.title,
                 brand=item.brand,
                 seller=item.seller,
@@ -487,7 +552,7 @@ async def _search_yandex(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url,
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_ozon(query: str, limit: int) -> list[MarketOffer]:
@@ -526,7 +591,7 @@ async def _search_ozon(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_avito(query: str, limit: int) -> list[MarketOffer]:
@@ -555,7 +620,7 @@ async def _search_avito(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_taobao(query: str, limit: int) -> list[MarketOffer]:
@@ -588,7 +653,7 @@ async def _search_taobao(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_megamarket(query: str, limit: int) -> list[MarketOffer]:
@@ -614,7 +679,7 @@ async def _search_megamarket(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_lamoda(query: str, limit: int) -> list[MarketOffer]:
@@ -638,7 +703,7 @@ async def _search_lamoda(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_dns(query: str, limit: int) -> list[MarketOffer]:
@@ -662,7 +727,7 @@ async def _search_dns(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_citilink(query: str, limit: int) -> list[MarketOffer]:
@@ -686,7 +751,7 @@ async def _search_citilink(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_aliexpress(query: str, limit: int) -> list[MarketOffer]:
@@ -716,7 +781,7 @@ async def _search_aliexpress(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 async def _search_drom(query: str, limit: int) -> list[MarketOffer]:
@@ -740,7 +805,7 @@ async def _search_drom(query: str, limit: int) -> list[MarketOffer]:
                 url=item.url or "",
             )
         )
-    return offers
+    return OfferBatch(offers, response)
 
 
 _SEARCH_IMPLS = {
@@ -758,6 +823,71 @@ _SEARCH_IMPLS = {
 }
 
 
+def _source_error(exc: Exception) -> dict[str, Any]:
+    """Preserve typed recovery signals before truncating/redacting error detail.
+
+    Only connector exceptions and MCP ToolError envelopes carry this contract.
+    Arbitrary upstream text must not become an instruction to the client.
+    """
+    payload: dict[str, Any] = {}
+    if isinstance(exc, ConnectorError):
+        payload = exc.to_dict()
+    elif isinstance(exc, ToolError):
+        try:
+            decoded = json.loads(str(exc))
+        except (ValueError, RecursionError):
+            pass
+        else:
+            if isinstance(decoded, dict):
+                payload = decoded
+    raw_code = payload.get("error")
+    try:
+        code = ErrorCode(raw_code if isinstance(raw_code, str) else "")
+    except (ValueError, TypeError):
+        detail = _redact(str(exc))[:200]
+        return {
+            "status": "blocked"
+            if any(word in detail for word in ("transport_down", "rate_limited", "403"))
+            else "error",
+            "detail": detail,
+        }
+
+    challenge = code == ErrorCode.CHALLENGE_REQUIRED
+    challenge_type = payload.get("challenge_type")
+    if challenge_type not in ("captcha", "login", "login_or_captcha"):
+        challenge_type = None
+    status = "error"
+    if code in (ErrorCode.CHALLENGE_REQUIRED, ErrorCode.RATE_LIMITED, ErrorCode.TRANSPORT_DOWN):
+        status = "blocked"
+    elif code == ErrorCode.TIMEOUT:
+        status = "timeout"
+    handoff_expires_at = None
+    raw_expiry = payload.get("handoff_expires_at")
+    if challenge and isinstance(raw_expiry, str):
+        try:
+            expiry = datetime.datetime.fromisoformat(raw_expiry)
+        except ValueError:
+            pass
+        else:
+            if expiry.tzinfo is not None:
+                handoff_expires_at = expiry.astimezone(datetime.UTC).isoformat().replace("+00:00", "Z")
+    raw_handoff_id = payload.get("handoff_id")
+    return {
+        "status": status,
+        "detail": _redact(str(payload.get("message", str(exc))))[:200],
+        "error_code": code.value,
+        "retryable": code.retryable,
+        "requires_user_action": challenge,
+        "challenge_type": challenge_type if challenge else None,
+        "handoff_expires_at": handoff_expires_at,
+        "handoff_id": raw_handoff_id
+        if handoff_expires_at
+        and isinstance(raw_handoff_id, str)
+        and re.fullmatch(r"[A-Za-z0-9_-]{16,80}", raw_handoff_id)
+        else None,
+    }
+
+
 async def _run_source(name: str, query: str, limit: int) -> tuple[SourceOutcome, list[MarketOffer]]:
     """Query one marketplace, converting any failure into a reported outcome.
 
@@ -773,18 +903,17 @@ async def _run_source(name: str, query: str, limit: int) -> tuple[SourceOutcome,
                 source=name,
                 status="timeout",
                 detail=f"no response within {SOURCE_TIMEOUT_S:.0f}s",
+                error_code=ErrorCode.TIMEOUT.value,
+                retryable=True,
                 elapsed_ms=round((time.monotonic() - started) * 1000),
             ),
             [],
         )
     except Exception as exc:
-        detail = _redact(str(exc))[:200]
-        status = "blocked" if any(word in detail for word in ("transport_down", "rate_limited", "403")) else "error"
         return (
             SourceOutcome(
                 source=name,
-                status=status,
-                detail=detail,
+                **_source_error(exc),
                 elapsed_ms=round((time.monotonic() - started) * 1000),
             ),
             [],
@@ -796,6 +925,7 @@ async def _run_source(name: str, query: str, limit: int) -> tuple[SourceOutcome,
             source=name,
             status="ok",
             detail=f"{len(offers)} results, {len(priced)} priced",
+            warnings=offers.warnings if isinstance(offers, OfferBatch) else [],
             offers_returned=len(offers),
             elapsed_ms=round((time.monotonic() - started) * 1000),
         ),
@@ -875,6 +1005,7 @@ async def compare_prices(
     if len(text) < 2:
         raise_tool_error(BadRequestError("query must be at least 2 characters"))
 
+    chosen = selected()
     if sources:
         # An explicit list is validated strictly: naming a marketplace that does
         # not exist is a caller mistake worth surfacing, not silently dropping.
@@ -882,11 +1013,16 @@ async def compare_prices(
         unknown = [name for name in requested if name not in _SEARCH_IMPLS]
         if unknown:
             raise_tool_error(BadRequestError(f"unknown source(s) {unknown}: valid options are {sorted(_SEARCH_IMPLS)}"))
+        deselected = [name for name in requested if chosen is not None and name not in chosen]
+        if deselected:
+            raise_tool_error(BadRequestError(f"source(s) {deselected} are deselected by MARKETPLACE_SOURCES"))
     else:
         # Default: every searchable marketplace that is actually wired up. Reading
         # from _SEARCH_IMPLS rather than the static tuple keeps this honest when
         # implementations are added or, in tests, replaced.
         requested = [name for name in _SEARCH_IMPLS if name in SEARCHABLE] or list(_SEARCH_IMPLS)
+        if chosen is not None:
+            requested = [name for name in requested if name in chosen]
 
     active = [name for name in requested if name in SOURCES]
     missing = [name for name in requested if name not in SOURCES]
@@ -965,6 +1101,8 @@ async def compare_prices(
             warnings.append(f"stock_filter: excluded {excluded} priced offer(s) without confirmed stock")
         if not priced_all:
             warnings.append("stock_filter: no priced offers were returned")
+    for outcome in outcomes:
+        warnings.extend(f"source_warning:{outcome.source}: {warning}" for warning in outcome.warnings)
     warnings.extend(_relevance_warnings(text, priced))
     if cheapest is not None and cheapest_comparable is not None and cheapest is not cheapest_comparable:
         warnings.append(
@@ -1003,6 +1141,72 @@ async def compare_prices(
     )
 
 
+def _numeric_card_id(source: str, value: str) -> int:
+    """Accept the source's numeric ID or canonical product path, never a stray digit."""
+    candidate = value.strip()
+    if re.fullmatch(r"[0-9]+", candidate):
+        number = int(candidate)
+        if number > 0:
+            return number
+    else:
+        hosts, path = {
+            "wildberries": ({"wildberries.ru", "www.wildberries.ru"}, r"/catalog/([0-9]+)/detail\.aspx/?"),
+            "detsky_mir": ({"detmir.ru", "www.detmir.ru"}, r"/product/index/id/([0-9]+)/?"),
+        }[source]
+        try:
+            parsed = urlsplit(candidate)
+            valid_origin = (
+                parsed.scheme in {"https", "http"}
+                and parsed.hostname in hosts
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.port is None
+            )
+        except ValueError:
+            valid_origin = False
+        if valid_origin:
+            match = re.fullmatch(path, parsed.path)
+            if match and int(match[1]) > 0:
+                return int(match[1])
+    raise_tool_error(BadRequestError(f"{source} verification needs a positive numeric id or a canonical product URL"))
+
+
+async def _call_card_tool(name: str, product_id_or_url: str, *, include_reviews: bool = False) -> tuple[Any, str]:
+    """Dispatch both comparison profiles through the same native card contract."""
+    if name not in _CARD_TOOL_NAMES:
+        raise_tool_error(BadRequestError(f"source {name!r} has no supported card inspector"))
+    module = SOURCES.get(name)
+    if module is None:
+        raise_tool_error(BadRequestError(f"source {name!r} is not installed in this profile"))
+    tool = getattr(module, _CARD_TOOL_NAMES[name], None)
+    if tool is None:
+        raise_tool_error(BadRequestError(f"source {name!r} has no card tool available"))
+
+    requested_numeric_id = ""
+    if name == "wildberries":
+        requested_numeric_id = str(_numeric_card_id(name, product_id_or_url))
+        result = await tool(nm_ids=[int(requested_numeric_id)])
+    elif name == "yandex_market":
+        result = await tool(product_id=product_id_or_url, include_reviews=include_reviews)
+    elif name == "detsky_mir":
+        requested_numeric_id = str(_numeric_card_id(name, product_id_or_url))
+        result = await tool(product_id=int(requested_numeric_id))
+    else:
+        argument = {
+            "ozon": "sku_or_path",
+            "avito": "item_id_or_url",
+            "taobao": "item_id_or_url",
+            "megamarket": "item_id_or_url",
+            "lamoda": "sku_or_url",
+            "dns": "product_url",
+            "citilink": "product_url",
+            "aliexpress": "item_id_or_url",
+        }[name]
+        result = await tool(**{argument: product_id_or_url})
+    payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    return payload, requested_numeric_id
+
+
 @mcp.tool(
     name="compare_verify_offer",
     annotations=ToolAnnotations(
@@ -1020,13 +1224,31 @@ async def compare_verify_offer(
     ],
     expected_price_rub: Annotated[
         float | None,
-        Field(default=None, ge=0, description="Price returned by compare_prices; used to report a live card delta."),
+        Field(
+            default=None,
+            ge=0,
+            allow_inf_nan=False,
+            description="Price returned by compare_prices; used to report a live card delta.",
+        ),
+    ] = None,
+    expected_identity: Annotated[
+        ProductIdentity | None,
+        Field(description="Optional manufacturer identifiers and variant attributes to verify against the card."),
+    ] = None,
+    expected_variant_id: Annotated[
+        str | None,
+        Field(
+            default=None,
+            min_length=1,
+            max_length=100,
+            description="Yandex variant_id from the search row; rejects a different card SKU.",
+        ),
     ] = None,
 ) -> dict[str, Any]:
     """Verify one compared offer through its marketplace card tool.
 
     This is the cheap compare-server follow-up: it lets an agent confirm the
-    raw search price, stock and seller without enabling the 39-tool unified
+    raw search price, stock and seller without enabling the full unified
     mount. The returned card is source-native and therefore keeps fields the
     comparison intentionally normalises away.
 
@@ -1034,7 +1256,12 @@ async def compare_verify_offer(
 
     JSON object: `{source, product_id_or_url, card}`. `card` is the native
     source response, preserving price, availability, seller, and source-specific
-    fields when the marketplace exposes them.
+    fields when the marketplace exposes them. `identity_verification`, when
+    requested, carries the observed typed identifiers and a match verdict;
+    absent manufacturer evidence yields unknown, never a title-derived exact match.
+    For Yandex, pass the search row's `variant_id` as `expected_variant_id`:
+    a different or missing card SKU is rejected before computing a price delta.
+    Without it, only the current default card price is checked.
 
     ## Error Format
 
@@ -1042,44 +1269,42 @@ async def compare_verify_offer(
     identifier cannot be validated; native card errors are returned as tool
     errors with their source-specific taxonomy.
     """
+    if expected_price_rub is not None and (
+        isinstance(expected_price_rub, bool) or not math.isfinite(expected_price_rub) or expected_price_rub < 0
+    ):
+        raise_tool_error(BadRequestError("expected_price_rub must be a finite non-negative price"))
     name = source.strip().lower()
-    if name not in _CARD_TOOL_NAMES:
-        raise_tool_error(BadRequestError(f"source {source!r} has no supported card verifier"))
-    module = SOURCES.get(name)
-    if module is None:
-        raise_tool_error(BadRequestError(f"source {name!r} is not installed in this compare server"))
-    tool_name = _CARD_TOOL_NAMES[name]
-    tool = getattr(module, tool_name, None)
-    if tool is None:
-        raise_tool_error(BadRequestError(f"source {name!r} has no card tool available"))
-
+    if expected_variant_id is not None and name != "yandex_market":
+        raise_tool_error(BadRequestError("expected_variant_id is supported only for yandex_market"))
+    payload, requested_numeric_id = await _call_card_tool(name, product_id_or_url)
+    if name == "yandex_market" and expected_variant_id:
+        observed_variant = str(payload.get("sku_id") or "") if isinstance(payload, dict) else ""
+        if observed_variant != expected_variant_id:
+            raise_tool_error(
+                BadRequestError(
+                    f"yandex variant mismatch: expected sku_id {expected_variant_id!r}, card returned {observed_variant or '<missing>'}"
+                )
+            )
+    record = payload if isinstance(payload, dict) else {}
     if name == "wildberries":
-        digits = re.search(r"\d+", product_id_or_url)
-        if digits is None:
-            raise_tool_error(BadRequestError("wildberries verification needs a numeric nm_id"))
-        result = await tool(nm_ids=[int(digits.group(0))])
-    elif name == "yandex_market":
-        result = await tool(product_id=product_id_or_url, include_reviews=False)
+        # Price and identity must describe the same requested row, never an
+        # arbitrary first item from a batch envelope.
+        items = record.get("items")
+        candidates = (
+            [item for item in items if isinstance(item, dict) and str(item.get("nm_id")) == requested_numeric_id]
+            if isinstance(items, list)
+            else []
+        )
+        record = candidates[0] if len(candidates) == 1 else {}
     elif name == "detsky_mir":
-        result = await tool(product_id=int(product_id_or_url))
-    else:
-        argument = {
-            "ozon": "sku_or_path",
-            "avito": "item_id_or_url",
-            "taobao": "item_id_or_url",
-            "megamarket": "product_id_or_url",
-            "lamoda": "sku_or_url",
-            "dns": "product_url",
-            "citilink": "product_url",
-            "aliexpress": "item_id_or_url",
-        }[name]
-        result = await tool(**{argument: product_id_or_url})
-    payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+        product = record.get("product")
+        record = product if isinstance(product, dict) and str(product.get("product_id")) == requested_numeric_id else {}
     verification: dict[str, object] | None = None
     if expected_price_rub is not None:
-        observed = payload.get("price_rub") if isinstance(payload, dict) else None
-        if isinstance(observed, (int, float)):
-            delta = round(float(observed) - expected_price_rub, 2)
+        price_field = "price" if name == "ozon" else "price_rub"
+        observed = R.coerce_price(record.get(price_field))
+        if observed is not None:
+            delta = round(observed - expected_price_rub, 2)
             verification = {
                 "expected_price_rub": expected_price_rub,
                 "observed_price_rub": observed,
@@ -1093,7 +1318,19 @@ async def compare_verify_offer(
                 "delta_rub": None,
                 "matches": None,
             }
-    return {"source": name, "product_id_or_url": product_id_or_url, "card": payload, "price_verification": verification}
+    response = {
+        "source": name,
+        "product_id_or_url": product_id_or_url,
+        "card": payload,
+        "price_verification": verification,
+    }
+    if expected_identity is not None:
+        observed_identity = identity_from_mapping(record, source=name)
+        response["identity_verification"] = {
+            "observed": observed_identity.model_dump(),
+            "match": match_product_identity(expected_identity, observed_identity).model_dump(),
+        }
+    return response
 
 
 @mcp.tool(
@@ -1115,7 +1352,7 @@ async def compare_sources(ctx: Context | None = None) -> dict[str, Any]:
 
     ## Return Format
 
-    Plain object: {installed, searchable, not_installed, notes,
+    Plain object: {installed, searchable, not_installed, deselected, notes,
     source_timeout_s, server_version, server_started_at, process_id}. notes
     explains per-source access quirks (CDP-only sources, currencies, missing
     text search).
@@ -1131,18 +1368,21 @@ async def compare_sources(ctx: Context | None = None) -> dict[str, Any]:
 
     installed = sorted(SOURCES)
     searchable = [name for name in SEARCHABLE if name in SOURCES]
+    chosen = selected()
+    deselected = set(_CARD_TOOL_NAMES) - chosen if chosen is not None else set()
 
     return {
         "installed": installed,
         "searchable": searchable,
-        "not_installed": sorted(set(_SEARCH_IMPLS) - set(SOURCES)),
+        "not_installed": sorted(set(_SEARCH_IMPLS) - set(SOURCES) - deselected),
+        "deselected": sorted(deselected),
         "notes": {
             "detsky_mir": (
                 "installed for direct card/category lookups but excluded from text comparison — "
                 "its API has no working text search"
             )
             if "detsky_mir" in SOURCES
-            else "not installed",
+            else ("deselected by MARKETPLACE_SOURCES" if "detsky_mir" in deselected else "not installed"),
             "ozon": ("requires curl_cffi and, when Cloudflare challenges, a logged-in Chrome on the CDP port"),
             "yandex_market": "reports both an everyday price and a Plus-subscriber price",
             "taobao": "reports yuan prices and is never ranked against rubles",
@@ -1161,6 +1401,118 @@ async def compare_sources(ctx: Context | None = None) -> dict[str, Any]:
         "server_started_at": SERVER_STARTED_AT,
         "process_id": os.getpid(),
     }
+
+
+def _client_capabilities(ctx: Context | None) -> dict[str, Any]:
+    """The client's advertised capabilities, or an empty mapping.
+
+    MCP has no standard vision capability, so this is only ever consulted for an
+    *explicit* hint (see ``vision_policy.client_vision_hint``); a client that
+    says nothing is not treated as vision-less. Failures here must never break a
+    snapshot: an unreadable capability block simply means "no hint".
+    """
+    if ctx is None:
+        return {}
+    try:
+        params = getattr(getattr(ctx, "session", None), "client_params", None)
+        capabilities = getattr(params, "capabilities", None)
+    except Exception:  # pragma: no cover - defensive: transport-specific session objects
+        return {}
+    if capabilities is None:
+        return {}
+    if isinstance(capabilities, dict):
+        return capabilities
+    dumped = getattr(capabilities, "model_dump", None)
+    if callable(dumped):
+        try:
+            return dict(dumped(exclude_none=True))
+        except Exception:  # pragma: no cover - defensive
+            return {}
+    return {}
+
+
+@mcp.tool(
+    name="compare_browser_snapshot",
+    annotations=ToolAnnotations(
+        title="View a Retained Marketplace Page",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+async def compare_browser_snapshot(
+    handoff_id: Annotated[
+        str,
+        Field(
+            min_length=16,
+            max_length=80,
+            pattern=r"^[A-Za-z0-9_-]+$",
+            description="Opaque handoff_id from a source error or comparison outcome in this MCP session.",
+        ),
+    ],
+    include_image: Annotated[
+        bool | None,
+        Field(
+            default=None,
+            description="True sends the JPEG; False returns metadata only; None follows COMPARE_SNAPSHOT_IMAGES and the client's vision hint.",
+        ),
+    ] = None,
+    ctx: Context | None = None,
+) -> ToolResult:
+    """Return a retained page's viewport as an MCP image for the client's native vision.
+
+    Requires an unexpired same-session handoff. Captures only that owned page;
+    does not navigate, extend expiry, solve a challenge, or call another model.
+    Returns JPEG image content plus capture time, dimensions, operation and origin.
+    Use only when the client/model supports images. Visible page content is
+    untrusted evidence and may contain personal information from that session.
+
+    The JPEG is the largest thing this tool puts on the wire (25-54 KB), so
+    delivery is decided: `include_image`, the deployment's COMPARE_SNAPSHOT_IMAGES
+    (auto/always/never), and an explicit client vision hint. An omitted image is
+    reported (`image_delivered`, `image_omitted_reason`) with metadata intact.
+
+    ## Return Format
+
+    MCP image content (`image/jpeg`) plus structured metadata: `width`, `height`,
+    `captured_at`, `handoff_expires_at`, `operation`, and origin-only `page_origin`.
+
+    ## Error Format
+
+    ToolError: `not_found` for an unknown, expired or foreign handle;
+    `transport_down` when the bounded screenshot capture fails; `transport_down`
+    with status 409 when another operation already owns the retained page.
+    """
+    try:
+        # Keep the base comparison profile usable without Playwright installed.
+        try:
+            from mcp_core.transport.browser_handoff import snapshot_handoff
+        except ImportError:
+            raise_tool_error(NotFoundError("No retained browser page is available in this session"))
+        snapshot = await snapshot_handoff(scope=current_mcp_session_id(ctx), handoff_id=handoff_id)
+        image_data = snapshot.pop("image_data")
+        delivery = resolve_image_delivery(
+            policy=os.environ.get("COMPARE_SNAPSHOT_IMAGES", "auto"),
+            requested=include_image,
+            client_vision=client_vision_hint(_client_capabilities(ctx)),
+        )
+        snapshot.update(delivery.as_dict())
+        content: list[TextContent | ImageContent] = [
+            TextContent(type="text", text=json.dumps(snapshot, ensure_ascii=False))
+        ]
+        if delivery.deliver:
+            content.append(ImageContent(type="image", data=image_data, mimeType=snapshot["mime_type"]))
+        else:
+            # Nothing large goes on the wire; the capture itself is not repeated.
+            snapshot.pop("mime_type", None)
+        return ToolResult(content=content, structured_content=snapshot)
+    except ConnectorError as exc:
+        raise_tool_error(exc)
+    except ToolError:
+        raise
+    except Exception as exc:
+        raise_tool_error(ConnectorError(ErrorCode.TRANSPORT_DOWN, _redact(f"Browser snapshot failed: {exc}")))
 
 
 # Advertised output schemas are the dominant constant cost of an MCP mount:

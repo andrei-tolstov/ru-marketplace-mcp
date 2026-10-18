@@ -18,21 +18,22 @@ from __future__ import annotations
 import asyncio
 import shutil
 import sys
+import tomllib
+from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 # script name -> how many model-facing tools it must expose. Operator-only
 # *_selfcheck canaries are no longer MCP tools (they run via
-# `marketplace-mcp doctor`), which is why every figure is one lower than the
-# pre-dsh contract and the marketplace server is 39, not 47.
+# `marketplace-mcp doctor`). The unified server exposes 40 model-facing tools.
 EXPECTED_TOOLS = {
     "wb-mcp": 8,
     "ozon-mcp": 3,
     "detmir-mcp": 3,
     "yandex-mcp": 2,
-    "compare-mcp": 3,
-    "decision-mcp": 4,  # compare trio + decision_inspect
+    "compare-mcp": 4,
+    "decision-mcp": 5,  # compare tools + decision_inspect
     "avito-mcp": 3,
     "taobao-mcp": 2,
     "megamarket-mcp": 2,
@@ -42,10 +43,47 @@ EXPECTED_TOOLS = {
     "aliexpress-mcp": 2,
     "cian-mcp": 2,
     "mpstats-mcp": 2,
-    "marketplace-mcp": 39,  # 38 mounted + marketplace_sources
+    "marketplace-mcp": 40,  # 39 mounted + marketplace_sources
 }
 
 TIMEOUT_S = 60.0
+EXPECTED_VERSION = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))[
+    "project"
+]["version"]
+EXPECTED_MOUNTS = {
+    "wildberries",
+    "ozon",
+    "detmir",
+    "yandex",
+    "compare",
+    "avito",
+    "taobao",
+    "megamarket",
+    "lamoda",
+    "dns",
+    "citilink",
+    "aliexpress",
+    "cian",
+    "mpstats",
+}
+
+
+def validate_sources(payload: object) -> str | None:
+    """Reject incomplete introspection even when tools/call itself succeeded."""
+    if not isinstance(payload, dict):
+        return "marketplace_sources did not return structured content"
+    mounted = payload.get("mounted")
+    if not isinstance(mounted, list) or not all(isinstance(name, str) for name in mounted):
+        return "marketplace_sources returned an invalid mounted list"
+    if set(mounted) != EXPECTED_MOUNTS or len(mounted) != len(EXPECTED_MOUNTS):
+        return f"expected mounted sources {sorted(EXPECTED_MOUNTS)}, got {mounted}"
+    if payload.get("mounted_count") != len(EXPECTED_MOUNTS):
+        return f"incorrect mounted_count: {payload.get('mounted_count')}"
+    if payload.get("skipped") != {} or payload.get("skipped_count") != 0:
+        return f"sources failed to mount or skipped status is incomplete: {payload.get('skipped')}"
+    if payload.get("server_version") != EXPECTED_VERSION:
+        return f"marketplace_sources version must be {EXPECTED_VERSION}, got {payload.get('server_version')}"
+    return None
 
 
 async def probe(script: str, expected: int) -> tuple[str, bool, str]:
@@ -63,8 +101,12 @@ async def probe(script: str, expected: int) -> tuple[str, bool, str]:
             version = init.serverInfo.version
 
             detail = f"{count} tools, server={server_name} v{version}"
+            if version != EXPECTED_VERSION:
+                return script, False, f"expected version {EXPECTED_VERSION}, got {version}"
             if count != expected:
                 return script, False, f"expected {expected} tools, got {count}"
+            if len({tool.name for tool in listed.tools}) != count:
+                return script, False, "tools/list contains duplicate names"
 
             # One real tools/call, on a tool that touches no network.
             if script == "marketplace-mcp":
@@ -74,12 +116,13 @@ async def probe(script: str, expected: int) -> tuple[str, bool, str]:
                 )
                 if called.isError:
                     return script, False, f"marketplace_sources returned an error: {called.content}"
-                payload = called.structuredContent or {}
-                mounted = payload.get("mounted_count")
-                skipped = payload.get("skipped", {})
+                payload = called.structuredContent
+                failure = validate_sources(payload)
+                if failure is not None:
+                    return script, False, failure
+                assert payload is not None
+                mounted = payload["mounted_count"]
                 detail += f", tools/call ok: {mounted} sources mounted"
-                if skipped:
-                    return script, False, f"sources failed to mount: {skipped}"
 
             return script, True, detail
     except TimeoutError:

@@ -142,6 +142,29 @@ The real trap here was not anti-bot but a **stale index**:
 `search-goods.wildberries.ru` returns ids for delisted SKUs. See
 [the search fix](#the-wildberries-search-trap).
 
+#### When the API refuses: rendered pages (`WB_TRANSPORT=dom`)
+
+Measured 2026-09-30 from a residential Moscow address (MTS), Windows, Claude
+Desktop, CDP Chrome in a clean profile that had passed WB's own browser check:
+`card.wb.ru`, `search.wb.ru` and `catalog.wb.ru` answered 403 to httpx, to
+curl_cffi impersonation, and to a real Chrome navigating to them; the site's
+same-origin API (`/__internal/card/…`, `/__internal/search/…`,
+`/__internal/u-search/…`) answered 403 to a plain `fetch` issued from a
+wildberries.ru tab. The rendered pages were readable.
+
+`WB_TRANSPORT=dom` (default `api`) makes `wb_search` and `wb_card` open the search
+grid and the product page through `mcp_core.transport.chrome_cdp.open_page` and
+read their text. It does not call the API, replay tokens, alter the browser or
+solve challenges: «Проверяем браузер» is waited out (`WB_DOM_WAIT_S`),
+«Подозрительная активность» and a visible captcha stop the call without a retry.
+The product page renders in stages — prices and «Артикул», then the store block,
+then «Все N предложений» — and the reader waits for each within
+`WB_DOM_STORE_WAIT_S` / `WB_DOM_OFFERS_WAIT_S`. The Wallet price on the product
+page arrives last and may be missing (`wallet_price_rub: null`); the search tile
+carries it reliably. Page-wide `del` / `[class*=wallet]` / `[class*=seller]`
+matches also hit the «Смотрите также» carousel, so a DOM hint counts only when it
+names one of the offer's own figures. Other WB tools keep their HTTP paths.
+
 Two more endpoints were verified live for v1.1.0, each with a silent-failure mode
 worth knowing:
 
@@ -180,7 +203,18 @@ product page ~2.5 MB, because the whole widget state ships inside the HTML.
 Because extraction is coupled to a front-end, `yandex_selfcheck` matters more here
 than for a JSON API. Drift is a question of when.
 
-### Detsky Mir — genuinely open
+### Detsky Mir — open JSON API, refused by address
+
+**Dated correction (2026-09-21).** The "genuinely open" premise below was
+measured from a Russian residential address and no longer holds from every
+vantage point. From a European hosting address (Frankfurt, a hosting ASN),
+`api.detmir.ru` answered **HTTP 418 from DDoS-Guard for the whole domain** — for
+httpx carrying this connector's exact headers, for httpx with no headers at all,
+and for curl_cffi's Chrome impersonation alike. The refusal arrives before any
+parser runs, so `inconclusive` from this address means the address, not the code;
+nothing in the request shaping is at fault and nothing was changed in response.
+The connector now says so in the error and in the canary note. Live record:
+[LIVE_STATUS.md](LIVE_STATUS.md).
 
 `api.detmir.ru` answers with no User-Agent at all. No rate limit observed across
 rapid sequential requests. Three quirks:
@@ -298,7 +332,7 @@ POST https://megamarket.ru/api/mobile/v1/catalogService/productCard/get
 It accepts requests and returns valid JSON — but always this:
 
 ```json
-{"error": "Произошла ошибка. Попробуйте отключить VPN…", "code": 7, "ip": "3.220.149.31"}
+{"error": "Произошла ошибка. Попробуйте отключить VPN…", "code": 7, "ip": "203.0.113.0"}
 ```
 
 Echoing our own IP back is an unambiguous reputation block. ServicePipe
@@ -347,6 +381,11 @@ That returns real prices, brands, availability and sizes. But:
 **Verdict:** shipped in v1.2.0 as two tiers. Cards come from the anonymous GraphQL
 endpoint (works tier 1, no ratings — `rating` is not in the schema); search runs
 through the CDP tier, which is what supplies the discovery the GraphQL lacks.
+
+**2026-10-12:** GraphQL over plain HTTPS now gets the same 307 loop. Cards keep
+trying it first and fall back to one in-page POST from a loaded lamoda.ru tab in the
+operator's Chrome (`tier_used: graphql_cdp`); a landing on the anti-bot page answers
+`challenge_required`.
 
 The split is right, and the July 2026 run is why it matters. The public GraphQL
 endpoint `POST /goapi/v2/catalog/graphql/products/` takes a list of SKUs, not a

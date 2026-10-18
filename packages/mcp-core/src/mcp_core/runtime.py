@@ -1,9 +1,9 @@
-"""Transport selection shared by all five connector entry points.
+"""Transport selection shared by all connector entry points.
 
 Every connector is launched the same way — ``mcp.run(...)`` — and every
 connector must default to stdio, because that is the transport MCP clients
 speak and the only one the existing client configs know about. Rather than
-copy the env-var parsing into five ``__main__.py`` files, it lives here once.
+copy the env-var parsing into every ``__main__.py`` file, it lives here once.
 
 Two rules this module exists to enforce, both protocol- or security-critical:
 
@@ -13,25 +13,69 @@ Two rules this module exists to enforce, both protocol- or security-critical:
    ``log_event`` — never ``print``, never ``sys.stdout``. ``scripts/check_no_print``
    guards this, and this module is in its scan path.
 
-2. **HTTP binds to loopback by default.** These servers carry no
-   authentication of their own; the tools are read-only, but an HTTP endpoint
-   on ``0.0.0.0`` is still an unauthenticated scraper anyone on the network can
-   drive. Binding to ``127.0.0.1`` keeps it local until the operator
-   deliberately puts a reverse proxy with auth in front. Choosing a non-loopback
-   host is allowed, but it is logged loudly as a warning so it is never silent.
+2. **HTTP binds to loopback by default.** Non-loopback binds require a bearer
+   token and static tenant id before the server can start. They also log an
+   exposure warning: authentication does not supply TLS or isolate browser
+   profiles between tenants. Each tenant needs its own process and profile.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Resolve and launch stdio or authenticated HTTP-family MCP servers.
+# SCOPE: Environment parsing, launch diagnostics and graceful handoff cleanup.
+# DEPENDS: FastMCP; mcp_core.logging; loaded browser_handoff at shutdown; stdlib.
+# LINKS: M-RUNTIME; M-LOGGING; M-BROWSER-HANDOFF.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# current_mcp_session_id: Resolve tool-call session identity or None for CLI probes.
+# browser_handoff_lifespan: Close already-loaded handoffs on server shutdown.
+# TransportConfig: Hold transport and loopback/default endpoint configuration.
+# BearerAuthMiddleware: Compare bearer token and optional static tenant identity.
+# _parse_transport: Reject unsupported transport names; blank defaults to stdio.
+# _parse_port: Validate configured TCP port bounds.
+# _parse_host: Trim the bind host or select loopback.
+# _parse_path: Normalize the HTTP endpoint's leading slash.
+# resolve_transport: Build configuration without launching or logging.
+# run_server: Require exposure credentials, add middleware and dispatch FastMCP.
+# _warn_if_exposed: Emit stderr warning for a non-loopback HTTP bind.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
 import logging
 import os
+import secrets
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+
+from fastmcp.server.dependencies import get_context, get_http_request
+from fastmcp.server.middleware import Middleware
 
 from mcp_core.logging import log_event
 
 if TYPE_CHECKING:
-    from fastmcp import FastMCP
+    from fastmcp import Context, FastMCP
+
+
+def current_mcp_session_id(ctx: Context | None = None) -> str | None:
+    """Resolve direct and mounted tool calls; CLI probes have no MCP session."""
+    try:
+        return (ctx or get_context()).session_id
+    except RuntimeError:
+        return None
+
+
+@asynccontextmanager
+async def browser_handoff_lifespan(server: FastMCP) -> AsyncIterator[dict]:
+    """Release loaded CDP leases without requiring the optional browser extra."""
+    try:
+        yield {}
+    finally:
+        handoff = sys.modules.get("mcp_core.transport.browser_handoff")
+        if handoff is not None:
+            await handoff.close_handoffs()
+
 
 # The transport strings FastMCP 3.x accepts for these servers. "stdio" is the
 # default and the only one existing client configs rely on. "http" is the
@@ -53,6 +97,8 @@ ENV_TRANSPORT = "MCP_TRANSPORT"
 ENV_HTTP_HOST = "MCP_HTTP_HOST"
 ENV_HTTP_PORT = "MCP_HTTP_PORT"
 ENV_HTTP_PATH = "MCP_HTTP_PATH"
+ENV_HTTP_AUTH_TOKEN = "MCP_HTTP_AUTH_TOKEN"
+ENV_HTTP_TENANT_ID = "MCP_HTTP_TENANT_ID"
 
 # Hosts that keep the server reachable only from the machine it runs on. Any
 # other value exposes it to the network and earns a warning.
@@ -81,6 +127,33 @@ class TransportConfig:
     def is_loopback(self) -> bool:
         """True when the HTTP bind host is reachable only from this machine."""
         return self.host in _LOOPBACK_HOSTS
+
+
+class BearerAuthMiddleware(Middleware):
+    """Require one configured bearer token for HTTP requests.
+
+    The process remains single-tenant: authenticated callers share the same
+    connector and browser profile. Separate tenants require separate processes.
+    """
+
+    def __init__(self, token: str, tenant_id: str | None = None) -> None:
+        self._token = token
+        self._tenant_id = tenant_id
+
+    async def __call__(self, context, call_next):
+        request = get_http_request()
+        supplied = request.headers.get("authorization", "")
+        if not secrets.compare_digest(supplied, f"Bearer {self._token}"):
+            from fastmcp.exceptions import AuthorizationError
+
+            raise AuthorizationError("HTTP bearer authentication required")
+        if self._tenant_id is not None:
+            supplied_tenant = request.headers.get("x-mcp-tenant", "")
+            if not secrets.compare_digest(supplied_tenant, self._tenant_id):
+                from fastmcp.exceptions import AuthorizationError
+
+                raise AuthorizationError("HTTP tenant identity mismatch")
+        return await call_next(context)
 
 
 def _parse_transport(raw: str | None) -> Transport:
@@ -176,6 +249,18 @@ def run_server(mcp: FastMCP, *, server_name: str) -> int:
 
     try:
         if config.is_http:
+            auth_token = os.environ.get(ENV_HTTP_AUTH_TOKEN, "").strip()
+            tenant_id = os.environ.get(ENV_HTTP_TENANT_ID, "").strip() or None
+            if not config.is_loopback and not auth_token:
+                raise ValueError(
+                    f"{ENV_HTTP_AUTH_TOKEN} must be set when {ENV_HTTP_HOST}={config.host!r} is not loopback"
+                )
+            if not config.is_loopback and tenant_id is None:
+                raise ValueError(
+                    f"{ENV_HTTP_TENANT_ID} must be set when {ENV_HTTP_HOST}={config.host!r} is not loopback"
+                )
+            if auth_token:
+                mcp.add_middleware(BearerAuthMiddleware(auth_token, tenant_id))
             _warn_if_exposed(config, server_name=server_name)
             log_event(
                 "server_start",
@@ -203,10 +288,9 @@ def run_server(mcp: FastMCP, *, server_name: str) -> int:
 def _warn_if_exposed(config: TransportConfig, *, server_name: str) -> None:
     """Log a loud warning when an HTTP server binds beyond loopback.
 
-    These servers ship no authentication. On ``0.0.0.0`` (or any routable host)
-    that makes them an unauthenticated, read-only scraper anyone who can reach
-    the port may drive. We do not refuse to start — an operator behind a
-    reverse proxy has a legitimate reason — but the choice is never silent.
+    ``run_server`` has already required bearer auth and a static tenant id.
+    A non-loopback bind still needs a protected network path, since the server
+    does not terminate TLS or separate multiple tenants' browser profiles.
     """
     if config.is_loopback:
         return
@@ -217,7 +301,7 @@ def _warn_if_exposed(config: TransportConfig, *, server_name: str) -> None:
         host=config.host,
         port=config.port,
         message=(
-            "HTTP transport is bound beyond loopback and this server has no built-in auth. "
-            "Put a reverse proxy that enforces authentication in front of it before exposing it."
+            "HTTP transport is bound beyond loopback with bearer authentication and a static tenant id. "
+            "Use TLS for remote access and a separate process/browser profile per tenant."
         ),
     )

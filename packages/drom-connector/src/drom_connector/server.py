@@ -57,7 +57,7 @@ from drom_connector.shape_reference import CARD_REQUIRED_KEYS, SEARCH_REQUIRED_K
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.5.3"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://baza.drom.ru"

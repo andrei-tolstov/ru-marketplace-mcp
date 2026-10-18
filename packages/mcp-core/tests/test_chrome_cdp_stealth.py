@@ -9,7 +9,6 @@ back", never a real browser.
 from __future__ import annotations
 
 import subprocess
-from contextlib import asynccontextmanager
 
 import pytest
 from mcp_core.transport import chrome_cdp
@@ -143,6 +142,18 @@ class _FakeCdp:
         self.detached = True
 
 
+class _FakePageCdp:
+    def __init__(self, target_id: str) -> None:
+        self.target_id = target_id
+
+    async def send(self, method: str, params=None):
+        assert method == "Target.getTargetInfo"
+        return {"targetInfo": {"targetId": self.target_id}}
+
+    async def detach(self) -> None:
+        pass
+
+
 class _FakeBrowser:
     def __init__(self, cdp: _FakeCdp | None) -> None:
         self._cdp = cdp
@@ -170,15 +181,14 @@ class _FakeContext:
         self.browser = browser
         self.plain_pages = 0
         self.expect_timeouts: list[float | None] = []
+        self.pages = ["background-page"]
+
+    async def new_cdp_session(self, page: str) -> _FakePageCdp:
+        return _FakePageCdp("T1")
 
     async def new_page(self) -> str:
         self.plain_pages += 1
         return "foreground-page"
-
-    @asynccontextmanager
-    async def expect_page(self, timeout: float | None = None):
-        self.expect_timeouts.append(timeout)
-        yield _FakeEventInfo("background-page")
 
 
 async def test_new_tab_creates_the_target_in_the_background_when_stealth_is_on(monkeypatch):
@@ -192,7 +202,7 @@ async def test_new_tab_creates_the_target_in_the_background_when_stealth_is_on(m
     assert cdp.sent == [("Target.createTarget", {"url": "about:blank", "background": True})]
     assert cdp.detached is True
     assert ctx.plain_pages == 0
-    assert ctx.expect_timeouts == [chrome_cdp._TAB_OP_TIMEOUT_S * 1000]
+    assert ctx.expect_timeouts == []
 
 
 async def test_new_tab_uses_plain_new_page_when_stealth_is_off(monkeypatch):
@@ -225,10 +235,9 @@ async def test_new_tab_falls_back_to_new_page_when_the_cdp_session_fails(monkeyp
 
 async def test_new_tab_detaches_the_session_even_when_no_page_arrives(monkeypatch):
     class _NoPageContext(_FakeContext):
-        @asynccontextmanager
-        async def expect_page(self, timeout: float | None = None):
-            raise TimeoutError("no page event")
-            yield  # pragma: no cover
+        def __init__(self, browser):
+            super().__init__(browser)
+            self.pages = []
 
     monkeypatch.setattr(chrome_cdp, "STEALTH", True)
     cdp = _FakeCdp()
@@ -238,3 +247,112 @@ async def test_new_tab_detaches_the_session_even_when_no_page_arrives(monkeypatc
         await chrome_cdp._new_tab(ctx)  # type: ignore[arg-type]
 
     assert cdp.detached is True
+
+
+@pytest.mark.parametrize("close_stalls", [False, True])
+@pytest.mark.parametrize("detach_disposes", [False, True])
+async def test_new_tab_closes_claimed_target_when_cancelled_during_detach(monkeypatch, close_stalls, detach_disposes):
+    import asyncio
+
+    detaching = asyncio.Event()
+    closing = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def close_target():
+        cdp.sent.append(("Target.closeTarget", {"targetId": "T1"}))
+        closing.set()
+        try:
+            if close_stalls:
+                await asyncio.Event().wait()
+            else:
+                await asyncio.sleep(0)
+        finally:
+            closed.set()
+
+    class OwnedPage:
+        async def close(self):
+            await close_target()
+
+    class Cdp(_FakeCdp):
+        async def detach(self):
+            self.detached = detach_disposes
+            detaching.set()
+            await asyncio.Event().wait()
+
+        async def send(self, method, params=None):
+            if self.detached:
+                raise RuntimeError("session already disposed")
+            if method == "Target.closeTarget":
+                await close_target()
+                return {}
+            return await super().send(method, params)
+
+    monkeypatch.setattr(chrome_cdp, "STEALTH", True)
+    monkeypatch.setattr(chrome_cdp, "_RAW_CONNECT_TIMEOUT_S", 0.05)
+    cdp = Cdp()
+    ctx = _FakeContext(_FakeBrowser(cdp))
+    ctx.pages = ["operator-tab", OwnedPage()]
+
+    async def page_session(page):
+        return _FakePageCdp("operator" if page == "operator-tab" else "T1")
+
+    monkeypatch.setattr(ctx, "new_cdp_session", page_session)
+    task = asyncio.create_task(chrome_cdp._new_tab(ctx))
+    await asyncio.wait_for(detaching.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert ("Target.closeTarget", {"targetId": "T1"}) in cdp.sent
+    assert all(params != {"targetId": "operator"} for _method, params in cdp.sent)
+    assert closing.is_set() and closed.is_set()
+
+
+async def test_new_tab_matches_distinct_targets_under_interleaved_creation(monkeypatch):
+    """Broadcast pages arrive out of order while all six callers are pending."""
+    import asyncio
+
+    created = []
+    all_created = asyncio.Event()
+
+    class Cdp(_FakeCdp):
+        def __init__(self, target_id):
+            super().__init__()
+            self.target_id = target_id
+
+        async def send(self, method, params=None):
+            self.sent.append((method, params))
+            assert method == "Target.createTarget"
+            created.append(self.target_id)
+            if len(created) == 6:
+                ctx.pages.extend(reversed(created))
+                all_created.set()
+            await all_created.wait()
+            return {"targetId": self.target_id}
+
+    class Browser:
+        def __init__(self):
+            self.sessions = []
+
+        async def new_browser_cdp_session(self):
+            cdp = Cdp(f"target-{len(self.sessions)}")
+            self.sessions.append(cdp)
+            return cdp
+
+    class Context(_FakeContext):
+        async def new_cdp_session(self, page):
+            await asyncio.sleep(0)
+            return _FakePageCdp(page)
+
+    monkeypatch.setattr(chrome_cdp, "STEALTH", True)
+    browser = Browser()
+    ctx = Context(browser)
+    ctx.pages = ["foreign-user-tab"]
+
+    pages = await asyncio.wait_for(asyncio.gather(*(chrome_cdp._new_tab(ctx) for _ in range(6))), timeout=1)
+
+    assert pages == [f"target-{index}" for index in range(6)]
+    assert len(set(pages)) == 6
+    assert ctx.pages == ["foreign-user-tab", *reversed(created)]
+    assert all(session.detached for session in browser.sessions)
+    assert ctx.plain_pages == 0
