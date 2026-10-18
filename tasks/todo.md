@@ -1,66 +1,60 @@
-# Задачи: Разработка коннектора baza.drom.ru для ru-marketplace-mcp
+# Задачи: Синхронизация форка с upstream Vladimir-Human/ru-marketplace-mcp
 
-- [x] Изучить архитектуру `ru-marketplace-mcp` (монорепозиторий uv, mcp-core, FastMCP, протоколы защиты, соглашения по коду)
-- [x] Провести live-зондирование `baza.drom.ru` (WAF, кодировка Windows-1251, структура выдачи, карточки товаров, профили продавцов, отзывы)
-- [x] Определить транспортный уровень (Chrome CDP Tier-2 через DevTools MCP / in-page fetch, с возможностью Tier-1 через residential proxy)
-- [x] Создать детальный `implementation_plan.md` с архитектурными решениями, моделями данных, спецификациями инструментов и тестами
-- [x] Согласовать план реализации с пользователем (автосогласование получено)
-- [x] Развернуть монорепозиторий в рабочей директории
-- [x] Реализовать пакет `packages/drom-connector`:
-  - [x] `pyproject.toml`
-  - [x] `src/drom_connector/settings.py`
-  - [x] `src/drom_connector/models_output.py`
-  - [x] `src/drom_connector/shape_reference.py`
-  - [x] `src/drom_connector/server.py`
-  - [x] `src/drom_connector/__init__.py`, `__main__.py`, `py.typed`
-- [x] Реализовать тестовые фикстуры и unit-тесты (`tests/test_server.py`, `tests/test_settings_secrets.py`, `tests/test_shape_reference.py`)
-- [x] Создать документацию и скилл `skills/drom-connector/SKILL.md` (включая зеркало в `dsh/skills/drom-connector/SKILL.md`)
-- [x] Зарегистрировать коннектор в корневом `pyproject.toml`, `marketplace-connector` и `compare-connector`
-- [x] Провести валидацию (ruff, mypy, pytest, no-print check, selfcheck)
+- [x] 1. Инициализация и анализ:
+  - [x] Добавить upstream remote `https://github.com/Vladimir-Human/ru-marketplace-mcp.git`
+  - [x] Выполнить `git fetch upstream`
+  - [x] Определить diff / новые коммиты в upstream/main относительно текущего main
+  - [x] Зафиксировать перечень кастомных изменений в форке (drom-connector, drom_card_photos, тесты, скиллы)
+- [x] 2. Слияние изменений:
+  - [x] Выполнить `git merge upstream/main` в локальную ветку main
+  - [x] Разрешить возможные конфликты с полным сохранением нашего функционала
+  - [x] Обновить общие конфигурации монорепозитория (pyproject.toml, uv.lock, public contract) если необходимо
+- [x] 3. Верификация работоспособности монорепозитория:
+  - [x] Запустить `uv sync`
+  - [x] Запустить `uv run ruff check` и `uv run ruff format --check`
+  - [x] Запустить `uv run mypy`
+  - [x] Запустить тесты монорепозитория (`packages/drom-connector`, `packages/marketplace-connector`, `packages/compare-connector` и др.)
+  - [x] Запустить `uv run python scripts/check_no_print.py`
+  - [x] Запустить тесты контрактов (`test_public_contract_snapshot.py`, `test_wire_frugality.py`)
+- [x] 4. Обновление локально установленного MCP-сервера:
+  - [x] Проверить состояние `C:\mcp\ru_marketplace-mcp`
+  - [x] Синхронизировать `C:\mcp\ru_marketplace-mcp` с актуальной веткой main
+  - [x] Выполнить `uv sync` в `C:\mcp\ru_marketplace-mcp`
+  - [x] Проверить работоспособность entrypoints (`drom-mcp`, `ozon-mcp`, `avito-mcp`, `yandex-mcp`, `aliexpress-mcp`)
+  - [x] Обновить схемы инструментов в `C:\Users\andrei\.gemini\antigravity-ide\mcp\` при изменении сигнатур
+- [x] 5. Пуш изменений в GitHub форк:
+  - [x] Настроить доступ к GitHub (добавить SSH-ключ или обновить scopes у PAT для workflow)
+  - [x] Запушить изменения в `origin main`
+  - [x] Проверить статус репозитория на GitHub
+- [x] 6. Документирование результатов:
+  - [x] Зафиксировать ревью в `tasks/todo.md`
 
-## Результаты проверки базового коннектора
+## Ревью синхронизации с апстримом (v2.5.3)
 
-- `uv run pytest packages/drom-connector/tests -v` — 20 passed.
-- `uv run pytest packages/marketplace-connector/tests -v` — 146 passed, 1 skipped (0 failed).
-- `uv run pytest packages/compare-connector/tests -v` — 96 passed (0 failed).
-- `uv run ruff check` — 0 errors.
-- `uv run ruff format --check` — 32 files formatted.
-- `uv run mypy -p drom_connector -p compare_connector -p marketplace_connector` — Success (16 source files).
-- `uv run python scripts/check_no_print.py` — checked 88 files, 0 stdout writes.
+1. **Слияние и разрешение конфликтов:**
+   - Выполнено слияние коммитов ветки `upstream/main` в `main`.
+   - Разрешены конфликты в `README.md`, `packages/compare-connector/pyproject.toml`, `packages/compare-connector/src/compare_connector/server.py`, `packages/marketplace-connector/tests/test_server.py`, `packages/marketplace-connector/tests/test_wire_frugality.py`, `uv.lock`.
+   - `drom-connector` обновлен до версии `2.5.3`, синхронизирован с `mcp-core==2.5.3`, добавлен возврат `OfferBatch` в `compare_connector/server.py`.
+   - В едином сервере смонтировано 44 инструмента (43 из 15 серверов + `marketplace_sources`).
+   - Обновлен контракт дистрибьюции `scripts/test_distribution_contract.py` и список тестов в `pyproject.toml`.
+   - Обновлен счетчик тестов до 2302 во всех 7 местах документации (`README.md`, `docs/ARCHITECTURE.md`).
 
-## Задачи: Фото-инспекция деталей (скачивание, передача и анализ состояния)
+2. **Верификация качества:**
+   - `uv sync`: OK (118 пакетов разрешены, все локальные пакеты версии 2.5.3).
+   - `uv run ruff check` & `uv run ruff format --check`: OK (357 файлов).
+   - `uv run mypy`: OK (110 файлов, 0 ошибок).
+   - `scripts/check_no_print.py`: OK (93 файла).
+   - `scripts/check_versions.py`: OK (версия 2.5.3 в 88 местах).
+   - `scripts/check_provenance.py`: OK (30 пинов).
+   - `scripts/check_test_count.py`: OK (2302 теста).
+   - `uv run pytest -q -m "not live and not cdp"`: OK (2199 passed, 103 skipped, 5 deselected).
 
-- [x] 1. Реализация скачивания и передачи фото в `packages/drom-connector`:
-  - [x] Реализовать функцию `_download_photo(url, high_res=True)` (загрузка CDN / in-page CDP, выбор `_full` разрешения, Base64 ImageContent)
-  - [x] Реализовать инструмент `@mcp.tool drom_card_photos(url_or_id, max_photos=5, high_res=True)` с поддержкой `mcp.types.ImageContent`
-  - [x] Добавить в `drom_card` явное указание на необходимость вызова `drom_card_photos`
-  - [x] Добавить `## Return Format` и `## Error Format` в docstrings
-- [x] 2. Unit-тесты для фото-функционала:
-  - [x] Тесты скачивания фото (mock responses, base64, mimeTypes)
-  - [x] Тесты инструмента `drom_card_photos` (извлечение фото из карточки, возврат `ImageContent` и `TextContent`)
-- [x] 3. Документация и скиллы (`skills/drom-connector/SKILL.md` и `dsh/`):
-  - [x] Добавить `drom_card_photos` в список доступных MCP-инструментов
-  - [x] Добавить протокол обязательного визуального анализа фото (проверка соответствия детали, геометрии, OEM-номеров, кронштейнов, дефектов, износа, трещин)
-- [x] 4. Синхронизация монорепозитория:
-  - [x] Обновить тесты `test_wire_frugality.py` (число инструментов 42 -> 43) и `test_server.py`
-  - [x] Обновить `public_contract.json` через скрипт `test_public_contract_snapshot.py`
-  - [x] Обновить схемы инструментов в `C:\Users\andrei\.gemini\antigravity\mcp\drom` (`drom_card_photos.json`, `instructions.md`)
-  - [x] Обновить `C:\mcp\ru_marketplace-mcp` (ветка main синхронизирована с форком)
-- [x] 5. Верификация:
-  - [x] Полный прогон `pytest`, `mypy`, `ruff`, `check_no_print.py` (273 passed, 1 skipped, 0 failed, 0 ruff errors, mypy success)
-  - [x] Пуш в GitHub форк пользователя (`https://github.com/andrei-tolstov/ru-marketplace-mcp`, коммит `f4ca895`)
+3. **Локальный MCP-сервер (`C:\mcp\ru_marketplace-mcp`):**
+   - Синхронизирован с веткой `main`.
+   - Выполнен `uv sync` без ошибок.
+   - Проверены entrypoints серверов (`drom-mcp`, `ozon-mcp`, `avito-mcp`, `yandex-mcp`, `aliexpress-mcp`, `marketplace-mcp`).
+   - Схемы инструментов в `C:\Users\andrei\.gemini\antigravity-ide\mcp\` проверены и полностью совпадают.
 
-## Итоговые результаты реализации фото-контроля Drom
-
-1. **Инструмент `drom_card_photos`**:
-   - Принимает `url_or_id` (ID лота, goods ID `g...`, ссылку на объявление или прямую ссылку на фото).
-   - Поддерживает получение оригиналов высокого разрешения (`high_res=True`, автозамена `_bulletin` -> `_full`).
-   - Возвращает структурированный `TextContent` с ключевыми параметрами детали и обязательным протоколом инспекции, а также последовательность `ImageContent` в формате Base64 с определением MIME-типа (`image/webp`, `image/jpeg`, `image/png`).
-2. **Протокол визуального контроля**:
-   - Закреплен в docstring инструментов `drom_card` и `drom_card_photos`.
-   - Включен в скиллы `skills/drom-connector/SKILL.md` и `dsh/skills/drom-connector/SKILL.md`.
-   - Обязывает модель перед выдачей вердикта проверять:
-     * геометрию, крепежные ушки/кронштейны, сторону (L/R) и рестайлинг;
-     * совпадение OEM-штампов и маркировок на деталях;
-     * отсутствие трещин, заломов, ржавчины, обломанных ушей, следов кустарной пайки/сварки и износа РТИ.
-3. **Все тесты пройдены**: 273 passed, 1 skipped. Все проверки ruff, mypy, wire frugality и contract snapshot успешно завершены. Изменения опубликованы в GitHub форке.
+4. **GitHub форк (`origin/main`):**
+   - Коммит `32861c4` успешно запушен в `https://github.com/andrei-tolstov/ru-marketplace-mcp.git`.
+   - Локальная и удаленная ветка `main` находятся в актуальном состоянии.
