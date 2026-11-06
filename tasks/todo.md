@@ -36,9 +36,42 @@
   - [x] Запустить тесты контрактов гайдов `packages/mcp-core/tests/test_guide_contracts.py` (54 passed)
   - [x] Запустить тесты `packages/marketplace-connector/tests` и `packages/compare-connector/tests` (833 passed)
   - [x] Запустить полный набор офлайн-тестов `uv run pytest -q -m "not live and not cdp"` (3169 passed, 111 skipped, 5 deselected, 0 failed)
-- [ ] 5. Фиксация коммита и синхронизация рабочего MCP сервера:
-  - [ ] Закоммитить слияние `Merge upstream/main into main (v2.8.2 sync with drom-connector integration)`
-  - [ ] Синхронизировать рабочую копию `C:\mcp\ru_marketplace-mcp`
-  - [ ] Запушить изменения в GitHub форк `origin main`
-- [ ] 6. Документирование результатов:
-  - [ ] Зафиксировать результаты и метрики синхронизации в `tasks/todo.md`
+- [x] 5. Фиксация коммита и синхронизация рабочего MCP сервера:
+  - [x] Закоммитить слияние `Merge upstream/main into main (v2.8.2 sync with drom-connector integration)` (`a57e663`)
+  - [x] Синхронизировать рабочую копию `C:\mcp\ru_marketplace-mcp` (ветка `main` подтянута к `a57e663`)
+  - [x] Запушить изменения в GitHub форк `origin main`
+- [x] 6. Документирование результатов:
+  - [x] Зафиксировать результаты и метрики синхронизации в `tasks/todo.md`
+
+---
+
+## Review & Validation Metrics
+
+1. **Коммит слияния**: `a57e663` ("Merge upstream/main into main (v2.8.2 sync with drom-connector integration)").
+2. **Ветки**:
+   - `backup-main-before-v2.8.2` указывает на исходное состояние до слияния (`f0f48ca`).
+   - `main` указывает на `a57e663` и синхронизирована с `origin/main`.
+   - `C:\mcp\ru_marketplace-mcp` (рабочая копия MCP) синхронизирована с `main` (`a57e663`).
+3. **Статические проверки**:
+   - `uv lock --check`: Resolved 116 packages, lockfile в актуальном состоянии.
+   - `uv run ruff check .`: 0 issues (All checks passed!).
+   - `uv run ruff format --check .`: 452 files already formatted.
+   - `uv run mypy`: Success: no issues found in 121 source files (проверено для win32 и darwin).
+   - `scripts/check_no_print.py`: 104 files checked, 0 stdout writes.
+4. **Релизные гейты upstream v2.8.2**:
+   - `scripts/check_versions.py 2.8.2`: согласовано в 92 местах.
+   - `scripts/check_provenance.py`: проверено 36 пинов в 44 sidecar-файлах (.provenance.json).
+   - `scripts/check_lock_revision.py`: revision 5 (floor 5).
+   - `scripts/check_test_count.py`: согласовано в 7 местах (3280 офлайн-тестов).
+   - `scripts/gen_tools_doc.py --check`: актуальны `docs/TOOLS.md`, `README.md`, `dsh/README.md`.
+5. **Тестирование**:
+   - Контракты гайдов (`test_guide_contracts.py`): 54 passed.
+   - Паритет реестра источников (`test_source_registry_parity.py`): 9 passed.
+   - Модульные тесты drom (`drom-connector/tests`): 27 passed.
+   - Тесты маркетплейса и сравнения цен (`marketplace-connector` + `compare-connector`): 833 passed, 1 skipped.
+   - Полный офлайн-прогон: `3169 passed, 111 skipped, 5 deselected, 0 failed` за 190.26s.
+6. **Сохраненные пользовательские возможности**:
+   - Коннектор `drom-connector` (4 инструмента: `drom_search`, `drom_card`, `drom_card_photos`, `drom_seller`).
+   - Инспекция фотографий запчастей с регламентом анализа (`drom_card_photos`).
+   - Интеграция Drom в `compare_prices` (поиск по автозапчастям, маслам, шинам) и единый `marketplace-connector` (43 инструмента).
+   - Полная совместимость с новой архитектурой v2.8.2 (ресурсы `guide://drom/*`, `serialize_by_alias=True`, `_NATIVE_OUTPUT_FIELDS`, `SourceSpec` в `mcp_core.sources.py`).
