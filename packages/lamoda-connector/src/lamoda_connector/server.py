@@ -23,8 +23,8 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 # START_MODULE_CONTRACT
 # PURPOSE: Expose Lamoda product discovery and SKU enrichment.
 # SCOPE: Read-only HTTPS GraphQL cards with CDP POST fallback; browser search and challenge recovery handoffs.
-# DEPENDS: FastMCP; httpx; mcp_core DOM/CDP/handoff/cache; models_output; settings; shape_reference.
-# LINKS: M-LAMODA; M-COMPARE; M-MARKETPLACE; packages/lamoda-connector/tests.
+# DEPENDS: FastMCP; httpx; mcp_core DOM/CDP/handoff/cache/kit; models_output; settings; shape_reference.
+# LINKS: M-LAMODA; M-KIT; M-COMPARE; M-MARKETPLACE; packages/lamoda-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
 # _extract_sku: Resolve and normalize SKU handles or product URLs.
@@ -33,7 +33,7 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 # _graphql_via_cdp: POST the query inside the operator's Chrome with bounded transport.
 # _graphql_card: Try HTTPS then CDP; parse and cache GraphQL product details, sizes and stock.
 # _cdp_render_search: Read browser search and recover explicit challenge handoffs.
-# lamoda_search: Return rendered catalog tiles with nullable prices.
+# lamoda_search: Return rendered catalog tiles with nullable prices; warn when a required key family vanishes.
 # lamoda_card: Return GraphQL-backed SKU details and availability.
 # lamoda_selfcheck: Diagnose operator endpoint/parser health; not an MCP tool.
 # END_MODULE_MAP
@@ -49,7 +49,6 @@ from typing import Annotated, Any
 
 import httpx
 from fastmcp import Context, FastMCP
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
@@ -62,12 +61,15 @@ from mcp_core.errors import (
     ToolError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import polite_wait
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
-from mcp_core.runtime import browser_handoff_lifespan, current_mcp_session_id
+from mcp_core.resources import register_reference_resources
+from mcp_core.runtime import browser_handoff_lifespan, current_client_scope
 from mcp_core.transport import build_client
 from mcp_core.transport.browser_handoff import get_handoff_id, has_pending_handoff, read_with_handoff
 from mcp_core.transport.chrome_cdp import NavBlocked, open_page
@@ -82,11 +84,15 @@ from lamoda_connector.models_output import (
     MetaOut,
 )
 from lamoda_connector.settings import get_settings
-from lamoda_connector.shape_reference import SEARCH_SHAPE_REFERENCE, missing_required_families
+from lamoda_connector.shape_reference import (
+    SEARCH_REQUIRED_FAMILIES,
+    SEARCH_SHAPE_REFERENCE,
+    missing_required_families,
+)
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://www.lamoda.ru"
@@ -126,10 +132,10 @@ mcp = FastMCP(
         "Lamoda fashion catalog: text search runs in the operator's Chrome over "
         "CDP (discovery is behind a redirect loop); product cards come from the "
         "GraphQL endpoint: HTTPS first, then an in-page Chrome POST if blocked. Lamoda exposes no ratings. "
-        "Start with lamoda_search; lamoda_card takes a SKU or product URL."
+        "Start with lamoda_search; lamoda_card takes a SKU or product URL. "
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
     ),
 )
-mcp.add_middleware(RetryMiddleware())
 
 _cache: TTLCache = TTLCache(ttl_s=_settings.cache_ttl, max_entries=128)
 _pacer = Pacer(_min_gap)
@@ -144,9 +150,11 @@ async def _polite_wait() -> None:
     """Space this source's requests out, and back off if it refused us.
 
     Reads ``_min_gap`` at call time so an operator or a test can retune the
-    pace without rebuilding the pacer.
+    pace without rebuilding the pacer. The pacing itself is shared
+    (mcp_core.kit.polite_wait); this module-level name stays because the tools
+    call it and the tests patch it.
     """
-    await _pacer.wait(min_gap=_min_gap)
+    await polite_wait(_pacer, _min_gap)
 
 
 def _extract_sku(raw: str) -> str | None:
@@ -332,8 +340,8 @@ async def _graphql_via_cdp(query: str, ctx: Context | None) -> tuple[int, str]:
             ):
                 raise_tool_error(
                     ChallengeRequiredError(
-                        "Lamoda requires user action in the connected Chrome. Complete the visible "
-                        "challenge on lamoda.ru, then retry.",
+                        "Lamoda requires user action in the connected Chrome. Complete the challenge "
+                        "on lamoda.ru, then call this tool again after the user confirms it is done.",
                         provider="lamoda",
                     )
                 )
@@ -442,7 +450,7 @@ async def _cdp_render_search(query: str, ctx: Context | None) -> dict[str, Any]:
     """Tier-2: render the search page in the operator's Chrome, extract tiles."""
     cache_key = f"search:{query}"
     url = f"{SITE_BASE}/catalogsearch/result/?q={urllib.parse.quote(query)}"
-    scope = current_mcp_session_id(ctx)
+    scope = current_client_scope(ctx)
     pending = has_pending_handoff(scope=scope, operation="lamoda_search", url=url)
     cached = None if pending else _cache.get(cache_key)
     if cached is not None:
@@ -496,7 +504,7 @@ async def _cdp_render_search(query: str, ctx: Context | None) -> dict[str, Any]:
 @mcp.tool(
     name="lamoda_search",
     annotations=ToolAnnotations(
-        title="Lamoda Search", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+        title="Lamoda Search", read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True
     ),
 )
 async def lamoda_search(
@@ -505,16 +513,9 @@ async def lamoda_search(
 ) -> LamodaSearchResponse:
     """Search Lamoda, rendered in the operator's Chrome (discovery is blocked tier 1).
 
-    ## Return Format
+    price_rub is None when the tile states no price — never 0; Lamoda exposes no ratings.
 
-    LamodaSearchResponse: {status, query, tier_used, count, items[], meta}.
-    Items carry sku, title, brand, price_rub (None when absent — never 0), url.
-
-    ## Error Format
-
-    ToolError: challenge_required on a visible challenge (not cached);
-    TransportDownError on CDP/nav failures; ParserDriftError when a rendered
-    page yields zero SKUs without challenge evidence.
+    Full field list and error codes: `guide://lamoda/lamoda_search`.
     """
     log_event("lamoda_search.start", query=query[:60])
     try:
@@ -525,7 +526,8 @@ async def lamoda_search(
         if _anti_bot_challenge(payload):
             raise_tool_error(
                 ChallengeRequiredError(
-                    "Lamoda requires user action in the connected Chrome. Complete the visible challenge, then retry.",
+                    "Lamoda requires user action in the connected Chrome. Complete the challenge on "
+                    "lamoda.ru, then call this tool again after the user confirms it is done.",
                     provider="lamoda",
                     handoff_expires_at=payload.get("_handoff_expires_at"),
                     handoff_id=payload.get("_handoff_id"),
@@ -539,9 +541,17 @@ async def lamoda_search(
                 )
             )
         items = [_search_item_from_tile(it) for it in items_raw if isinstance(it, dict)]
-        warnings: list[str] = []
-        if all(it.price_rub is None for it in items):
-            warnings.append("no_prices_on_page")
+        warnings: list[str] = R.validate_items(
+            [it.model_dump() for it in items], require_title=True, absent_price="no_prices_on_page"
+        )
+        # The selfcheck's family registry now also guards the tool's own
+        # answer: a payload that lost a whole key family is drift the agent
+        # must see, not only a human running doctor. The four render-based
+        # connectors raise on zero items before this point, so the family
+        # check never runs on a vacuously empty payload.
+        drift = R.shape_drift_warning(payload, SEARCH_REQUIRED_FAMILIES, source="lamoda_search")
+        if drift:
+            warnings.append(drift)
         result = LamodaSearchResponse(query=query, tier_used="cdp", count=len(items), items=items)
         attached = R.attach_meta(result.model_dump(by_alias=True, exclude={"meta"}), warnings, source="lamoda_search")
         result.meta = MetaOut(**attached["_meta"])
@@ -550,13 +560,17 @@ async def lamoda_search(
         raise
     except Exception as exc:
         log_event("lamoda_search.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"lamoda_search failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"lamoda_search failed: {exc}"))
 
 
 @mcp.tool(
     name="lamoda_card",
     annotations=ToolAnnotations(
-        title="Lamoda Product Card", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+        title="Lamoda Product Card",
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def lamoda_card(
@@ -567,17 +581,7 @@ async def lamoda_card(
 ) -> LamodaCardResponse:
     """Fetch a GraphQL card over HTTPS, falling back to an in-page Chrome POST.
 
-    ## Return Format
-
-    LamodaCardResponse: {status, sku, title, brand, price_rub, old_price_rub,
-    is_available, sizes[], url, tier_used, meta}. Lamoda exposes no ratings.
-
-    ## Error Format
-
-    ToolError: BadRequestError when no SKU can be extracted; NotFoundError when
-    the SKU has no product; ChallengeRequiredError when the Chrome fallback lands on
-    Lamoda's anti-bot page (complete it, then retry); TransportDownError on HTTP failures; ParserDriftError
-    when the GraphQL envelope changed.
+    Full field list and error codes: `guide://lamoda/lamoda_card`.
     """
     log_event("lamoda_card.start", input=sku_or_url[:80])
     try:
@@ -605,14 +609,15 @@ async def lamoda_card(
             url=f"{SITE_BASE}/p/{sku.lower()}/",
             tier_used=product.get("_tier_used", "graphql"),
         )
-        attached = R.attach_meta(result.model_dump(by_alias=True, exclude={"meta"}), [], source="lamoda_card")
+        card = result.model_dump(by_alias=True, exclude={"meta", "sizes"})
+        attached = R.attach_meta(card, R.validate_offer(card), source="lamoda_card")
         result.meta = MetaOut(**attached["_meta"])
         return result
     except ToolError:
         raise
     except Exception as exc:
         log_event("lamoda_card.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"lamoda_card failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"lamoda_card failed: {exc}"))
 
 
 # CLI-only drift canary: ``marketplace-mcp doctor`` imports and calls lamoda_selfcheck()
@@ -646,7 +651,7 @@ async def lamoda_selfcheck(ctx: Context | None = None) -> LamodaSelfcheckRespons
         raise
     except Exception as exc:
         log_event("lamoda_selfcheck.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"lamoda_selfcheck failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"lamoda_selfcheck failed: {exc}"))
 
 
 async def _lamoda_selfcheck_impl(ctx: Context | None) -> LamodaSelfcheckResponse:
@@ -736,3 +741,8 @@ async def _lamoda_selfcheck_impl(ctx: Context | None) -> LamodaSelfcheckResponse
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)

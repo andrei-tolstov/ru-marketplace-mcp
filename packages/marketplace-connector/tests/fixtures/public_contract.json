@@ -340,6 +340,16 @@
           "anyOf": [
             {
               "items": {
+                "enum": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6,
+                  7,
+                  9
+                ],
                 "type": "integer"
               },
               "type": "array"
@@ -1022,12 +1032,30 @@
       "type": "object"
     }
   },
+  "marketplace_health": {
+    "output": {
+      "properties": {
+        "budget": {},
+        "cdp": {},
+        "handoffs": {},
+        "server_version": {},
+        "unblock": {}
+      },
+      "type": "object"
+    },
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
   "marketplace_sources": {
     "output": {
       "properties": {
         "capabilities": {},
         "mounted": {},
         "mounted_count": {},
+        "needs_cdp": {},
         "server_version": {},
         "skipped": {},
         "skipped_count": {}
@@ -1096,72 +1124,6 @@
       },
       "required": [
         "query"
-      ],
-      "type": "object"
-    }
-  },
-  "mpstats_item": {
-    "output": {
-      "properties": {
-        "count": {},
-        "days": {},
-        "items": {},
-        "meta": {},
-        "place": {}
-      },
-      "type": "object"
-    },
-    "parameters": {
-      "additionalProperties": false,
-      "properties": {
-        "oz_fbs": {
-          "default": true,
-          "type": "boolean"
-        },
-        "place": {
-          "type": "string"
-        },
-        "skus": {
-          "items": {
-            "type": "integer"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "skus",
-        "place"
-      ],
-      "type": "object"
-    }
-  },
-  "mpstats_warehouses": {
-    "output": {
-      "properties": {
-        "count": {},
-        "days": {},
-        "items": {},
-        "meta": {},
-        "place": {}
-      },
-      "type": "object"
-    },
-    "parameters": {
-      "additionalProperties": false,
-      "properties": {
-        "place": {
-          "type": "string"
-        },
-        "skus": {
-          "items": {
-            "type": "integer"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "skus",
-        "place"
       ],
       "type": "object"
     }
@@ -1250,9 +1212,11 @@
         "count": {},
         "items": {},
         "page": {},
+        "parsed_count": {},
         "query": {},
         "status": {},
-        "tier_used": {}
+        "tier_used": {},
+        "truncated": {}
       },
       "type": "object"
     },
@@ -1357,8 +1321,11 @@
         },
         "nm_ids": {
           "items": {
+            "exclusiveMinimum": 0,
             "type": "integer"
           },
+          "maxItems": 100,
+          "minItems": 1,
           "type": "array"
         }
       },
@@ -1562,7 +1529,11 @@
       "properties": {
         "result": {}
       },
-      "type": "object"
+      "required": [
+        "result"
+      ],
+      "type": "object",
+      "x-fastmcp-wrap-result": true
     },
     "parameters": {
       "additionalProperties": false,

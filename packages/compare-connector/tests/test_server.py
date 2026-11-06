@@ -17,7 +17,13 @@ from compare_connector import server
 from compare_connector.models_output import MarketOffer
 from fastmcp.exceptions import ToolError
 from mcp_core import resilience as R
-from mcp_core.errors import ChallengeRequiredError, ParserDriftError, RateLimitedError, raise_tool_error
+from mcp_core.errors import (
+    ChallengeRequiredError,
+    ParserDriftError,
+    RateLimitedError,
+    TransportDownError,
+    raise_tool_error,
+)
 from pydantic import ValidationError
 
 
@@ -246,6 +252,53 @@ async def test_a_timeout_is_reported_as_a_timeout(monkeypatch):
     assert outcomes["yandex_market"].requires_user_action is False
 
 
+# START_BLOCK_TAOBAO_LOADING_TIMEOUT
+async def test_taobao_loading_timeout_keeps_citilink_results(monkeypatch):
+    """R-TAOBAO-GRID-LOADING, R-ERRORS: the real Taobao tool's loading error maps to retryable timeout."""
+    from mcp_core.cache import TTLCache
+    from taobao_connector import server as taobao_server
+
+    calls = []
+    monkeypatch.setattr(taobao_server, "_cache", TTLCache(ttl_s=300))
+    monkeypatch.setenv("MARKETPLACE_SOURCES", "taobao,citilink,compare")
+
+    async def render(url, extract_js, wait_ms, ctx):
+        calls.append("taobao")
+        return {
+            "title": "iphone 15_淘宝搜索",
+            "items": [],
+            "anchors_total": 0,
+            "login_anchors": 0,
+            "body_snippet": "加载中...",
+            "grid_loading": True,
+        }
+
+    async def taobao(query, limit):
+        await taobao_server.taobao_search(query)
+        return []
+
+    async def citilink(query, limit):
+        calls.append("citilink")
+        return [offer("citilink", 500.0)]
+
+    monkeypatch.setattr(taobao_server, "_cdp_render", render)
+    stub_sources(monkeypatch, {"taobao": taobao, "citilink": citilink})
+    result = await server.compare_prices("iphone 15", sources=["taobao", "citilink"])
+    outcome = next(it for it in result.source_outcomes if it.source == "taobao")
+    assert outcome.status == "timeout"
+    assert outcome.error_code == "timeout"
+    assert outcome.retryable is True
+    assert outcome.requires_user_action is False
+    assert result.complete is False
+    assert result.sources_ok == ["citilink"]
+    assert result.total_offers == 1
+    assert result.cheapest.source == "citilink"
+    assert calls.count("taobao") == calls.count("citilink") == 1
+
+
+# END_BLOCK_TAOBAO_LOADING_TIMEOUT
+
+
 @pytest.mark.parametrize("wire_error", [False, True])
 async def test_challenge_keeps_partial_results_and_recovers_only_failed_source(monkeypatch, wire_error):
     calls = []
@@ -298,6 +351,33 @@ def test_structured_error_code_takes_precedence_over_message(error, status, code
     assert result["error_code"] == code
     assert result["retryable"] is retryable
     assert result["requires_user_action"] is False
+
+
+async def test_recovery_fields_reach_the_source_outcome(monkeypatch):
+    """R-CDP-HOST-PAUSE, R-CHALLENGE-ACTION: an open host breaker's remaining
+    pause and the challenge's retry contract must survive _source_error into
+    SourceOutcome. Before this only error_code/retryable crossed that boundary,
+    so the agent saw rate_limited with no clock and challenge_required with no
+    user action — the two fields those requirements exist for."""
+
+    async def paused(query, limit):
+        raise_tool_error(TransportDownError("CDP navigation paused", provider="wildberries", retry_after_s=17.5))
+
+    async def challenged(query, limit):
+        raise_tool_error(ChallengeRequiredError("captcha", provider="taobao"))
+
+    stub_sources(monkeypatch, {"wildberries": paused, "taobao": challenged})
+
+    result = await server.compare_prices(query="тест", sources=["wildberries", "taobao"])
+
+    assert result.complete is False
+    outcomes = {o.source: o for o in result.source_outcomes}
+    assert outcomes["wildberries"].retry_after_s == 17.5
+    assert outcomes["wildberries"].retryable is True
+    challenge = outcomes["taobao"]
+    assert challenge.retryable_now is False
+    assert challenge.retry_when == "after_user_confirmation"
+    assert "marketplace-mcp unblock taobao" in (challenge.user_action or "")
 
 
 @pytest.mark.parametrize("message", ["broken", "[]", "null", '{"error": []}', '{"error": "new_code"}'])
@@ -905,6 +985,64 @@ async def test_taobao_adapter_never_ranks_yuan_as_rubles(monkeypatch):
     assert got[0].currency == "cny"
     assert got[0].price_native == 9999.0
     assert not server._ranks_in_rubles(got[0])
+
+
+async def test_foreign_source_detail_counts_native_prices_without_changing_ranking(monkeypatch):
+    """R-COMPARE-FOREIGN-DETAIL: 20 CNY prices are visible, never ranked as RUB."""
+
+    async def taobao(query, limit):
+        return [offer("taobao", None, product_id=str(i), currency="cny", price_native=10 + i) for i in range(20)]
+
+    async def wb(query, limit):
+        return [offer("wildberries", 500, product_id="wb1"), offer("wildberries", 300, product_id="wb2")]
+
+    stub_sources(monkeypatch, {"taobao": taobao, "wildberries": wb})
+    result = await server.compare_prices("тест", per_source_limit=20, sources=["taobao", "wildberries"])
+    outcomes = {outcome.source: outcome for outcome in result.source_outcomes}
+    assert outcomes["taobao"].detail == "20 results, 20 priced in CNY (not ranked)"
+    assert outcomes["wildberries"].detail == "2 results, 2 priced"
+    assert result.cheapest.source == "wildberries" and result.cheapest.price_rub == 300
+    assert result.price_spread_rub == 200
+    assert [item.price_rub for item in result.offers[:2]] == [300, 500]
+    assert len(result.offers[2:]) == 20
+    assert all(item.source == "taobao" and item.price_rub is None for item in result.offers[2:])
+    assert [item.price_native for item in result.offers[2:]] == list(range(10, 30))
+
+
+@pytest.mark.parametrize(
+    ("prices", "expected"),
+    [
+        ([], "0 results, 0 priced (not ranked)"),
+        ([("cny", None), ("usd", None)], "2 results, 0 priced (not ranked)"),
+        ([("usd", 10), ("cny", 20), ("cny", 30), ("eur", None)], "4 results, 3 priced in CNY/USD (not ranked)"),
+    ],
+)
+async def test_foreign_source_detail_handles_missing_and_mixed_native_prices(monkeypatch, prices, expected):
+    """R-COMPARE-FOREIGN-DETAIL: count present native prices and sort their codes."""
+
+    async def taobao(query, limit):
+        return [
+            offer("taobao", None, product_id=str(i), currency=currency, price_native=price)
+            for i, (currency, price) in enumerate(prices)
+        ]
+
+    stub_sources(monkeypatch, {"taobao": taobao})
+    result = await server.compare_prices("тест", sources=["taobao"])
+    assert result.source_outcomes[0].detail == expected
+    assert result.cheapest is None and result.price_spread_rub is None
+    assert result.total_offers == len(prices)
+
+
+async def test_rouble_source_detail_still_counts_only_rouble_prices(monkeypatch):
+    """R-COMPARE-FOREIGN-DETAIL: missing RUB prices do not change the old detail."""
+
+    async def wb(query, limit):
+        return [offer("wildberries", 500), offer("wildberries", None, price_native=200, currency="usd")]
+
+    stub_sources(monkeypatch, {"wildberries": wb})
+    result = await server.compare_prices("тест", sources=["wildberries"])
+    assert result.source_outcomes[0].detail == "2 results, 1 priced"
+    assert result.cheapest.price_rub == 500 and result.price_spread_rub is None
 
 
 async def test_a_yuan_offer_never_becomes_cheapest(monkeypatch):

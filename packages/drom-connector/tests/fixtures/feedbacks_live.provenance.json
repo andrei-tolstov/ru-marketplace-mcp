@@ -1,0 +1,9 @@
+{
+  "url": "https://baza.drom.ru/user/autotrade/feedbacks",
+  "captured_at": "2026-10-18",
+  "sha256": "088bd9c935a2a2dce7ef545acaf2a6da6582d2e2b3c8a2482d878347d209542d",
+  "method": "Captured HTML from baza.drom.ru using Chrome CDP and residential proxy",
+  "ground_truth": {
+    "note": "Feedbacks and reviews page for seller autotrade"
+  }
+}

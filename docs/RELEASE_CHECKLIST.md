@@ -15,14 +15,28 @@
 
 **Go** — всё сразу:
 
-- офлайн-гейт зелёный, покрытие выше порога 70;
-- `e2e_stdio_check.py` даёт 16/16, у всех серверов версия релиза;
-- `doctor` вернул `0`, либо `2` с понятным объяснением по каждому
-  непроверенному источнику;
+- офлайн-гейт зелёный, покрытие выше порога 80;
+- `e2e_stdio_check.py` даёт 32/32 (16 серверов в обоих протоколах), у всех
+  серверов версия релиза;
+- `python scripts/live_check.py doctor` вернул `0`, либо `2` с понятным
+  объяснением по каждому непроверенному источнику. Строка `refused before
+  sending` в конце значит, что бюджет не пустил запросы этих площадок: их
+  `transport_down` ничего не говорит о сайте. Ozon, когда его API отказывает
+  curl, тратит до 12 запросов на полную самопроверку при лимите 8 — отзывы
+  проверьте в следующем прогоне одним вызовом: `live_check.py reset`, затем
+  `live_check.py call ozon_connector.server ozon_reviews '{"sku_or_path": "<sku>"}'`;
 - по каждому источнику, который ответил, сверка глазами сошлась по цене и
   наличию;
 - юани Taobao не выиграли рублёвое ранжирование;
 - CI зелёный.
+
+Отказ по бюджету doctor показывает как `inconclusive` с причиной
+`budget_refused`, а не как здоровую проверку; за предел лимита запрос не уходит.
+Коды doctor: `0` — здоровы все выбранные проверки, `1` — дрейф, `2` — признанный
+блок или непроверенный источник, `3` — не записан status-файл, `4` — авария
+самопроверки, запуска или аргументов doctor (включая неизвестный источник).
+`live_check.py doctor` сохраняет эти коды; вне doctor отказ бюджета даёт `3`.
+Nightly поднимает тревогу на `1` и `4`, но не на `2`.
 
 **Conditional go** — то же самое, но часть источников осталась непроверенной или
 дрейфует. Тогда релиз возможен, если такие источники **явно помечены** в README
@@ -33,7 +47,8 @@
 **No-go** — достаточно одного пункта:
 
 - цена, валюта, наличие или продавец не совпали с сайтом;
-- `doctor` вернул `1`;
+- `python scripts/live_check.py doctor` вернул `1` (дрейф), `3` (не записан
+  status-файл) или `4` (авария самопроверки, запуска или аргументов);
 - сравнение назвало полным результат, из которого источник молча выпал;
 - юаневая цена попала в рублёвое ранжирование;
 - чистая установка, сборка образа или CI красные.
@@ -57,9 +72,18 @@ uv run mypy --platform darwin
 uv run python scripts/check_no_print.py
 uv run python scripts/check_versions.py
 uv run python scripts/check_test_count.py
+uv run python scripts/gen_tools_doc.py --check
+uv run python scripts/check_lock_revision.py
 uv run pytest -q -m "not live and not cdp" --cov --cov-report= --cov-fail-under=80
 uv run python scripts/e2e_stdio_check.py
 ```
+
+Порог покрытия — 80: ровно это значение требует гейт (`--cov-fail-under=80`),
+и `scripts/check_coverage_floor.py` читает его оттуда, а не из текста.
+
+Перелокить `uv.lock` нужно uv не старше 0.13.6 (`uvx --from uv==0.13.6 uv lock`):
+старый uv пишет в лок-файл `revision = 3`, и образы собираются из другого
+лок-файла. Проверка `scripts/check_lock_revision.py` стоит в CI.
 
 При замедлении используйте `--durations=10`: время зависит от машины и запуска
 DOM-процессов. Случайные обращения к живому пейсеру или Chrome нужно исключить
@@ -74,10 +98,11 @@ npm ci --no-audit --no-fund
 
 ## 2. Консистентность версий
 
-Одна версия живёт в восьмидесяти четырёх местах: семнадцать `pyproject.toml`,
+Одна версия живёт в восьмидесяти восьми местах: семнадцать `pyproject.toml`,
 шестнадцать `__version__`, пятнадцать `SERVER_VERSION`, пятнадцать пинов
-`mcp-core==` в `pyproject.toml` коннекторов, `server.json`, OCI identifier, `dsh/package.json` и
-восемнадцать тегов образа в `docker-compose.yml` и `docs/DEPLOYMENT.md`. Вручную такое не
+`mcp-core==` в `pyproject.toml` коннекторов, `server.json`, OCI identifier, `dsh/package.json`,
+девятнадцать тегов образа в `docker-compose.yml`, `docs/DEPLOYMENT.md` и `dsh/README.md` и три пина
+релиза в `docs/DEPLOYMENT.md`. Вручную такое не
 сверяется — при подготовке 1.2.1 тринадцать `__version__` остались на прошлой
 версии и никто этого не заметил. Поэтому сверяет скрипт, он входит в гейт:
 
@@ -96,8 +121,18 @@ JSON-RPC — это единственное место, где число пр�
 Семь источников отказывают датацентровым адресам, поэтому CI их не проверяет.
 Это единственное место, где они проверяются вообще.
 
+Живые запросы идут только через `scripts/live_check.py` или `pytest -m live`:
+оба ставят бюджет владельца — не больше 40 запросов за прогон, не больше 8 на
+площадку и пауза не меньше 3 секунд между запросами к одной площадке. Журнал
+общий, `.live-budget.json` в корне репозитория; `python scripts/live_check.py
+ledger` показывает, сколько уже израсходовано. Запрос сверх лимита
+останавливает прогон до отправки, а не после. Новый прогон начинается после
+`python scripts/live_check.py reset`: журнал прошлого прогона не удаляется, а
+переименовывается в `.live-budget-<время>.json`.
+
 ```powershell
 pwsh scripts\start_chrome_cdp.ps1     # Chrome с CDP на 127.0.0.1:9222
+python scripts\live_check.py selfcheck dns
 ```
 
 Автоматических тестов для этого яруса нет: маркер `cdp` объявлен в
@@ -181,17 +216,42 @@ git push -u origin release/vX.Y.Z
 gh pr create --base main --head release/vX.Y.Z --body-file RELEASE_NOTES_vX.Y.Z.md
 ```
 
-Мерж только с зелёным CI. Затем:
+Мерж только с зелёным CI. Затем — на коммите релиза, до тега — прогнать
+workflow `Image check`: он собирает оба образа и проводит stdio-образ через
+настоящую MCP-сессию. Без него сломанный Dockerfile или потерянный пакет
+всплывут только после пуша тега, когда образ уже опубликован.
 
 ```powershell
 gh pr merge --squash --delete-branch
 git checkout main ; git pull --ff-only origin main
+gh workflow run image-check.yml --ref main
+gh run watch
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
 Пуш тега запускает release workflow: он собирает 32 артефакта (16 wheel и 16
 sdist) и прикладывает их к релизу.
+
+## PyPI (maintainer)
+
+Одноразовая настройка pending publisher, окружения и переключателя описана в
+[DEPLOYMENT.md — PyPI (maintainer)](DEPLOYMENT.md#pypi-maintainer): это единственный
+список точных полей для владельца. Владелец выполнил её 2026-10-31, и теперь каждый
+тег `v*` публикует бандл; без настройки (например, в форке) job пропускается.
+Токен API не нужен. Публикуется только дополнительный бандл, а не 16 workspace-пакетов.
+
+Перед выпуском проверьте:
+
+- `scripts/build_pypi_bundle.py --print-pyproject` показывает метаданные из
+  манифестов; обычный запуск собирает один wheel и один sdist в `dist/pypi/`;
+- новый CI job **PyPI bundle installs** зелёный: чистый pip-venv запускает оба
+  CLI help и stdio-проверку установленных консольных команд;
+- wheel `METADATA` содержит версию выбранного `v*` тега; ручной
+  `workflow_dispatch` тоже запускайте на теге, не на ветке;
+- конфиг из uv tool использует пин релиза, обновляемый через `install --write --force`.
+
+32 артефакта существующего GitHub Release workflow остаются как прежде.
 
 ## 8. Проверка после публикации
 
@@ -207,6 +267,15 @@ uv run python scripts/e2e_stdio_check.py
 Проверить страницу релиза глазами: текст на месте, таблица проверенных
 источников отрисовалась, приложено 32 файла (16 wheel и 16 sdist).
 
+Проверить PyPI: на https://pypi.org/project/ru-marketplace-mcp/ видна версия X.Y.Z
+с одним wheel и одним sdist, а пакет запускается без checkout:
+
+```console
+uvx ru-marketplace-mcp@X.Y.Z setup --dry-run
+```
+
+Команда печатает запись с `ru-marketplace-mcp==X.Y.Z` и ничего не пишет.
+
 ---
 
 # Release checklist (English)
@@ -218,11 +287,21 @@ for.
 
 ## Go / no-go
 
-**Go** — all at once: the offline gate is green and above the 70% coverage
-floor; `e2e_stdio_check.py` reports 16/16 at the release version; `doctor`
-returns `0`, or `2` with a clear account of every unverified source; every
-source that answered was compared by eye on price and availability; Taobao's
-yuan did not win a rouble ranking; CI is green.
+**Go** — all at once: the offline gate is green and above the 80% coverage
+floor; `e2e_stdio_check.py` reports 32/32 (16 servers in both protocols) at
+the release version; `python scripts/live_check.py doctor` returns `0`, or `2`
+with a clear account of every unverified source (a closing `refused before
+sending` line means the budget stopped those marketplaces' requests, so their
+`transport_down` says nothing about the site; Ozon needs up to 12 requests for
+a full selfcheck when its API refuses curl, against a cap of 8, so check its
+reviews in the next run with one call: `live_check.py reset`, then
+`live_check.py call ozon_connector.server ozon_reviews '{"sku_or_path": "<sku>"}'`);
+every source that answered was compared by eye on
+price and availability; Taobao's yuan did not win a rouble ranking; CI is
+green.
+
+A request refused by the budget is reported by doctor as that source's error,
+and nothing is sent past the cap.
 
 **Conditional go** — the same, but some sources stayed unverified or drifted.
 The release may ship if those are **explicitly labelled** in the README and the
@@ -230,30 +309,40 @@ release notes and removed from anything claiming they work. An unverified source
 presented as a working one is the failure mode this project exists to avoid.
 
 **No-go** — any one of: price, currency, availability or seller disagreed with
-the site; `doctor` returned `1`; a comparison called a result complete while a
-source had silently dropped out; a yuan price entered a rouble ranking; a clean
-install, image build or CI is red.
+the site; `python scripts/live_check.py doctor` returned `1`; a comparison
+called a result complete while a source had silently dropped out; a yuan price
+entered a rouble ranking; a clean install, image build or CI is red.
 
 ## The steps
 
 1. **Offline gate** — lock check, frozen sync, tests, ruff, mypy on the host
-   plus win32 and darwin, the no-print and version-consistency checks, the
-   coverage floor, `uv run pytest -q scripts` for operational gate regressions,
-   and a real stdio MCP session for all sixteen servers. Install the locked DOM
-   test dependencies with `npm ci --no-audit --no-fund`. Use `--durations=10` to
-   investigate slow tests; total runtime alone does not prove network access.
+   plus win32 and darwin, the no-print, version-consistency, test-count and
+   lock-revision checks, the 80% coverage floor, `uv run pytest -q scripts` for
+   operational gate regressions, and a real stdio MCP session for all sixteen
+   servers. Install the locked DOM test dependencies with
+   `npm ci --no-audit --no-fund`. Relocking `uv.lock` needs uv 0.13.6 or newer
+   (`uvx --from uv==0.13.6 uv lock`): an older uv downgrades the lockfile
+   revision the images build from. Use `--durations=10` to investigate slow
+   tests; total runtime alone does not prove network access.
 2. **Version consistency** — `scripts/check_versions.py` compares all
-   eighty-four declarations (seventeen `pyproject.toml`, sixteen `__version__`,
-   fifteen `SERVER_VERSION`, fifteen `mcp-core==` pins, eighteen image tags,
-   `server.json`, its OCI image identifier, and `dsh/package.json`) against the root `pyproject.toml`;
+   eighty-eight declarations (seventeen `pyproject.toml`, sixteen `__version__`,
+   fifteen `SERVER_VERSION`, fifteen `mcp-core==` pins, nineteen image tags,
+   three deployment-guide release pins, `server.json`, its OCI image identifier,
+   and `dsh/package.json`) against the root `pyproject.toml`;
    `e2e_stdio_check.py` then reports what the running servers
    actually say.
 3. **Live checks from the operator's machine** — seven sources refuse datacenter
-   addresses, so this is the only place they are exercised at all. Run each
-   `*_selfcheck`: `success` means the transport answered, `drift_detected` means
-   the page arrived and the parser did not understand it (the only case that
-   calls for a selector fix), `inconclusive` means IP, captcha or session got in
-   the way and the source stays unverified.
+   addresses, so this is the only place they are exercised at all. Live requests
+   go only through `scripts/live_check.py` or `pytest -m live`: both install the
+   owner's budget of at most 40 requests per run, at most 8 per marketplace and
+   at least 3 s between requests to one marketplace. The ledger is shared in
+   `.live-budget.json` at the repository root; `python scripts/live_check.py
+   ledger` reports what one run has spent. A request over a cap stops the run
+   before it is sent. `python scripts/live_check.py reset` starts a new run; the
+   old ledger is kept as `.live-budget-<time>.json`, not deleted. Run each `*_selfcheck`: `success` means the transport
+   answered, `drift_detected` means the page arrived and the parser did not
+   understand it (the only case that calls for a selector fix), `inconclusive`
+   means IP, captcha or session got in the way and the source stays unverified.
 4. **Compare by eye** — a passing selfcheck is not proof the number is right.
    DNS once went green while every title and price came back empty. Take two or
    three products per source and read the site next to the tool: the price an
@@ -264,7 +353,26 @@ install, image build or CI is red.
 6. **Write `docs/releases/RELEASE_NOTES_<tag>.md`** and say plainly which sources were
    verified against live pages and which were not. Any reader can open a
    marketplace and check.
-7. **Branch, PR, green CI, squash merge, tag.** The tag push builds and attaches
-   32 artifacts (16 wheels and 16 sdists).
+7. **Branch, PR, green CI, squash merge, tag.** On the release commit, before
+   tagging, run the `Image check` workflow: it builds both images and drives the
+   stdio image through a real MCP session. Without it a broken Dockerfile or a
+   missing package surfaces only after the tag push, once the image is already
+   published. The tag push builds and attaches 32 artifacts (16 wheels and 16
+   sdists).
 8. **Verify after publishing** — clone the tag fresh, sync, and run
-   `e2e_stdio_check.py`, then read the release page.
+   `e2e_stdio_check.py`, then read the release page. Check that
+   https://pypi.org/project/ru-marketplace-mcp/ lists X.Y.Z with one wheel and one
+   sdist, and that `uvx ru-marketplace-mcp@X.Y.Z setup --dry-run` prints an entry
+   pinned to `ru-marketplace-mcp==X.Y.Z` and writes nothing.
+
+## PyPI (maintainer, English)
+
+Follow the single owner-registration checklist in
+[DEPLOYMENT.md — PyPI (maintainer)](DEPLOYMENT.md#pypi-maintainer). The owner
+completed it on 2026-10-31, so every `v*` tag now publishes the bundle; without it
+(in a fork, say) the publish job is skipped. No API token is used. Only the additional
+bundle goes to PyPI, not the 16 workspace distribution names. Check the generated
+metadata and both local artifacts, the **PyPI bundle installs** CI job, and the
+wheel `METADATA` version against the selected `v*` tag (also for manual dispatch).
+The existing 32 GitHub Release artifacts and Docker builds stay unchanged;
+uv-tool client entries pin a release and refresh it with `install --write --force`.

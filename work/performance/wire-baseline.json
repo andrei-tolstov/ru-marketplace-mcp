@@ -1,226 +1,281 @@
 {
   "version": 1,
+  "ceilings": {
+    "compare-mcp": 1860,
+    "decision-mcp": 2109,
+    "marketplace-mcp": 13588
+  },
   "profiles": {
     "compare-mcp": {
       "script": "compare-mcp",
       "tool_count": 4,
-      "wire_tokens": 2023,
-      "latency_ms": 1721.9,
-      "schema_sha256": "1a86ba7d05a2da14a588b5cbf3c6553a06c1e9dee7bfc992ed755b48df89dd51",
+      "wire_tokens": 1735,
+      "model_tokens": 1429,
+      "instructions_tokens": 36,
+      "latency_ms": 3765.0,
+      "schema_sha256": "314450e09450b9c9671380bc16f3848988248fe598e73f6442d32dea1c8a1ef2",
       "tools": [
         {
           "name": "compare_browser_snapshot",
-          "tokens": 370
+          "tokens": 415,
+          "model_tokens": 352
         },
         {
           "name": "compare_prices",
-          "tokens": 709
+          "tokens": 642,
+          "model_tokens": 518
         },
         {
           "name": "compare_sources",
-          "tokens": 250
+          "tokens": 171,
+          "model_tokens": 110
         },
         {
           "name": "compare_verify_offer",
-          "tokens": 694
+          "tokens": 507,
+          "model_tokens": 449
         }
       ]
     },
     "decision-mcp": {
       "script": "decision-mcp",
       "tool_count": 5,
-      "wire_tokens": 2278,
-      "latency_ms": 1720.7,
-      "schema_sha256": "2f230ff34a3e15fda8491614fdb12a46a868e27fa180a03840e30b4ad6f08d4a",
+      "wire_tokens": 2008,
+      "model_tokens": 1636,
+      "instructions_tokens": 36,
+      "latency_ms": 3735.0,
+      "schema_sha256": "d837e8784dd65be0ce161251d3ea85b7fdce1b451f465036eae8c9e4576f58cf",
       "tools": [
         {
           "name": "compare_browser_snapshot",
-          "tokens": 370
+          "tokens": 415,
+          "model_tokens": 352
         },
         {
           "name": "compare_prices",
-          "tokens": 709
+          "tokens": 642,
+          "model_tokens": 518
         },
         {
           "name": "compare_sources",
-          "tokens": 250
+          "tokens": 171,
+          "model_tokens": 110
         },
         {
           "name": "compare_verify_offer",
-          "tokens": 694
+          "tokens": 507,
+          "model_tokens": 449
         },
         {
           "name": "decision_inspect",
-          "tokens": 255
+          "tokens": 273,
+          "model_tokens": 207
         }
       ]
     },
     "marketplace-mcp": {
       "script": "marketplace-mcp",
-      "tool_count": 40,
-      "wire_tokens": 16549,
-      "latency_ms": 1793.6,
-      "schema_sha256": "2f22553e7ad814641ffba1ac877ca35451c425203ecf362ac83f5c689a7e3870",
+      "tool_count": 39,
+      "wire_tokens": 13084,
+      "model_tokens": 9504,
+      "instructions_tokens": 153,
+      "latency_ms": 3719.0,
+      "schema_sha256": "cb40899b11a8f262c3b88353fbdc33550fef0f5e9c5b5eaf989d156ff79bd716",
       "tools": [
         {
           "name": "aliexpress_card",
-          "tokens": 323
+          "tokens": 271,
+          "model_tokens": 174
         },
         {
           "name": "aliexpress_search",
-          "tokens": 234
+          "tokens": 204,
+          "model_tokens": 127
         },
         {
           "name": "avito_card",
-          "tokens": 280
+          "tokens": 301,
+          "model_tokens": 200
         },
         {
           "name": "avito_search",
-          "tokens": 379
+          "tokens": 290,
+          "model_tokens": 205
         },
         {
           "name": "avito_seller",
-          "tokens": 259
+          "tokens": 285,
+          "model_tokens": 207
         },
         {
           "name": "cian_card",
-          "tokens": 461
+          "tokens": 349,
+          "model_tokens": 141
         },
         {
           "name": "cian_search",
-          "tokens": 859
+          "tokens": 741,
+          "model_tokens": 647
         },
         {
           "name": "citilink_card",
-          "tokens": 263
+          "tokens": 216,
+          "model_tokens": 123
         },
         {
           "name": "citilink_search",
-          "tokens": 221
+          "tokens": 185,
+          "model_tokens": 108
         },
         {
           "name": "compare_browser_snapshot",
-          "tokens": 370
+          "tokens": 415,
+          "model_tokens": 352
         },
         {
           "name": "compare_prices",
-          "tokens": 709
+          "tokens": 642,
+          "model_tokens": 518
         },
         {
           "name": "compare_sources",
-          "tokens": 250
+          "tokens": 171,
+          "model_tokens": 110
         },
         {
           "name": "compare_verify_offer",
-          "tokens": 694
+          "tokens": 507,
+          "model_tokens": 449
         },
         {
           "name": "detmir_card",
-          "tokens": 453
+          "tokens": 361,
+          "model_tokens": 290
         },
         {
           "name": "detmir_categories",
-          "tokens": 425
+          "tokens": 340,
+          "model_tokens": 254
         },
         {
           "name": "detmir_category",
-          "tokens": 438
+          "tokens": 372,
+          "model_tokens": 277
         },
         {
           "name": "dns_card",
-          "tokens": 258
+          "tokens": 210,
+          "model_tokens": 117
         },
         {
           "name": "dns_search",
-          "tokens": 219
+          "tokens": 181,
+          "model_tokens": 105
         },
         {
           "name": "lamoda_card",
-          "tokens": 276
+          "tokens": 196,
+          "model_tokens": 100
         },
         {
           "name": "lamoda_search",
-          "tokens": 253
+          "tokens": 196,
+          "model_tokens": 121
+        },
+        {
+          "name": "marketplace_health",
+          "tokens": 250,
+          "model_tokens": 166
         },
         {
           "name": "marketplace_sources",
-          "tokens": 351
+          "tokens": 307,
+          "model_tokens": 212
         },
         {
           "name": "megamarket_card",
-          "tokens": 263
+          "tokens": 214,
+          "model_tokens": 113
         },
         {
           "name": "megamarket_search",
-          "tokens": 381
-        },
-        {
-          "name": "mpstats_item",
-          "tokens": 544
-        },
-        {
-          "name": "mpstats_warehouses",
-          "tokens": 427
+          "tokens": 345,
+          "model_tokens": 264
         },
         {
           "name": "ozon_card",
-          "tokens": 397
+          "tokens": 300,
+          "model_tokens": 193
         },
         {
           "name": "ozon_reviews",
-          "tokens": 763
+          "tokens": 645,
+          "model_tokens": 513
         },
         {
           "name": "ozon_search",
-          "tokens": 285
+          "tokens": 243,
+          "model_tokens": 162
         },
         {
           "name": "taobao_card",
-          "tokens": 343
+          "tokens": 221,
+          "model_tokens": 128
         },
         {
           "name": "taobao_search",
-          "tokens": 317
+          "tokens": 245,
+          "model_tokens": 167
         },
         {
           "name": "wb_card",
-          "tokens": 384
+          "tokens": 276,
+          "model_tokens": 207
         },
         {
           "name": "wb_categories",
-          "tokens": 425
+          "tokens": 333,
+          "model_tokens": 248
         },
         {
           "name": "wb_category_products",
-          "tokens": 691
+          "tokens": 580,
+          "model_tokens": 491
         },
         {
           "name": "wb_questions",
-          "tokens": 583
+          "tokens": 474,
+          "model_tokens": 380
         },
         {
           "name": "wb_reviews",
-          "tokens": 515
+          "tokens": 427,
+          "model_tokens": 331
         },
         {
           "name": "wb_root_info",
-          "tokens": 302
+          "tokens": 222,
+          "model_tokens": 131
         },
         {
           "name": "wb_search",
-          "tokens": 391
+          "tokens": 294,
+          "model_tokens": 231
         },
         {
           "name": "wb_seller",
-          "tokens": 387
+          "tokens": 302,
+          "model_tokens": 199
         },
         {
           "name": "yandex_card",
-          "tokens": 512
+          "tokens": 411,
+          "model_tokens": 270
         },
         {
           "name": "yandex_search",
-          "tokens": 664
+          "tokens": 562,
+          "model_tokens": 473
         }
       ]
     }

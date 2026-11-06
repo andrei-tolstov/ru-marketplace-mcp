@@ -22,16 +22,17 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 # START_MODULE_CONTRACT
 # PURPOSE: Expose Citilink product search and cards from rendered pages.
 # SCOPE: Read-only paced CDP reads; reject Qrator walls before mapping or caching.
-# DEPENDS: FastMCP; mcp_core DOM/CDP/cache/pacing; models_output; settings; shape_reference.
-# LINKS: M-CITILINK; M-COMPARE; M-MARKETPLACE; packages/citilink-connector/tests.
+# DEPENDS: FastMCP; mcp_core DOM/CDP/cache/pacing/kit; models_output; settings; shape_reference.
+# LINKS: M-CITILINK; M-KIT; M-COMPARE; M-MARKETPLACE; packages/citilink-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
-# _extract_product_id: Validate bare handles or product URLs before navigation.
+# _polite_wait: Delegate this source's pacing gap to mcp_core.kit.polite_wait.
+# _extract_product_id: Validate bare handles or citilink.ru product URLs before navigation (shared host check).
 # _search_item_from_tile: Normalize attached/current and old-price tile fields.
-# _cdp_render: Serialize paced browser navigation and extractor execution.
+# _cdp_render: Delegate paced browser navigation and extractor execution to mcp_core.kit.render_json.
 # _is_qrator_wall: Detect positive document-title or Qrator markup evidence.
 # _reject_qrator_wall: Invalidate cached walls and request operator browser action.
-# citilink_search: Validate rendered tiles before caching; allow nullable prices.
+# citilink_search: Validate rendered tiles before caching; allow nullable prices; warn when a required key vanishes.
 # citilink_card: Validate before caching; warn only on in-stock missing prices.
 # citilink_selfcheck: Report walls as inconclusive(blocked); not an MCP tool.
 # END_MODULE_MAP
@@ -40,13 +41,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import json
 import re
 import urllib.parse
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
@@ -58,12 +57,15 @@ from mcp_core.errors import (
     ToolError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import host_checked_id, polite_wait, render_json
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
-from mcp_core.transport.chrome_cdp import NavBlocked, open_page
+from mcp_core.resources import register_reference_resources
+from mcp_core.transport.chrome_cdp import NavBlocked
 from pydantic import Field
 
 from citilink_connector.models_output import (
@@ -78,7 +80,7 @@ from citilink_connector.shape_reference import SEARCH_REQUIRED_KEYS, SEARCH_SHAP
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://www.citilink.ru"
@@ -109,10 +111,10 @@ mcp = FastMCP(
         "Citilink electronics catalog: search and product cards. Every read "
         "runs in the operator's own Chrome over CDP — Qrator's proof-of-work "
         "blocks all anonymous access. Start with citilink_search; citilink_card takes a "
-        "product id or citilink.ru product URL."
+        "product id or citilink.ru product URL. "
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
     ),
 )
-mcp.add_middleware(RetryMiddleware())
 
 _cache: TTLCache = TTLCache(ttl_s=_settings.cache_ttl, max_entries=128)
 _pacer = Pacer(_min_gap)
@@ -123,9 +125,11 @@ async def _polite_wait() -> None:
     """Space this source's requests out, and back off if it refused us.
 
     Reads ``_min_gap`` at call time so an operator or a test can retune the
-    pace without rebuilding the pacer.
+    pace without rebuilding the pacer. The pacing itself is shared
+    (mcp_core.kit); this module-level name stays because the tools call it and
+    the tests patch it.
     """
-    await _pacer.wait(min_gap=_min_gap)
+    await polite_wait(_pacer, _min_gap)
 
 
 def _extract_product_id(raw: str) -> str | None:
@@ -134,27 +138,10 @@ def _extract_product_id(raw: str) -> str | None:
     Host-checked on purpose. The id is the only thing that survives this
     function, and the card URL is rebuilt from SITE_BASE, so a caller cannot
     smuggle ``/product/<id>`` into a path on someone else's domain and
-    steer the operator's logged-in Chrome there. Anything that is not
-    citilink.ru, or carries a scheme we do not navigate, returns None.
+    steer the operator's logged-in Chrome there. The check is the shared one
+    (mcp_core.kit.host_checked_id); this pattern and this host are ours.
     """
-    raw = raw.strip()
-    if not raw:
-        return None
-    if _BARE_ID_RE.fullmatch(raw):
-        return raw.lower()
-    parts = urllib.parse.urlsplit(raw)
-    if parts.scheme:
-        if parts.scheme not in ("http", "https"):
-            return None
-        host = (parts.hostname or "").rstrip(".").lower()
-        if host != "citilink.ru" and not host.endswith(".citilink.ru"):
-            return None
-        raw = parts.path
-    elif raw.startswith("//"):
-        # Scheme-relative: the authority is someone else's, so treat it as off-host.
-        return None
-    match = _PRODUCT_ID_RE.search(raw)
-    return match.group(1).lower() if match else None
+    return host_checked_id(raw, hosts=("citilink.ru",), path_re=_PRODUCT_ID_RE, bare_re=_BARE_ID_RE)
 
 
 _SEARCH_EXTRACT_TEMPLATE = """
@@ -314,17 +301,10 @@ async def _cdp_render(url: str, extract_js: str, wait_ms: int, ctx: Context | No
 
     The first navigation pays the proof-of-work (wait_ms is generous for that
     reason); later reads on the same session are fast. Serialized via _cdp_lock.
+    The mechanism is shared (mcp_core.kit.render_json); this module-level name
+    stays because the tools call it and the tests patch it.
     """
-    async with _cdp_lock:
-        await _polite_wait()
-        async with open_page(url, wait_ms=wait_ms) as page:
-            raw = await asyncio.wait_for(page.evaluate(extract_js), timeout=30.0)
-    if not isinstance(raw, str) or len(raw.encode()) > MAX_BODY_BYTES:
-        raise ToolError(TransportDownError("extracted page data missing or over the body cap"))
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise ToolError(ParserDriftError("page extractor returned a non-object payload"))
-    return data
+    return await render_json(url, extract_js, wait_ms, lock=_cdp_lock, wait=_polite_wait, max_body_bytes=MAX_BODY_BYTES)
 
 
 def _is_qrator_wall(data: dict[str, Any]) -> bool:
@@ -352,7 +332,7 @@ def _reject_qrator_wall(payload: dict[str, Any], url: str) -> None:
 @mcp.tool(
     name="citilink_search",
     annotations=ToolAnnotations(
-        title="Citilink Search", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+        title="Citilink Search", read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True
     ),
 )
 async def citilink_search(
@@ -361,18 +341,9 @@ async def citilink_search(
 ) -> CitilinkSearchResponse:
     """Search Citilink, rendered in the operator's Chrome.
 
-    ## Return Format
+    price_rub is None when the tile states no price — never 0.
 
-    CitilinkSearchResponse: {status, query, tier_used, count, items[], meta}.
-    price_rub is None when absent — never 0.
-
-    ## Error Format
-
-    ToolError: ChallengeRequiredError (challenge_required) on a detected Qrator
-    wall: open citilink.ru in the scraping-profile Chrome, pass the check, retry.
-    TransportDownError on CDP/navigation failures; ParserDriftError when a
-    rendered page yields zero product tiles without challenge evidence.
-    Only validated successful searches are cached; cached legacy walls are invalidated.
+    Full field list and error codes: `guide://citilink/citilink_search`.
     """
     log_event("citilink_search.start", query=query[:60])
     try:
@@ -401,9 +372,17 @@ async def citilink_search(
                 )
             )
         items = [_search_item_from_tile(it) for it in items_raw if isinstance(it, dict)]
-        warnings: list[str] = []
-        if all(it.price_rub is None for it in items):
-            warnings.append("no_prices_on_page")
+        warnings: list[str] = R.validate_items(
+            [it.model_dump() for it in items], require_title=True, absent_price="no_prices_on_page"
+        )
+        # The selfcheck compares this payload against the captured
+        # required-key registry; the tool's own answer now carries the same
+        # drift signal, so an agent does not need a human running doctor to
+        # learn the shape moved. Zero tiles raise before this point, so the
+        # key check never runs on a vacuously empty payload.
+        drift = R.shape_drift_warning(payload, ((key,) for key in SEARCH_REQUIRED_KEYS), source="citilink_search")
+        if drift:
+            warnings.append(drift)
         result = CitilinkSearchResponse(query=query, tier_used=tier, count=len(items), items=items)
         attached = R.attach_meta(result.model_dump(by_alias=True, exclude={"meta"}), warnings, source="citilink_search")
         result.meta = MetaOut(**attached["_meta"])
@@ -414,13 +393,17 @@ async def citilink_search(
         raise
     except Exception as exc:
         log_event("citilink_search.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"citilink_search failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"citilink_search failed: {exc}"))
 
 
 @mcp.tool(
     name="citilink_card",
     annotations=ToolAnnotations(
-        title="Citilink Product Card", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+        title="Citilink Product Card",
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def citilink_card(
@@ -436,19 +419,9 @@ async def citilink_card(
 ) -> CitilinkCardResponse:
     """Fetch one Citilink product card.
 
-    ## Return Format
+    price_rub and old_price_rub are None when the card states none — never 0.
 
-    CitilinkCardResponse: {status, product_id, title, price_rub, old_price_rub,
-    is_available, url, tier_used, meta}.
-
-    ## Error Format
-
-    ToolError: BadRequestError when the URL carries no product id;
-    ChallengeRequiredError (challenge_required) on a detected Qrator wall: open
-    citilink.ru in the scraping-profile Chrome, pass the check, then retry.
-    TransportDownError on CDP/navigation failures; ParserDriftError when a rendered
-    card has neither product title nor price without challenge evidence.
-    Only validated successful cards are cached; cached legacy walls are invalidated.
+    Full field list and error codes: `guide://citilink/citilink_card`.
     """
     log_event("citilink_card.start", input=product_url[:80])
     try:
@@ -499,9 +472,10 @@ async def citilink_card(
             url=url,
             tier_used=tier,
         )
-        attached = R.attach_meta(
-            result.model_dump(by_alias=True, exclude={"meta"}), card_warnings, source="citilink_card"
-        )
+        # The card's own fields, plus the buy-block warning above; the offer
+        # invariants report a price that parsed into something unparseable.
+        card = result.model_dump(by_alias=True, exclude={"meta"})
+        attached = R.attach_meta(card, [*R.validate_offer(card), *card_warnings], source="citilink_card")
         result.meta = MetaOut(**attached["_meta"])
         if tier == "cdp":
             _cache.set(url, payload)
@@ -510,7 +484,7 @@ async def citilink_card(
         raise
     except Exception as exc:
         log_event("citilink_card.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"citilink_card failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"citilink_card failed: {exc}"))
 
 
 # CLI-only drift canary: ``marketplace-mcp doctor`` imports and calls citilink_selfcheck()
@@ -544,7 +518,7 @@ async def citilink_selfcheck(ctx: Context | None = None) -> CitilinkSelfcheckRes
         raise
     except Exception as exc:
         log_event("citilink_selfcheck.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"citilink_selfcheck failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"citilink_selfcheck failed: {exc}"))
 
 
 async def _citilink_selfcheck_impl(ctx: Context | None) -> CitilinkSelfcheckResponse:
@@ -621,3 +595,8 @@ async def _citilink_selfcheck_impl(ctx: Context | None) -> CitilinkSelfcheckResp
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)

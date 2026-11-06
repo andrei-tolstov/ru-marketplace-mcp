@@ -5,6 +5,9 @@
 # reliable way to read their catalogs is from inside a real browser session. This
 # script launches a Chrome dedicated to that job.
 #
+# Your everyday Chrome can stay open: this starts a separate Chrome with its own
+# --user-data-dir, which Chrome allows next to another profile.
+#
 # SECURITY — the profile this creates is a scraping profile, not your browser:
 #   * CDP grants any local process full control of every session in the profile
 #     it is attached to. That is why this uses a SEPARATE user-data-dir.
@@ -17,6 +20,7 @@
 #   ./scripts/start_chrome_cdp.sh --port 9333
 #   ./scripts/start_chrome_cdp.sh --profile ~/my-scraping-profile
 #   ./scripts/start_chrome_cdp.sh --headless      # no display (detectable!)
+#   ./scripts/start_chrome_cdp.sh --hidden        # on macOS hide the app after launch
 #
 # Windows users: run scripts/start_chrome_cdp.ps1 instead.
 
@@ -24,6 +28,7 @@ set -euo pipefail
 
 PORT="${CHROME_CDP_PORT:-9222}"
 HEADLESS=0
+HIDDEN=0
 
 case "$(uname -s)" in
     Darwin) DEFAULT_PROFILE="$HOME/Library/Application Support/Chrome-Scraping" ;;
@@ -36,7 +41,8 @@ while [[ $# -gt 0 ]]; do
         --port)     PORT="$2"; shift 2 ;;
         --profile)  PROFILE="$2"; shift 2 ;;
         --headless) HEADLESS=1; shift ;;
-        -h|--help)  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --hidden)   HIDDEN=1; shift ;;
+        -h|--help)  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -73,8 +79,15 @@ CHROME="$(find_chrome)" || {
     exit 1
 }
 
-# Refuse to double-start: Chrome enforces user-data-dir exclusivity anyway, but a
-# clear message beats a silently exiting second process.
+# 1. A CDP endpoint that already answers means the browser is up: nothing to do.
+if curl -sf -m 1 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then
+    echo "Chrome with CDP is already running on port $PORT - nothing to start."
+    echo "To bring its window on-screen: marketplace-mcp browser show"
+    exit 0
+fi
+
+# A listener that does not answer as CDP would make Chrome's bind fail; say so
+# now instead of waiting 12 s for a port that never answers.
 if command -v ss >/dev/null 2>&1; then
     LISTENING="$(ss -ltn "sport = :$PORT" 2>/dev/null | grep -c LISTEN || true)"
 elif command -v lsof >/dev/null 2>&1; then
@@ -83,9 +96,17 @@ else
     LISTENING=0
 fi
 if [[ "${LISTENING:-0}" -gt 0 ]]; then
-    echo "CDP is already listening on 127.0.0.1:$PORT — nothing to do."
-    echo "Verify with: curl -s http://127.0.0.1:$PORT/json/version"
-    exit 0
+    echo "ERROR: port $PORT is taken by a process that does not answer as a CDP endpoint." >&2
+    echo "Free the port, or pass --port <another port>." >&2
+    exit 2
+fi
+
+# A Chrome that already holds THIS profile would refuse to start a second one
+# with the same --user-data-dir. Other Chrome windows are fine.
+if pgrep -f -- "--user-data-dir=${PROFILE}( |\$)" >/dev/null 2>&1; then
+    echo "ERROR: another Chrome is already using the profile $PROFILE." >&2
+    echo "Close that window (or choose another --profile) and re-run." >&2
+    exit 2
 fi
 
 mkdir -p "$PROFILE"
@@ -120,13 +141,13 @@ for _ in $(seq 1 30); do
     if curl -sf -m 1 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then
         echo
         echo "CDP is up. Verify with: curl -s http://127.0.0.1:$PORT/json/version"
-        # macOS: tuck the freshly opened window away (⌘H) so it does not sit on
-        # top of whatever you were doing. Connectors keep it hidden afterwards
-        # (CHROME_STEALTH=1, the default). Skip when the user opted out.
-        if [[ "$(uname -s)" == "Darwin" && "${CHROME_STEALTH:-1}" != "0" ]]; then
+        # macOS: only tuck the fresh window away (⌘H) when --hidden was asked
+        # for. The default launch is on-screen so a human can log in; the
+        # connector's own autostart still hides its window.
+        if [[ "$(uname -s)" == "Darwin" && "$HIDDEN" == "1" ]]; then
             sleep 1
             osascript -e "tell application \"System Events\" to set visible of (first process whose unix id is $CHROME_PID) to false" >/dev/null 2>&1 || true
-            echo "Window hidden (⌘H). Unhide it from the Dock when you need to log in; CHROME_STEALTH=0 disables this."
+            echo "Window hidden (⌘H) because of --hidden. Unhide it from the Dock when you need to log in."
         fi
         exit 0
     fi

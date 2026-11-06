@@ -143,14 +143,47 @@ async def test_search_percent_encodes_cyrillic_queries(monkeypatch):
     assert "%D1%81" in seen[-1]
 
 
-async def test_search_warns_on_empty_results(monkeypatch):
+async def test_search_reports_an_explicit_empty_result_as_healthy(monkeypatch):
+    """R04 (owner study 2026-11-02): the page's own "nothing found" banner.
+
+    The banner is the marketplace's answer, not a doubt about the data: the
+    empty result is healthy and the note is informational. A page that is
+    NEITHER products nor a banner is a different case and still raises
+    parser_drift (test_search_raises_drift_when_the_page_is_unrecognisable).
+
+    Renamed from test_search_warns_on_empty_results, which asserted the old
+    behaviour (healthy false for an honest empty answer).
+    """
     stub_html(monkeypatch, {"/search": load("search_empty.html")})
 
     result = await server.yandex_search(query="йцукенгшщз")
 
     assert result.returned == 0
-    assert result.meta.healthy is False
+    assert result.meta.healthy is True
     assert any("no_results" in w for w in result.meta.warnings)
+
+
+async def test_search_warns_when_an_in_stock_item_lost_its_price(monkeypatch):
+    """_zone_items reports in_stock from the payload's own isAvailable, so an
+    offer can be flagged in stock while every price node stopped matching.
+
+    validate_offer's `instock_no_price` invariant is the alarm for that
+    contradiction, and it only fires once the search path calls it: on the
+    pre-change yandex_search the warnings list stayed empty and meta.healthy
+    stayed true (audit 2026-11-01, item B).
+    """
+    stub_html(monkeypatch, {"/search": load("search_washer.html")})
+    parsed = ssr.parse_search(load("search_washer.html"))
+    priced = [item for item in parsed["items"] if item.get("price_rub") is not None]
+    for item in priced:
+        item["price_rub"] = None
+    monkeypatch.setattr(server.ssr, "parse_search", lambda html: parsed)
+
+    result = await server.yandex_search(query="стиральная машина")
+
+    assert result.returned == len(priced)
+    assert result.meta.healthy is False
+    assert any(w.startswith("instock_no_price") for w in result.meta.warnings), result.meta.warnings
 
 
 async def test_search_raises_drift_when_the_page_is_unrecognisable(monkeypatch):
@@ -457,6 +490,53 @@ async def test_fetch_html_caches_within_the_ttl(monkeypatch):
     assert len(calls) == 1
 
 
+async def test_a_challenge_page_is_never_cached(monkeypatch):
+    """R03 (owner study 2026-11-02): only verified content is cached.
+
+    The captcha page arrived as a successful HTTP answer and was cached like
+    any other page, so the NEXT tool call replayed the wall for the whole TTL
+    — even after upstream had started answering normally. The page is dropped
+    from the cache instead, and the next call reaches upstream again.
+    """
+    calls = 0
+
+    async def fake_get(client, url, **kwargs):
+        nonlocal calls
+        calls += 1
+        challenge = '<html><body><div id="SmartCaptcha"></div></body></html>'
+        return 200, (challenge if calls == 1 else load("search_washer.html"))
+
+    monkeypatch.setattr(server, "get_text_with_retries", fake_get)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.yandex_search(query="стиральная машина")
+    assert error_payload(excinfo.value)["error"] == "rate_limited"
+
+    result = await server.yandex_search(query="стиральная машина")
+
+    assert calls == 2, "the second call must reach upstream again, not replay the cached challenge"
+    assert result.returned == 3
+    assert result.items[0].price_rub == 16724.0
+
+
+async def test_a_normal_page_is_still_cached(monkeypatch):
+    """R03 positive control: verified content keeps its cache entry."""
+    calls = 0
+
+    async def fake_get(client, url, **kwargs):
+        nonlocal calls
+        calls += 1
+        return 200, load("search_washer.html")
+
+    monkeypatch.setattr(server, "get_text_with_retries", fake_get)
+
+    first = await server.yandex_search(query="стиральная машина")
+    second = await server.yandex_search(query="стиральная машина")
+
+    assert calls == 1
+    assert first.items[0].price_rub == second.items[0].price_rub == 16724.0
+
+
 async def test_fetch_html_rejects_an_empty_body(monkeypatch):
     async def fake_get(client, url, **kwargs):
         return 200, "   "
@@ -656,3 +736,88 @@ async def test_card_requests_the_card_path_not_the_retired_product_path(monkeypa
 def test_fallback_card_url_uses_the_card_path():
     assert ssr.card_url(42) == "https://market.yandex.ru/card/x/42"
     assert ssr.card_url(42, "stiralnaya-mashina") == "https://market.yandex.ru/card/stiralnaya-mashina/42"
+
+
+# START_BLOCK_PREPUBLICATION_CACHE_CONTENT
+
+
+def _id_only_ssr_search_page() -> str:
+    """Native search collections whose item identity survived value drift."""
+    collections = {
+        "visibleSearchResult": {"v": {"text": "prepub value drift", "total": 1}},
+        "productShowPlace": {"p": {"id": "p", "productId": 123456, "productSnippetId": "s"}},
+        "product": {"123456": {}},
+        "productSnippet": {"s": {}},
+    }
+    patch = {"widgets": {"w": {"/path": {"options": {"collections": collections}}}}}
+    return '<html><noframes data-apiary="patch">' + json.dumps(patch) + "</noframes></html>"
+
+
+@pytest.mark.parametrize("shape", ["id-only-collections", "renamed-capture-values"])
+async def test_value_drift_is_evicted_before_the_next_public_search(monkeypatch, shape):
+    """R-YANDEX-CACHE-CONTENT: rejected values cannot poison the query's TTL.
+
+    Prepublication requirement, 2026-11-03: an ID-bearing nonempty native SSR
+    page raises parser_drift when all titles/prices disappear, then the next
+    same-query public call fetches the recovered source. Only GET I/O is fake.
+    """
+    bad = _id_only_ssr_search_page() if shape == "id-only-collections" else _drifted_values_search_html()
+    parsed = ssr.parse_search(bad)
+    assert parsed["status"] == ssr.ParseStatus.OK
+    assert parsed["items"] and all(item["product_id"] for item in parsed["items"])
+    assert all(
+        not item["title"] and item["price_rub"] is None and item["price_with_plus"] is None for item in parsed["items"]
+    )
+    calls = []
+
+    async def native_get(client, url, **kwargs):
+        calls.append(url)
+        return 200, bad if len(calls) == 1 else load("search_washer.html")
+
+    monkeypatch.setattr(server, "get_text_with_retries", native_get)
+    with pytest.raises(ToolError) as excinfo:
+        await server.yandex_search(query="prepub value drift")
+    assert error_payload(excinfo.value)["error"] == "parser_drift"
+    assert "without any title or price" in str(excinfo.value)
+    assert len(calls) == 1
+
+    recovered = await server.yandex_search(query="prepub value drift")
+    assert len(calls) == 2, "value drift must be evicted, not replayed from the response cache"
+    assert calls[0] == calls[1]
+    assert recovered.returned == 3
+    assert recovered.items[0].price_rub == 16724.0
+    assert recovered.meta.healthy is True
+
+    cached = await server.yandex_search(query="prepub value drift")
+    assert len(calls) == 2, "the recovered, verified page must keep its normal cache hit"
+    assert cached.items == recovered.items
+
+
+@pytest.mark.parametrize(
+    "fixture,returned",
+    [("search_washer.html", 3), ("search_empty.html", 0)],
+    ids=["healthy-products", "explicit-empty"],
+)
+async def test_verified_search_content_keeps_public_cache_hits(monkeypatch, fixture, returned):
+    """R-YANDEX-CACHE-CONTENT/R-YANDEX-HONEST-EMPTY: both honest answers cache."""
+    calls = []
+
+    async def native_get(client, url, **kwargs):
+        calls.append(url)
+        return 200, load(fixture)
+
+    monkeypatch.setattr(server, "get_text_with_retries", native_get)
+    first = await server.yandex_search(query="prepub cache control")
+    second = await server.yandex_search(query="prepub cache control")
+
+    assert len(calls) == 1
+    assert first.returned == second.returned == returned
+    assert first.meta.healthy is second.meta.healthy is True
+    assert first.items == second.items
+    if returned:
+        assert first.items[0].price_rub == 16724.0
+    else:
+        assert any(w.startswith("info:no_results") for w in second.meta.warnings)
+
+
+# END_BLOCK_PREPUBLICATION_CACHE_CONTENT

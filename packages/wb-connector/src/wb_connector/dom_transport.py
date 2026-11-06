@@ -437,7 +437,8 @@ def parse_search_page(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], li
             "equal or a few % higher and shows only on the product page — verify leaders with wb_card)"
         )
     if items and all(item["price_rub"] is None for item in items):
-        warnings.append("wb_dom_search: no prices read from any tile — DOM shape may have moved")
+        warnings.append("no_prices_on_page: no price parsed from any tile — the tile price shape moved")
+
     return items, warnings
 
 
@@ -714,10 +715,15 @@ def _stop_blocked(url: str, probe: dict[str, Any]) -> None:
     if probe.get("captcha"):
         raise_tool_error(
             ChallengeRequiredError(
-                "WB is showing a captcha in the scraping-profile Chrome. Not retrying: the operator "
-                "decides whether to open wildberries.ru there and continue.",
+                "WB answered with a captcha in the scraping-profile Chrome; the page is not kept open. "
+                "Not retrying: the operator decides whether to open wildberries.ru there and continue.",
                 provider="wb",
                 challenge_type="captcha",
+                user_action=(
+                    "Have the operator open wildberries.ru in the scraping-profile Chrome and pass the "
+                    "captcha; run `marketplace-mcp browser show` if the window is off-screen. Then call "
+                    "this tool again after the user confirms the challenge is done."
+                ),
             )
         )
     raise_tool_error(

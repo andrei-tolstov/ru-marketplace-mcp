@@ -9,6 +9,1697 @@
 
 ## [Unreleased]
 
+## [2.8.2] - 2026-11-03
+
+### Fixed
+- AliExpress больше не игнорирует `ALI_TIMEOUT` при навигации поиска и стартовой
+  страницы карточки: вместо жёстких 20 секунд используется заданный положительный
+  конечный таймаут (по умолчанию 45 секунд). Общий `CHROME_NAV_TIMEOUT_MS` сохраняет
+  20 секунд для остальных источников и применяется к Playwright и raw CDP;
+  отправка raw `Page.navigate` входит в тот же дедлайн. Проверки страницы,
+  закрытие собственных вкладок и внешние лимиты инструментов сохранены (#190).
+- AliExpress search and card-landing navigation now honor `ALI_TIMEOUT` (45 seconds
+  by default) instead of a fixed 20-second limit. The shared `CHROME_NAV_TIMEOUT_MS`
+  keeps the 20-second default for other sources and applies to Playwright and raw
+  CDP, including raw navigation send in its deadline. Page checks, owned-tab cleanup
+  and outer tool limits remain unchanged (#190).
+
+## [2.8.1] - 2026-11-03
+
+### Fixed
+- Предпубликационное ревью: некорректное значение предпочтительной цены Яндекса
+  (включая bool/неконечное число/объект) больше не подменяется справочной ценой;
+  фатально испорченная выдача удаляется из кэша и следующий вызов может восстановиться.
+  Дедлайн raw-CDP охватывает отправку команды, doctor отвергает повреждённые под-проверки.
+- Удалены рекламные tracking-параметры из сохранённой фикстуры Lamoda с честным
+  обновлением sanitization/SHA-256; сама фикстура и её ценовые проверки сохранены.
+  Уточнён PyPI-путь bundle, сокращены устаревшие машинные дневники GRACE и Docker context.
+- Prepublication review: unusable preferred Yandex money no longer falls back to
+  a reference price; fatal value-drift pages are evicted so the next call can recover.
+  The raw-CDP deadline includes outbound send and doctor rejects malformed subchecks.
+  Captured Lamoda advertising query fields were sanitized with updated provenance;
+  regression data/prices remain, install metadata and stale operational notes are clarified.
+- Сравнение больше не отбрасывает основной товар из-за составного названия
+  комплектного аксессуара: «зарядное устройство», «кабель USB-C» или
+  «чехол силиконовый» перед «в комплекте», а также определения после явного
+  `with` / «в комплекте:». Разбор ограничен тремя известными словами на
+  вхождение; другой некомплектный аксессуар, б/у, пунктуация и связи «для/с»
+  не теряют смысл. Исходный минимум цены сохраняется.
+- Comparison no longer drops the main product because a bundled accessory has
+  a noun complement or modifier, such as a charging device, USB-C cable or
+  silicone case, including modifiers following an explicit bundle prefix.
+  Each occurrence admits at most three recognized words; separate accessories,
+  used conditions, punctuation and relationship clauses remain significant.
+  Raw cheapest and offer rows are unchanged.
+- MCP-гайды теперь совпадают с ответами инструментов: списки типизированных полей
+  строятся из моделей сериализации, включая реальные алиасы и обёртку `result`.
+  Описаны `cheapest_comparable`, проверка цены, пагинация отзывов Ozon, DOM-поля
+  WB и площади/типы Cian. Уточнены условные цены Wallet/Plus, неизвестные значения
+  и частичные ответы; челлендж AliExpress обозначен как `challenge_required`,
+  а метаданные — как `_meta` у самостоятельных карточек и `card.meta` у инспекторов.
+- MCP guides now match tool replies: typed field lists come from serialization
+  models, including actual aliases and the `result` envelope. They cover
+  `cheapest_comparable`, price verification, Ozon review pagination, WB DOM fields
+  and Cian areas/types. Wallet/Plus conditions, unknown values and partial replies
+  are explicit; AliExpress challenges use `challenge_required`, and metadata is
+  `_meta` on standalone aliased cards but `card.meta` in inspectors.
+
+- `marketplace-mcp doctor` больше не прячет поломку своей же проверки под «не удалось проверить». Упавшая selfcheck-обёртка, неизвестный статус, неизвестный источник и ошибка вызова теперь дают код 4 (жёсткий сбой), и ночной drift-алерт на нём краснеет. Код 2 по-прежнему означает признанную блокировку источника и тревоги не поднимает, дрейф остаётся кодом 1, а отказ live-бюджета показывается как `budget_refused`, а не как здоровье.
+- `marketplace-mcp doctor` no longer hides a broken check of its own behind "could not be judged". A crashed selfcheck wrapper, an unknown status, an unknown source and a usage error now exit 4 (hard failure), and the nightly drift alarm turns red on it. Exit 2 still means an acknowledged blocked source and raises no alarm, drift stays exit 1, and a live-budget refusal is shown as `budget_refused`, never as healthy.
+
+- Яндекс больше не выдаёт выдуманную цену. Строка вроде `1 999 2 999` — это два
+  числа, склеенные пробелом-разделителем тысяч, — раньше читалась как 19992999.0:
+  сумма, которой нет, ещё и выигрывала сравнение как самая дешёвая. Теперь все
+  денежные поля Яндекса читаются общим безопасным парсером, неоднозначная сумма
+  даёт `price_rub: null` и предупреждение `price_unparseable` с текстом, который
+  не удалось прочитать, а обычные группировки (`3 983`) и дробные цены
+  (`1 999,50`) остаются ценами. Так же читается и зачёркнутая цена до скидки
+  (`price_old_rub`, `price_before_discount_rub`): если её не удалось прочитать,
+  поле пустое, а предупреждение называет эту цену и её текст. Карточку с
+  нечитаемой обычной ценой Яндекс больше не называет карточкой только с ценой Plus.
+- Карточка Яндекса больше не выдаёт цену подписки за обычную цену. Обычная цена
+  (`price_rub`) берётся только из явно заданной regular-цены; карточка без неё
+  честно говорит, что обычная цена неизвестна (`price_rub: null` и
+  предупреждение `no_everyday_price`), вместо того чтобы одолжить сумму «с
+  Плюсом». `compare_verify_offer` такую карточку не подтверждает: сумма по
+  подписке не выдаётся за обычную цену, а дельта считается от явно заданной
+  regular-цены.
+- Страница с капчей больше не попадает в кэш. Ответ с HTTP 200, который оказался
+  челленджем (или страницей, которую парсер не понял), выбрасывается из кэша, и
+  следующий вызов инструмента снова идёт к Яндексу, а не повторяет стену до конца
+  срока жизни записи. Обычные страницы кэшируются как раньше.
+- Пустой результат Яндекса с явным баннером «ничего не найдено» — честный ответ,
+  а не проблема с данными. `meta.healthy` остаётся `true`, сравнение считает
+  источник ответившим и завершённым (`complete: true`, ноль предложений).
+  Пострадавшая пустая страница по-прежнему нездорова и оставляет сравнение
+  неполным; проверка дрейфа для страницы без баннера не отключена.
+- Сравнение больше не отбрасывает товар как аксессуар или б/у из-за случайной
+  подстроки в названии (`Suitcase`, `стеклокерамика`, `unused`). Маркеры читаются
+  по границам слов и фраз без учёта регистра; комплектный аксессуар и явно
+  отрицанное состояние (`не б/у`) не мешают товару стать `cheapest_comparable`.
+  Настоящие незапрошенные чехлы и б/у по-прежнему исключаются из этого выбора,
+  но остаются в общем списке предложений.
+- Ответ MCP для `wb_search` теперь совпадает с объявленной схемой: найденные
+  товары и `no_results` приходят в SDK-обёртке `result`, а типизированные отказы
+  остаются ошибками MCP. Компактер схем больше не выключает обёртку, поэтому
+  `tools/list` и `tools/call` не показывают разные формы ответа. Инструменты без
+  обёртки сохраняют прежнюю форму.
+
+- Yandex no longer quotes a made-up price. A string like `1 999 2 999` — two
+  numbers glued by the thousands-separator space — used to read as 19992999.0, a
+  sum nobody charges that also won comparisons as the cheapest offer. Every
+  Yandex money field is now read with the shared safe parser: an ambiguous
+  amount gives `price_rub: null` plus a `price_unparseable` warning naming the
+  text it could not read, while ordinary groupings (`3 983`) and fractional
+  prices (`1 999,50`) stay prices. The struck-through pre-discount price
+  (`price_old_rub`, `price_before_discount_rub`) is read the same way: when it
+  cannot be read, the field is null and the warning names that price and its
+  text. A card whose everyday price cannot be read is no longer called a
+  Plus-only card.
+- A Yandex card no longer passes the subscriber price off as the everyday one.
+  The everyday price (`price_rub`) comes from the explicit regular price only; a
+  card without one says the everyday price is unknown (`price_rub: null` and a
+  `no_everyday_price` warning) instead of borrowing the Plus amount.
+  `compare_verify_offer` refuses to certify such a card: a Plus amount is never
+  confirmed as the everyday price, and the delta is measured against the
+  explicit regular price.
+- A captcha page is no longer cached. An HTTP-200 answer that turned out to be a
+  challenge (or a page the parser could not read) is dropped from the cache, so
+  the next tool call reaches Yandex again instead of replaying the same wall for
+  the whole TTL. Normal pages are still cached.
+- An empty Yandex result with an explicit "nothing found" banner is an honest
+  answer, not a doubt about the data. `meta.healthy` stays `true`, and the
+  comparison counts the source as answered and complete (`complete: true`, zero
+  offers). A damaged empty answer stays unhealthy and leaves the comparison
+  incomplete; the drift check for a page without the banner is not weakened.
+- Comparison no longer drops a product as an accessory or used item because of
+  an accidental title substring (`Suitcase`, `стеклокерамика`, `unused`). Markers
+  now match word/phrase boundaries case-insensitively; a bundled accessory or an
+  explicitly negated condition (`не б/у`) does not disqualify the product from
+  `cheapest_comparable`. Genuine unrequested cases and used items still lose that
+  slot, but remain in the full offer list.
+- The MCP reply for `wb_search` now matches its advertised schema: found items
+  and `no_results` arrive in the SDK's `result` envelope, while typed refusals
+  remain MCP errors. Schema compaction no longer disables that envelope, so
+  `tools/list` and `tools/call` agree on the response shape. Tools without SDK
+  wrapping keep their existing shape.
+Транспорт и ошибки больше не теряют то, что знает оператор и агент: адрес
+websocket собирается одинаково для IPv4 и IPv6, команда CDP имеет абсолютный
+дедлайн, диагностика в успешном ответе вычищается, подсказки восстановления
+следуют за способом установки, а тип ошибки коннектора доходит до вызывающего
+вместе со своими полями. Данные и контракты тоже перестают вводить в
+заблуждение: счётчик отзывов не становится правдоподобным неверным числом,
+число выдачи равно числу возвращённых товаров, ограничения инструментов видны
+в его схеме, инвентарь источников учитывает настроенный режим, а обрезанные
+предупреждения сообщают, сколько их потеряно.
+
+The transport and the errors no longer lose what the operator and the agent
+need: the websocket URL is built the same way for IPv4 and IPv6, a CDP command
+has an absolute deadline, a diagnostic inside a success answer is scrubbed, the
+recovery hints follow the install mode, and a connector's error reaches the
+caller with its own fields. The data and the contracts no longer mislead
+either: a review counter is not a plausible-but-wrong number, the number of
+results equals the number of items returned, a tool's limits are visible in its
+schema, the source inventory follows the configured mode, and cut warnings say
+how many were lost.
+
+- «Сырой» CDP-фолбэк больше не строит невалидный адрес для IPv6: хост `::1`
+  даёт `ws://[::1]:9222/...`, а не `ws://::1:9222/...`, который вообще не
+  разбирается. Один сборщик netloc обслуживает и сокет браузера, и сокет
+  страницы; IPv4, `host.docker.internal`, обычное имя хоста и удалённый CDP
+  сохраняют прежний вид, и своя вкладка по-прежнему закрывается при любой
+  неудаче подключения и при отмене.
+- У команды CDP теперь абсолютный дедлайн, а не лимит ожидания ответа. Chrome
+  шлёт события всем подключённым клиентам, поэтому прежний таймаут, который
+  перезапускался на каждом чужом событии, превращал 80 мс в несколько минут:
+  поток посторонних событий больше не продлевает ожидание. Правило действует и
+  для команд подключения (`Target.createTarget`, `Page.enable`,
+  `Network.enable`, `Runtime.enable`), и для закрытия своей вкладки, а не
+  только для `evaluate`; ответы команд и события с URL фрейма по-прежнему
+  сопоставляются как раньше.
+- Диагностика внутри успешного ответа вычищается до того, как её сохранить или
+  вернуть. Причина пропуска источника в `marketplace_sources`, статус CDP и
+  окна браузера и подробность в отчёте doctor больше не выдают наружу текст
+  исключения с токеном или с учётными данными прокси — раньше лог это чистил, а
+  ответ нет. Класс исключения, имя источника и безопасная часть сообщения
+  остаются читаемыми: диагностика не теряется, секрет не утекает.
+- Подсказки восстановления следуют за способом установки. В checkout они
+  называют локальные `scripts/` и `docs/`, установленный пакет — консольную
+  команду, которую он действительно ставит, а запуск через `uvx` — закреплённый
+  релиз `uvx ru-marketplace-mcp@<версия>`. Ссылки в подсказках закреплены на
+  теге релиза и ведут на файлы именно этого релиза: пакет из PyPI больше не
+  отправляет оператора к файлу, которого в пакете нет.
+- Тип ошибки коннектора больше не теряется в общем обработчике. «Занято» (409)
+  и пауза `retry_after_s`, полный реестр удерживаемых страниц, истёкший
+  дедлайн и провайдер доходят до вызывающего — и через исходный инструмент, и
+  через сравнение источников. Неожиданная ошибка остаётся обычным
+  `transport_down`: без выдуманного кода и без утечки учётных данных.
+
+- The raw CDP fallback no longer builds an invalid URL for an IPv6 host: `::1`
+  now gives `ws://[::1]:9222/...` instead of `ws://::1:9222/...`, which cannot
+  be parsed at all. One netloc builder serves both the browser socket and the
+  page socket; IPv4, `host.docker.internal`, a plain host name and a remote CDP
+  endpoint keep the spelling they had, and the owned tab is still closed after
+  every attach failure and after a cancellation.
+- A CDP command now has an absolute deadline instead of an inactivity limit.
+  Chrome broadcasts its events to every attached client, so the old timeout,
+  which restarted on each foreign event, turned 80 ms into minutes: a stream of
+  unrelated events no longer extends the wait. The rule covers the attach
+  commands (`Target.createTarget`, `Page.enable`, `Network.enable`,
+  `Runtime.enable`) and the owned-target cleanup, not only `evaluate`; matching
+  responses and frame URL events still correlate exactly as before.
+- A diagnostic inside a success answer is scrubbed before it is stored or
+  returned. The reason a source was skipped in `marketplace_sources`, the CDP
+  and browser-window status answers and the doctor's per-source detail no
+  longer carry the text of an exception with a token or proxy credentials in it
+  — the log path scrubbed that text, the answer path did not. The exception
+  class, the source name and the harmless part of the message stay readable:
+  the diagnosis survives, the secret does not.
+- The recovery hints follow the install mode. In a checkout they name the local
+  `scripts/` and `docs/`; an installed package names the console script it
+  really ships, and a `uvx` run names the pinned `uvx ru-marketplace-mcp@<version>`
+  release. Every link a hint carries is pinned to the release's tag and points at
+  a file of that release, so the PyPI package no longer sends the operator after
+  a file it does not contain.
+- A connector's error type no longer gets lost in a generic handler. "Busy"
+  (409) with its `retry_after_s`, a full retained-page registry, a deadline and
+  the provider now reach the caller — both through the native source tool and
+  through the source comparison. An unexpected failure stays the ordinary
+  `transport_down`: no invented taxonomy, no leaked credentials.
+- Проверка wire-бюджета больше не пропускает бесконечные лимиты. Бюджет
+  baseline из `1e999` превращался в `inf`, проверка «положительное число» его
+  принимала, а дельта роста становилась `nan` — сравнение `nan > лимит` всегда
+  ложно, — поэтому гейт в режиме проверки пропускал инструмент, выросший
+  примерно на миллион токенов. Теперь любой бюджет, потолок и порог
+  (`--max-token-regression-percent`, `--max-latency-ms`, `--timeout`) читаются
+  как конечное число больше нуля: `bool`, `NaN`, `inf` и строка отвергаются с
+  понятным сообщением и кодом возврата 1, и проверяется весь файл baseline, а
+  не только профили текущего прогона. Обычный замер, явное создание baseline
+  и штатная проверка против `work/performance/wire-baseline.json` работают как
+  прежде.
+- The wire-budget check no longer accepts infinite limits. A baseline budget of
+  `1e999` became `inf`, the positive-number check accepted it, and the growth
+  delta became `nan` — `nan > limit` is always false — so check mode passed a
+  tool that had grown by about a million tokens. Every budget, ceiling and
+  threshold (`--max-token-regression-percent`, `--max-latency-ms`, `--timeout`)
+  is now read as a finite number above zero: a boolean, `NaN`, `inf` and a
+  string are refused with a clear message and exit code 1, and the whole
+  baseline file is checked, not only the profiles of the current run. The
+  ordinary measurement, the explicit baseline creation and the check against
+  the committed `work/performance/wire-baseline.json` keep working.
+- Гейт provenance теперь проверяет и полноту набора, а не только те пины,
+  которые сумел прочитать. Sidecar без `sha256`, с битым JSON или без парной
+  фикстуры — и фикстура без sidecar — раньше давали «checked 0: ok» и код 0.
+  Теперь каждый sidecar обязан разбираться, нести пригодный pin SHA-256 и
+  описывать ровно одну существующую фикстуру, а каждая фикстура в
+  `packages/*/tests/fixtures` — иметь свой sidecar; иначе проверка падает с
+  кодом 1. Открытые пробелы перечислены в датированном списке исключений с
+  причиной: восемь sidecar без pin («pin missing since capture» — происхождение
+  съёмки не выдумывается) и пять фикстур, которые не съёмки, а ручные модели
+  или сгенерированный снимок контракта. Исключение закрывает ровно один
+  дефект, а закрытое исключение сообщает о себе, чтобы его удалили. Корректные
+  31 pin остаются корректными при любых переводах строк.
+- The provenance gate now checks the completeness of the set, not only the pins
+  it could read. A sidecar without a `sha256`, a broken JSON, an orphan sidecar
+  and a fixture without a sidecar all used to give "checked 0: ok" and exit 0.
+  Now every sidecar must parse, carry a usable SHA-256 pin and describe exactly
+  one fixture that exists, and every fixture under `packages/*/tests/fixtures`
+  must have its own sidecar — otherwise the check fails with exit 1. The open
+  gaps are listed in a dated exception list with a reason: the eight sidecars
+  without a pin ("pin missing since capture" — no capture provenance is
+  invented) and the five fixtures that are hand-modelled or a generated
+  contract snapshot rather than captures. An exception covers one defect only,
+  and a resolved exception says so, so its entry can be deleted. The 31
+  correct pins stay correct under any line-ending convention.
+- Счётчик отзывов больше не превращается в правдоподобное неверное число.
+  Ozon отдаёт его текстом («1.2K отзывов»), и разбор склеивал все цифры подряд:
+  «1.2K отзывов» становилось двенадцатью — и ответ оставался здоровым. Теперь
+  метка отзывов отделяется, а число разбирается строго: «1 200 отзывов» и «1200»
+  дают 1200, а знак, диапазон, два числа и форма с множителем («1.2K») не
+  называют одного счётчика и дают пусто. Правило одно и то же для исходного
+  инструмента и для сравнения источников, поэтому счётчик не может быть
+  правильным с одной стороны и неверным с другой.
+- Число найденного в `ozon_search` теперь равно числу возвращённых товаров.
+  Страница из сорока плиток отвечала `count=40`, а `items` содержал первые
+  тридцать, и обрезка не была сказана вслух. Теперь `count` равен
+  `len(items)`, разобранное число приходит отдельным полем `parsed_count`, флаг
+  `truncated` и предупреждение называют обрезку, а проверка здоровья
+  смотрит ровно на те товары, которые получил агент. Полная короткая выдача
+  остаётся полной и здоровой.
+- Ограничения партий и закрытые перечисления переехали из описания в схему
+  инструмента. `wb_card` больше не принимает по объявленной схеме пустой
+  список, ноль или 101 идентификатор: границы партии, положительность
+  элементов и закрытые наборы значений (площадка MPStats, число комнат у
+  Cian) видны в `tools/list`, и такой вызов отвергается схемой до запроса к
+  сети. Серверные проверки и их понятные ошибки остались, а граничные
+  значения, которые схема принимает, по-прежнему выполняются.
+- Инвентарь источников теперь учитывает настроенный режим Wildberries.
+  При `WB_TRANSPORT=dom` (и при обычном режиме API с включённым откатом в DOM)
+  `marketplace_sources` больше не говорит, что браузер не нужен, — а именно
+  так выглядел инвентарь, когда `wb_search` уходил в CDP. Три вопроса
+  разделены: нужен ли браузер обязательно, может ли он понадобиться и какой
+  маршрут выбран сейчас; ответы следуют за настройками источника и не открывают
+  браузер.
+- Диагностические предупреждения больше не режутся молча. Двенадцать
+  предупреждений типизированного ответа источника приходили десятью — без
+  единого слова об обрезке, и предупреждение, объясняющее нездоровый ответ,
+  могло исчезнуть за информационными заметками. Список остаётся ограниченным,
+  но последняя запись называет число подавленных предупреждений — и в исходном
+  инструменте, и в сравнении источников; настоящие предупреждения
+  заполняют бюджет первыми, а вердикт о здоровье считается по полному списку.
+
+- A review counter no longer becomes a plausible-but-wrong number. Ozon renders
+  it as display text ("1.2K отзывов") and the parser used to glue every digit
+  together, so "1.2K отзывов" became twelve and the answer stayed healthy. The
+  review label is now split off and the number is parsed strictly: "1 200
+  отзывов" and "1200" give 1200, while a sign, a range, two numbers and a
+  magnitude form ("1.2K") name no single counter and give nothing. The rule is
+  the same for the native tool and for the source comparison, so a counter
+  cannot be right on one side and wrong on the other.
+- The number found by `ozon_search` is now the number of items returned. A page
+  of forty tiles answered `count=40` while `items` carried the first thirty,
+  and the cut was never said out loud. `count` now equals `len(items)`, the
+  parsed total arrives in its own `parsed_count` field, and a `truncated` flag
+  and a warning name the cut; the health check runs on exactly the items the
+  agent receives. A complete short answer stays complete and healthy.
+- Batch limits and closed enumerations moved from prose into the tool schema.
+  `wb_card` no longer accepts an empty list, a zero or 101 ids as its declared
+  schema: the batch bounds, the positivity of the items and the closed value
+  sets (the MPStats marketplace, the Cian room counts) are visible in
+  `tools/list`, and such a call is refused by the schema before any request
+  goes out. The server-side checks and their clear errors stay, and the
+  boundary values the schema accepts still run.
+- The source inventory now follows the configured Wildberries mode. With
+  `WB_TRANSPORT=dom` — and in the ordinary API mode with the DOM fallback on —
+  `marketplace_sources` no longer claims that no browser is involved, which is
+  exactly what it used to say while `wb_search` went through CDP. Three
+  questions are separated: is the browser unavoidable, may it be used, and
+  which route is taken now; the answers follow the source's own settings and
+  open no browser.
+- Diagnostic warnings are no longer cut silently. Twelve warnings of a typed
+  source reply arrived as ten, without a word about the cut, and a warning that
+  explains an unhealthy answer could disappear behind informational notes. The
+  list stays bounded, but the last entry names the number of suppressed
+  warnings — in the native tool and in the source comparison — real warnings
+  fill the budget first, and the health verdict is computed from the full list.
+
+## [2.8.0] - 2026-11-01
+
+Честные ответы агенту: одно значение `healthy`, отказы и проверки — типизированные ошибки с подсказкой, что делать, условные цены и другие размеры не выигрывают сравнение, неоднозначный текст цены даёт `null`; дрейф виден в предупреждениях инструментов; новый `marketplace_health`; справочник инструментов в MCP-ресурсах; секреты вычищаются из ошибок и логов.
+
+Honest answers for the agent: one meaning of `healthy`, refusals and challenges as typed errors with a next step, conditional prices and other sizes never win a comparison, ambiguous price text becomes `null`; drift shows in the tools' own warnings; a new `marketplace_health`; the tool reference moves into MCP resources; secrets are redacted in errors and logs.
+
+### Added
+
+- Справочная половина описаний инструментов переехала из `tools/list` в MCP
+  resources: у каждого инструмента есть ресурс `guide://<источник>/<инструмент>`
+  с его секциями `## Return Format` и `## Error Format` — тем же текстом, слово
+  в слово, — а общий справочник кодов (`marketplace://errors`) собирается из
+  `ErrorCode` и классов ошибок, а не переписывается руками. Описание инструмента
+  оставляет ядро (что инструмент отвечает и инварианты, влияющие на решение) и
+  одну строку со ссылкой на свой гайд, поэтому половинки не могут разойтись.
+  Профиль, монтирующий коннекторы, отдаёт каждый гайд один раз и
+  `marketplace://errors` ровно один раз: `mcp_core.resources.mount_child` прячет
+  копию дочернего сервера в листинге родителя, не отбирая её у самого
+  коннектора, — иначе импорт объединённого сервера ломал бы отдельный
+  `wb-mcp` в том же процессе. Это смена канала по требованию владельца, а не
+  ослабление: `test_tool_docstring_sections.py` теперь требует ядро и парный
+  ресурс вместо обеих секций в докстринге.
+- Ядро описания сохранило не только первый абзац, но и инварианты, меняющие
+  решение агента: отсутствующее значение — `null`, а не `0` (`price_rub`,
+  `price_cny`, остатки MPStats); пустая выдача, неполный результат и
+  неизвестный SKU — не ошибка, а здоровый ответ или `partial=True`; цена по
+  подписке не участвует в ранжировании; `price_unit` у Cian говорит, что
+  значит сумма; карточка Taobao не читает Tmall; для снимка страницы нужно
+  владение handoff. Формулировки сжаты до одной строки перед ссылкой на гайд,
+  сам гайд по-прежнему несёт исходный текст слово в слово.
+- `scripts/mcp_wire.py` меряет всю цену профиля, а не только `tools/list`:
+  читает `instructions` из ответа на `initialize`, пишет рядом с `wire_tokens`
+  поле `instructions_tokens` и печатает обе величины и их сумму. Там же —
+  абсолютный потолок профиля из `ceilings` в `work/performance/wire-baseline.json`
+  (сумма инструментов и instructions): относительный гейт видит только рост
+  относительно baseline, который обновляют руками. В режиме проверки отсутствие
+  положительного потолка у проверяемого профиля — отказ, как и отсутствие
+  baseline или бюджета; `--update-baseline` записывает потолок новому профилю
+  (+5 % к замеру) и не трогает уже выставленный, потому что поднять потолок —
+  решение, а не побочный эффект замера.
+- The reference half of tool descriptions moved out of `tools/list` into MCP
+  resources: every tool has a `guide://<source>/<tool>` resource holding its
+  `## Return Format` and `## Error Format` sections — the same text, word for
+  word — and one shared error-code reference (`marketplace://errors`) is built
+  from `ErrorCode` and the connector error classes instead of being copied by
+  hand. The description keeps the core (what the tool answers and the invariants
+  that change the decision) plus one line naming its guide, so the two halves
+  cannot drift apart. A profile that mounts connectors serves each guide once and
+  `marketplace://errors` exactly once: `mcp_core.resources.mount_child` hides a
+  child's copy from the parent's listing without taking it away from the
+  connector, because deleting it made importing the unified server break a
+  standalone `wb-mcp` in the same process. A channel change by the owner's
+  order, not a weakening: `test_tool_docstring_sections.py` now requires the
+  core plus the paired resource instead of both sections in the docstring.
+- The core kept more than the first paragraph: the invariants that change what
+  the agent concludes stay in the description, compressed to one line before the
+  guide pointer — a missing value is `null`, never `0` (`price_rub`,
+  `price_cny`, MPStats stock); an empty, partial or unknown-SKU result is not an
+  error but a healthy response or `partial=True`; a subscription price never
+  ranks; Cian's `price_unit` says what the amount means; a Taobao card cannot
+  read a Tmall listing; a page snapshot needs ownership of the handoff. The
+  guide still carries the original text word for word.
+- `scripts/mcp_wire.py` measures a profile's whole cost, not only `tools/list`:
+  it reads `instructions` from the initialize result, records
+  `instructions_tokens` beside `wire_tokens`, and prints both plus their sum. It
+  also checks an absolute per-profile ceiling from `ceilings` in
+  `work/performance/wire-baseline.json` (tools plus instructions), because the
+  relative gate only sees growth against a baseline that is updated by hand. In
+  check mode a checked profile without a positive ceiling fails, like a missing
+  baseline or budget; `--update-baseline` records a ceiling for a new profile
+  (5% above the measurement) and leaves one already written alone, since raising
+  a ceiling is a decision rather than a side effect of measuring.
+
+- Дрейф структуры страницы виден в самом ответе инструмента: коннекторы, у
+  которых есть реестр обязательных семейств ключей (avito, lamoda, taobao,
+  citilink, dns), сверяют разобранный payload с этим реестром в общем
+  хелпере `mcp_core.resilience.shape_drift_warning`, и потеря целого семейства
+  даёт одно компактное предупреждение на вызов —
+  `shape_drift: <источник>: missing <семейство>` — в существующем
+  `meta.warnings` ответа (healthy становится false). Без новых сетевых
+  запросов: полный payload оплачивает только само сравнение. Поведение CLI
+  doctor не изменилось; yandex не покрыт — его парсер выдаёт все ключи
+  безусловно, и его shape_reference прямо говорит, что охрана по наличию
+  ключей там никогда не сработала бы.
+
+- Parser drift is now visible in the tool's own response: the connectors
+  that ship a required-key-family registry (avito, lamoda, taobao, citilink,
+  dns) compare the parsed payload against it through the shared
+  `mcp_core.resilience.shape_drift_warning`, and a whole family vanishing
+  adds one compact warning per call — `shape_drift: <source>: missing
+  <family>` — to the response's existing `meta.warnings` (healthy flips to
+  false). No extra network requests: a complete payload costs only the
+  comparison itself. CLI doctor behaviour is unchanged; yandex is not
+  covered — its parser emits every item key unconditionally, and its
+  shape_reference says outright that a key-presence guard would never fire
+  there.
+
+- Structural drift is now visible in six more tool responses: aliexpress,
+  cian, detmir, megamarket, ozon and wb gained a `shape_reference` — the
+  shape fingerprint of their search output (and card, where a captured
+  fixture exists), measured by the real parser over the fixture — plus the
+  same `shape_drift: <source>: missing <family>` warning through the shared
+  `mcp_core.resilience.shape_drift_warning`. Where the parser emits every
+  parsed key unconditionally (cian, detmir, megamarket, wb), the check runs
+  on the raw envelope, against the alias families the parser binds through;
+  ozon guards the one conditionally-emitted parser-critical key, the tile
+  url (losing `action.link` silently strips navigation from every result).
+  Their selfcheck canaries use the same registry. Yandex remains uncovered
+  — its shape_reference documents why a key-presence guard would never fire
+  there.
+
+- Дрейф структуры виден в самом ответе ещё у шести коннекторов: aliexpress,
+  cian, detmir, megamarket, ozon и wb получили свой `shape_reference` —
+  отпечаток формы выдачи (и карточки, где есть захваченный фиксстур),
+  измеренный настоящим парсером по фиксстуре, — и то же предупреждение
+  `shape_drift: <источник>: missing <семейство>` через общий
+  `mcp_core.resilience.shape_drift_warning`. Там, где парсер выдаёт все
+  ключи безусловно (cian, detmir, megamarket, wb), проверка идёт по сырому
+  конверту, по тем alias-семействам, через которые парсер биндится; у ozon
+  охраняется единственный условно излучаемый критичный ключ — url тайла
+  (без `action.link` каждый результат молча теряет навигацию). Их
+  selfcheck-канарейки используют тот же реестр. Yandex по-прежнему не
+  покрыт — его shape_reference объясняет, почему охрана по наличию ключей
+  там никогда не сработала бы.
+
+- У агента появился один read-only взгляд на транспорт: `marketplace_health`
+  отвечает, жив ли Chrome на настроенном CDP-адресе (версия браузера и число
+  вкладок, если отвечает), какие хосты остывают в брейкере и сколько ждать,
+  какие челлендж-вкладки удержаны, и какую страницу открыть человеку, чтобы
+  разблокировать каждый смонтированный источник, — по тем же статическим
+  таблицам, которыми пользуется CLI. Инструмент ничего не тратит: не
+  запускает Chrome, не создаёт и не закрывает вкладки, не ходит на площадки;
+  он только читает `/json/version` и `/json/list` с таймаутом около двух
+  секунд, а сломанная часть попадает в ответ (`cdp.reachable=false` рядом с
+  `error`), а не в исключение. `budget_snapshot()` и `handoff_diagnostics()`
+  перестали быть тестовым API: их видит агент (у удержанной вкладки — только
+  имя папки профиля, без пути с именем пользователя ОС, и URL без query и
+  фрагмента). У `marketplace_sources`
+  появилось аддитивное поле `needs_cdp` — отсортированный список
+  смонтированных источников, которые могут читаться через Chrome; полный
+  список полей обоих инструментов лежит в их гайдах, докстринги не выросли.
+
+- The agent gets one read-only transport-health view: `marketplace_health`
+  answers whether Chrome is alive on the configured CDP address (browser
+  version and page-target count when it is), which hosts sit in breaker
+  cooldown and for how long, which challenge pages are retained, and which page
+  a human opens to unblock each mounted source — from the same static tables
+  the CLI uses. The tool spends nothing: it starts no Chrome, opens and closes
+  no tab, and never calls a marketplace; it only reads `/json/version` and
+  `/json/list` with a timeout of about two seconds, and a broken part lands in
+  the answer (`cdp.reachable=false` beside `error`) instead of an exception.
+  `budget_snapshot()` and `handoff_diagnostics()` are no longer test-only API:
+  the agent sees them (a retained lease shows only the profile folder name, not
+  the path with the OS user name, and its URL without query or fragment). `marketplace_sources` gained the additive `needs_cdp`
+  field — the sorted mounted sources that can be read through Chrome. The full
+  field lists of both tools live in their guides, so the docstrings did not
+  grow.
+- У проекта появился один реестр источников — `mcp_core.sources`: каноническое
+  имя и алиасы, пакет, модуль, консольный скрипт, префикс инструментов, имя в
+  таблице монтирования, ключ в конфиге клиента, selfcheck, карточный инструмент,
+  число инструментов, уровень доступа, CDP и логин, валюта, текстовый поиск,
+  страница разблокировки, признаки «стена — это логин» и «умеет diagnose_drift»,
+  гейт монтирования и строка-подсказка для конфига. Из него выведены
+  `KNOWN_SOURCES` и алиасы, таблица возможностей, таблицы CLI (конфиг и
+  selfcheck), карта страниц `unblock`, список источников сравнения с карточными
+  инструментами и валютной развилкой, счётчики инструментов в stdio-проверке и
+  обе таблицы CI. Точки, которые не могут импортировать Python (`pyproject.toml`,
+  `server.json`, а также литералы `mounts`, `SEARCHABLE` и таблиц
+  `scripts/diagnose_drift.py`, которые разбирают существующие тесты), остались
+  литералами, но новый тест сверяет каждую с реестром: пакет без записи и запись
+  без пакета теперь падают. Одиннадцатый источник стоит одной записи, а не
+  пятнадцати правок в пятнадцати местах. Первая же сверка нашла потерянную
+  строку: в `server.json` не было cian.
+- Общая сборка коннекторов переехала в `mcp_core.kit` и лежит там по одному
+  разу: вызов пейсинга, хвост ошибки отказа (подсказка пейсера плюс обрезанная
+  деталь), проверка хоста при разборе id товара, потоковое чтение с лимитом тела
+  и отрисовка страницы через CDP с разбором JSON. `chrome_cdp` импортируется
+  внутри `render_json`, а `curl_cffi` в mcp-core вообще не попадает: коннектор
+  передаёт свою точку входа сам, поэтому тест, патчащий `cffi.get` в своём
+  модуле, бьёт по тому же шву, что и раньше. Миграция не меняет ни поведение, ни
+  провод: у каждого коннектора остаётся своя обёртка с тем же именем, которое
+  патчат его тесты, а имена инструментов, докстринги, параметры, коды ошибок и
+  тексты сообщений не тронуты. dns и citilink, которые совпадали почти целиком,
+  делят общую часть и оставляют у себя только факты о своей площадке.
+
+- One registry of sources now lives in `mcp_core.sources`: canonical name and
+  aliases, package, module, console script, tool prefix, unified mount name,
+  per-source client config key, selfcheck, card tool, tool count, access tier,
+  CDP and login needs, currency, text search, unblock page, the login-wall and
+  drift-probe flags, the mount gate and the config note. Derived from it:
+  `KNOWN_SOURCES` and the aliases, the capability table, the CLI tables (config
+  and selfcheck), the `unblock` page map, compare's source list with its card
+  tools and foreign-currency split, the stdio check's tool counts and both CI
+  tables. The sites that cannot import Python (`pyproject.toml`, `server.json`,
+  and the `mounts`, `SEARCHABLE` and `scripts/diagnose_drift.py` literals
+  existing tests parse) stay literal, but a new parity test ties each of them to
+  the registry: a package without a record, or a record without a package, now
+  fails. A sixth source costs one record instead of fifteen edits in fifteen
+  places. The first comparison found a missing row: `server.json` had no cian
+  entry.
+- The shared connector assembly moved into `mcp_core.kit`, once: the pacing
+  call, the refusal-error tail (the pacer's rotation hint plus a bounded
+  detail), the host check when parsing a product id, the streamed read with its
+  body cap, and the paced CDP render-and-parse. `chrome_cdp` is imported inside
+  `render_json`, and curl_cffi never enters mcp-core at all: the connector
+  passes its own entry point, so a test that patches `cffi.get` on its module
+  still hits the seam it always did. The migration changes no behaviour and no
+  wire bytes: every connector keeps its own wrapper under the name its tests
+  patch, and tool names, docstrings, parameters, error codes and message texts
+  are untouched. dns and citilink, which matched almost completely, share the
+  mechanism and keep only their own site facts.
+
+- `scripts/mcp_wire.py` теперь меряет и то, что платит модель, а не только весь
+  `tools/list`: рядом с `wire_tokens` появилась величина `model_tokens` — оценка
+  компактного `{"name", "description", "input_schema"}`, который запрос к
+  провайдеру действительно несёт (у каждого инструмента и по профилю в
+  `work/performance/wire-baseline.json`), тогда как `outputSchema`, аннотации и
+  `_meta` остаются в клиенте. Поэтому рост описания за счёт сжатия схемы вывода
+  больше не проходит гейт: относительная проверка
+  `--max-token-regression-percent` считается по обеим величинам, каждая против
+  своего значения в baseline, и падение называет виновника
+  (`model_tokens_regression`). Baseline без `model_tokens` в режиме проверки
+  падает так же, как без `wire_tokens`, а в режиме замера читается по-прежнему
+  мягко. `--update-baseline` пишет обе величины сам, вручную файл править не
+  нужно.
+- `scripts/mcp_wire.py` now measures what the model pays too, not only the whole
+  `tools/list`: beside `wire_tokens` it records `model_tokens`, the estimate of
+  the compact `{"name", "description", "input_schema"}` a provider request
+  really carries (per tool and per profile in
+  `work/performance/wire-baseline.json`), while `outputSchema`, annotations and
+  `_meta` stay in the client. A description growing behind a shrinking output
+  schema therefore no longer passes the gate: the relative
+  `--max-token-regression-percent` check applies to both measures, each against
+  its own baseline value, and a failure names which one regressed
+  (`model_tokens_regression`). A baseline without `model_tokens` fails in check
+  mode exactly like one without `wire_tokens` and keeps the permissive reading
+  in a measurement run. `--update-baseline` writes both measures itself, so the
+  file needs no hand edit.
+
+### Changed
+
+- Публикация на PyPI включена: владелец настроил издателя 31 октября, и v2.7.0
+  вышла на PyPI ручным запуском на своём теге. README и `docs/QUICKSTART.md`
+  показывают установку без checkout (`uvx ru-marketplace-mcp setup`),
+  `docs/DEPLOYMENT.md` и чеклист релиза описывают публикацию как включённую, а
+  проверка после публикации смотрит страницу PyPI и
+  `uvx ru-marketplace-mcp@X.Y.Z setup --dry-run`.
+- Заметки к релизу v2.7.0 переписаны короче; подробности проверок остались в #152.
+- Ошибка `challenge_required` стала честной для агента: флаг `retryable` остаётся
+  `true` по документированному контракту, но добавлены `retryable_now=false`
+  (сейчас повтор не поможет), `user_action` с настоящей командой
+  `marketplace-mcp unblock <source>` или удержанной вкладкой и
+  `retry_when=after_user_confirmation`. Сообщения Taobao, Lamoda и WB больше не
+  обещают видимую вкладку, когда `CHROME_CHALLENGE_HANDOFF_S` её не удерживает, а
+  WB называет свою ручную команду, потому что `marketplace-mcp unblock` его не
+  покрывает.
+- Открытый breaker хоста в бюджете CDP-навигации теперь доходит до агента как
+  временный отказ, а не как общий транспортный сбой: `open_page` переводит
+  `HostRefusingError` в существующий код `rate_limited` (`retryable=true` по
+  документации), несёт остаток паузы в поле `retry_after_s`, хост — в `provider`,
+  а сообщение говорит «paused for N s after M refusals». Раньше ни один коннектор
+  не ловил это исключение: широкие обработчики превращали его в `transport_down`
+  без паузы, а Avito проглатывал в `except Exception`, и агент повторял сразу
+  вместо ожидания. Отображение одно и общее — в `open_page`; широкие обработчики
+  на CDP-пути (Avito, Cian, Ozon) просто пропускают готовый `ToolError` дальше.
+- Пауза хоста больше не проглатывается деградирующими обработчиками Megamarket.
+  Адресная привязка, каталог-редирект и url/parse намеренно не фатальны для
+  обычных сбоев эндпоинтов (слабый поиск лучше никакого, и это закреплено
+  тестами), но временный отказ `rate_limited` с `retry_after_s` теперь проходит
+  сквозь них как есть. Раньше обработчик адресной привязки проглатывал паузу и
+  навсегда кэшировал вердикт «адрес не разрешён», из-за чего поиск и после паузы
+  шёл без адреса доставки. Ошибки без паузы (например, «не авторизован» из
+  профиля) сохраняют прежнее не фатальное поведение; путь карточки и раньше
+  доносил паузу без искажений и не менялся. Для уже существующих защит Cian и
+  Ozon добавлены отдельные офлайн-тесты (поиск и карточка), для Megamarket —
+  тесты поиска и карточки.
+- Унифицированный сервер (`marketplace-mcp`) больше не монтирует инструменты
+  `mpstats_*`, когда в окружении нет непустого `MPSTATS_MP_AUTH`: каждый вызов
+  всё равно вернул бы `auth_missing`, а две схемы стоили около 971 токена
+  (≈6 % профиля) на каждом запросе. Источник попадает в `skipped` с причиной
+  «токен не задан», `doctor` по-прежнему показывает его выключенным, а
+  отдельный `mpstats-mcp` сохраняет прежнее поведение и отвечает `auth_missing`.
+
+- PyPI publishing is on: the owner set up the publisher on 31 October, and v2.7.0
+  went out to PyPI by a manual run on its tag. README and `docs/QUICKSTART.md`
+  show the install without a checkout (`uvx ru-marketplace-mcp setup`);
+  `docs/DEPLOYMENT.md` and the release checklist describe publishing as on, and
+  the after-publication step checks the PyPI page and
+  `uvx ru-marketplace-mcp@X.Y.Z setup --dry-run`.
+- The v2.7.0 release notes are rewritten shorter; the check details stay in #152.
+- The `challenge_required` error contract is now honest for the agent: `retryable`
+  stays `true` per the documented contract and the body gains `retryable_now=false`
+  (a plain retry now cannot pass), `user_action` naming the real
+  `marketplace-mcp unblock <source>` command or the retained tab, and
+  `retry_when=after_user_confirmation`. Taobao, Lamoda and WB messages no longer
+  promise a visible tab when `CHROME_CHALLENGE_HANDOFF_S` keeps none, and WB names
+  its own manual step because `marketplace-mcp unblock` does not cover it.
+- An open host breaker in the CDP navigation budget now reaches the agent as a
+  temporary refusal instead of a generic transport failure: `open_page` maps
+  `HostRefusingError` to the existing `rate_limited` code (`retryable=true` as
+  documented), carries the remaining pause in `retry_after_s`, the host in
+  `provider`, and says "paused for N s after M refusals" in the message. No
+  connector caught the exception before: broad handlers relabelled it
+  `transport_down` with no pause, and Avito swallowed it in an `except Exception`,
+  so the agent retried at once instead of waiting. The mapping is one shared
+  place — `open_page`; the broad handlers on the CDP path (Avito, Cian, Ozon)
+  just let the finished `ToolError` through.
+- Megamarket's degrade handlers no longer swallow the host pause. Address
+  resolution, the catalog redirect and url/parse are deliberately non-fatal for
+  ordinary endpoint failures (a weaker search beats none, and tests pin that),
+  but a `rate_limited` refusal with `retry_after_s` now passes through them
+  unchanged. Before, the address handler swallowed the pause and cached a
+  "no address" verdict for the process lifetime, so searches kept running
+  addressless even after the cooldown. Non-pause errors (say, "not
+  authenticated" from the profile endpoint) keep the existing non-fatal
+  degrade; the card path already carried the pause intact and is unchanged.
+  The existing Cian and Ozon guards gained dedicated offline tests (search and
+  card each), and Megamarket got search and card tests.
+- The unified server (`marketplace-mcp`) no longer mounts the `mpstats_*` tools
+  when no non-empty `MPSTATS_MP_AUTH` is set: every call would return
+  `auth_missing`, while the two schemas cost about 971 tokens (~6% of the
+  profile) on every request. The source is reported in `skipped` with a
+  missing-token reason, `doctor` still shows it as off, and the standalone
+  `mpstats-mcp` keeps its behaviour and answers `auth_missing`.
+
+### Security
+
+- Секреты вычищаются на выходе самими функциями, а не только там, где автор
+  вызова вспомнил про `_redact`: `log_event` прогоняет через правила `redact.py`
+  имя события и все строки в полях, включая вложенные в списки и словари, а
+  `raise_tool_error` — сообщение и строковые поля ToolError. Явные вызовы
+  `_redact` остались и безвредны, потому что повторная чистка ничего не меняет;
+  нестроковые значения не трогаются. Новых правил нет: формы токена, куки и
+  учётных данных в URL те же.
+
+- Значения секретных переменных окружения вычищаются целиком: правила
+  `redact.py` теперь заменяют и точные текущие значения `MPSTATS_MP_AUTH` и
+  `MCP_HTTP_AUTH_TOKEN` (реестр имён — в mcp-core), даже когда значение не
+  похоже ни на одну известную форму. Значения читаются в момент чистки, а не
+  при импорте; пустые и короче 6 символов игнорируются, а из двух
+  пересекающихся значений сначала заменяется более длинное. Замена идемпотентна.
+  Прокси-переменные не тронуты: их учётные данные закрывает прежнее правило
+  для URL, а хост остаётся читаемым намеренно.
+
+- `avito_card` открывает страницы в залогиненном Chrome оператора, поэтому
+  полный URL принимается только с путём страницы объявления — `/<id>`,
+  `/<slug>_<id>` или `/<город>/<категория>/<slug>_<id>` — и открывается ровно
+  этот путь, без query и фрагмента. Путь вида `/<город>/<категория>/…` с
+  первым сегментом из служебных маршрутов Avito (`api`, `profile`, `account` и
+  т. п.) тоже отклоняется. Раньше путь из входного URL сохранялся
+  целиком, и путь с «хвостом» идентификатора после личного префикса (например,
+  `/profile/x_1234567890`) уходил в браузер оператора. Теперь любой другой
+  путь (`/profile`, `/account`, `/orders`, `/favorites`, `/api/...`, путь
+  после идентификатора) отклоняется как `bad_request` до навигации.
+
+- Secrets are scrubbed on the way out by the functions themselves, not only where
+  a caller remembered `_redact`: `log_event` runs the `redact.py` rules over the
+  event name and every string in its fields, including strings nested in lists and
+  dicts, and `raise_tool_error` does the same for the message and string fields of
+  the ToolError. The explicit `_redact` calls stay and are harmless because a
+  second pass changes nothing; non-string values are left alone. No new rules:
+  the token, cookie and URL-credential shapes are unchanged.
+
+- Secret environment-variable values are scrubbed whole: the `redact.py` rules
+  now also replace the exact current values of `MPSTATS_MP_AUTH` and
+  `MCP_HTTP_AUTH_TOKEN` (the name registry lives in mcp-core), even when the
+  value matches no known shape. Values are read at redaction time, not import
+  time; empty and shorter-than-6 values are ignored, and of two overlapping
+  values the longer one is replaced first. The replacement is idempotent.
+  Proxy variables are untouched: their credentials are covered by the existing
+  URL rule and the host is deliberately kept readable.
+- `avito_card` открывает страницы в залогиненном Chrome оператора, поэтому
+  полный URL принимается только с путём страницы объявления — `/<id>`,
+  `/<slug>_<id>` или `/<город>/<категория>/<slug>_<id>` — и открывается ровно
+  этот путь, без query и фрагмента. Путь вида `/<город>/<категория>/…` с
+  первым сегментом из служебных маршрутов Avito (`api`, `profile`, `account` и
+  т. п.) тоже отклоняется. Раньше путь из входного URL сохранялся
+  целиком, и путь с «хвостом» идентификатора после личного префикса (например,
+  `/profile/x_1234567890`) уходил в браузер оператора. Теперь любой другой
+  путь (`/profile`, `/account`, `/orders`, `/favorites`, `/api/...`, путь
+  после идентификатора) отклоняется как `bad_request` до навигации.
+
+- `avito_card` opens pages in the operator's logged-in Chrome, so a full URL
+  is accepted only with an item-page path — `/<id>`, `/<slug>_<id>` or
+  `/<city>/<category>/<slug>_<id>` — and exactly that path is opened, without
+  query or fragment. A `/<city>/<category>/…` path whose first segment is one of
+  Avito's own routes (`api`, `profile`, `account` and the like) is refused too. Previously the input URL's path was kept as-is, so a
+  path with an item-id tail after a personal prefix (for example,
+  `/profile/x_1234567890`) reached the operator's browser. Any other path
+  (`/profile`, `/account`, `/orders`, `/favorites`, `/api/...`, a path
+  continuing past the id) is now refused as `bad_request` before navigation.
+### Fixed
+- Ночная канарейка больше не падает с ложным «дрейф или блок», когда бюджет
+  живых запросов WB уже потратил шаг doctor (он теперь идёт первым на том же
+  журнале): тест, запрос которого бюджет отказал, корневой `conftest.py`
+  отмечает пропущенным с причиной от бюджета. Канарейка печатает причины
+  пропусков, а сводка при пропусках пишет «PASS with skips», а не «все тесты
+  прошли». Лимиты бюджета не менялись.
+- `coerce_price` отказывает и на множителях заглавными буквами (`15 ТЫС. ₽`,
+  `2 Млн ₽`): раньше ловилось только `тыс`/`млн` строчными.
+
+- `avito_card` больше не принимает путь товара с обратным слешем или знаком
+  процента. `https://www.avito.ru/profile\x_1234567890` и
+  `/profile%2Fx_1234567890` проходили проверку формы — регулярка видит в них
+  обычные символы, — не попадали под запрет служебных разделов и открывались в
+  браузере оператора как `/profile/x_1234567890`: Chromium считает `\`
+  разделителем пути в http(s), а сервер раскодирует `%2F` и `%5C`. Теперь
+  такой путь отклоняется с `bad_request` до навигации, как и остальные
+  не-товарные адреса; обычные слаги вида
+  `/moskva/telefony/iphone_15_1234567890` работают как раньше.
+
+- Отказы девяти мест AliExpress (`_unwrap_extract`, карточка через popup,
+  челлендж x5sec) и оба отказа `mcp_core.kit.render_json` уходят агенту как
+  общий JSON ошибки (`raise_tool_error`), а не голым текстом: раньше
+  `str(ToolError(TransportDownError(...)))` было просто сообщением — без кода,
+  без `retryable` и полей челленджа, — а превью страницы в 200 символов в
+  тексте ошибки не вычищалось. Челлендж x5sec теперь `challenge_required`
+  (`requires_user_action: true`, `retryable_now: false`, `user_action` с
+  ручным шагом), как у x5sec на Taobao, а не `transport_down`, на который
+  агент повторял бы запрос впустую. Не-JSON выдача экстрактора в
+  `render_json` теперь тоже `parser_drift`, а не голый `JSONDecodeError`.
+
+- `run_server` ставит на каждом транспорте (stdio и HTTP) middleware
+  `ToolErrorRedactionMiddleware`. FastMCP сам превращает неожиданное исключение
+  внутри инструмента в `ToolError("Error calling tool ...: <текст исключения>")`,
+  и это происходит вне обработчиков коннектора: `build_client(...)` в yandex и
+  detmir стоит вне `try`, поэтому `ValueError` на прокси `htp://user:pass@host`
+  уносил учётные данные прямо в ответ. Middleware перевыпускает `ToolError` с
+  вычищенным текстом (сохраняя `__cause__`), пропускает остальные исключения без
+  изменений и не укорачивает сообщение — уже вычищенный JSON ошибки доходит до
+  агента байт в байт.
+
+- Ozon больше не отдаёт сырой текст апстрима. Тела страниц в `last_error`
+  успешного `ozon_reviews` и исключение Tier-1 в `ctx.debug` проходят через
+  `_redact`: раньше токен из тела ошибки попадал и в ответ агенту, и в лог
+  клиента.
+
+- `avito_card` no longer accepts an item path containing a backslash or a
+  percent sign. `https://www.avito.ru/profile\x_1234567890` and
+  `/profile%2Fx_1234567890` passed the shape check — the regex reads those as
+  ordinary characters — missed the service-route deny-list and opened in the
+  operator's browser as `/profile/x_1234567890`: Chromium treats `\` as a path
+  separator in http(s) URLs and a server decodes `%2F` and `%5C`. Such a path is
+  now refused with `bad_request` before any navigation, like the other
+  non-item addresses; ordinary slugs such as
+  `/moskva/telefony/iphone_15_1234567890` keep working.
+
+- Nine AliExpress failure sites (`_unwrap_extract`, the popup card path and the
+  x5sec challenge) and both `mcp_core.kit.render_json` refusals now reach the
+  agent as the shared error JSON (`raise_tool_error`) instead of plain text:
+  `str(ToolError(TransportDownError(...)))` used to be the bare message, with no
+  code, no `retryable` and no challenge fields, and the 200-character page
+  preview in it was never redacted. The x5sec challenge is now
+  `challenge_required` (`requires_user_action: true`, `retryable_now: false`,
+  a `user_action` naming the manual step), like Taobao's x5sec, instead of a
+  `transport_down` the agent would retry in vain. A non-JSON extract in
+  `render_json` is now `parser_drift` too, not a bare `JSONDecodeError`.
+
+- `run_server` installs `ToolErrorRedactionMiddleware` on every transport
+  (stdio and HTTP). FastMCP itself turns an unexpected exception inside a tool
+  into `ToolError("Error calling tool ...: <exception text>")`, outside the
+  connector's own handlers: `build_client(...)` sits outside the `try` in yandex
+  and detmir, so a `ValueError` on a `htp://user:pass@host` proxy carried the
+  credentials straight into the answer. The middleware re-raises a `ToolError`
+  with the redacted text (keeping `__cause__`), passes every other exception
+  through unchanged and never truncates the message, so an already-redacted
+  error JSON reaches the agent byte-identical.
+
+- Ozon no longer returns raw upstream text. Page bodies quoted in the
+  `last_error` of a successful `ozon_reviews` and the Tier-1 exception logged
+  through `ctx.debug` go through `_redact`: a token in an upstream error body
+  used to reach both the agent's answer and the client log.
+
+- Дрейф формы WB больше не срабатывает на законной странице со снятыми с
+  продажи товарами: у неё у всех товаров `"sizes": []`, а ценовое семейство
+  живёт внутри `sizes[]`, поэтому общий матчер
+  `mcp_core.resilience.shape_drift_warning` объявлял семейство потерянным.
+  Теперь пустой контейнер (сигнатура пишет его как `<путь>:empty_array`) не
+  считается потерей ключа внутри себя — искать там нечего. Правило узкое:
+  работает только для вложенного массива (не для конверта выдачи, так что
+  пустой `items: []` рядом с заполненным `goods[]` дрейф не прячет) и только
+  если этот массив пуст у всех элементов; записи `sizes`, которые есть, но
+  потеряли ключ цены, остаются дрейфом, в том числе на смешанной странице.
+- Avito: реестр `SEARCH_REQUIRED_FAMILIES` получил алиасы третьего конверта
+  `data.items[]`, который `_parse_search_items` уже читает. Раньше ответ,
+  отданный только через `data.items`, разбирался, но все семейства читались как
+  потерянные — ложная тревога; потерянное семейство внутри этого конверта
+  по-прежнему называется своим именем.
+- Заголовки `shape_reference.py` у aliexpress, citilink, dns, lamoda и taobao
+  теперь прямо говорят, по какому payload идёт проверка семейств: это выход
+  самого экстрактора, где каждый ключ выдаётся на каждой плитке, поэтому дрейф
+  разметки площадки приходит к агенту пустыми значениями и ловится
+  `validate_items` (`no_prices_on_page`, `title_missing`), а пропавший ключ
+  значит, что экстрактор перестал его выдавать. У aliexpress исправлено
+  обратное утверждение, будто экстрактор выдаёт ключи условно.
+- Ночной job: шаг doctor с аварийным сигналом идёт ПЕРЕД канарейкой. Оба шага
+  пишут в один журнал живых запросов (`.live-budget.json` в корне репозитория,
+  8 запросов на площадку за прогон, ни один шаг его не сбрасывает), поэтому
+  канарейка, идя первой, тратила бюджет WB на свои live-тесты, `wb_selfcheck`
+  у doctor'а получал отказ, читался как inconclusive (2) и job оставался
+  зелёным при настоящем дрейфе WB. Сигнал важнее: канарейка остаётся
+  информационной и зелёной, как и была.
+- `scripts/live_check.py` отдаёт код 4 на собственные ошибки использования и на
+  неудачную установку бюджета вместо прежней двойки, а ночной job валит шаг на
+  4. Двойка у doctor'а значит «источники не удалось проверить, остаёмся
+  зелёными» — правильно для заблокированной площадки, но сломанный вызов
+  `live_check` не должен прятаться в том же коде.
+- The nightly canary no longer fails with a false "drift or block" when the
+  doctor step (now first on the same ledger) has already spent WB's live
+  budget: the root `conftest.py` reports a test whose request the budget
+  refused as skipped with the budget's reason. The canary prints skip reasons
+  and its summary says "PASS with skips" instead of "all live tests passed".
+  The budget caps are unchanged.
+- `coerce_price` refuses magnitude words in any case (`15 ТЫС. ₽`, `2 Млн ₽`);
+  only lowercase `тыс`/`млн` were caught before.
+- WB shape drift no longer fires on the legitimate page whose products are all
+  delisted: every product carries `"sizes": []` and the price family lives
+  inside `sizes[]`, so the shared matcher
+  `mcp_core.resilience.shape_drift_warning` reported the family as lost. An
+  empty container (the signature writes it as `<path>:empty_array`) is no
+  longer read as a lost key inside itself — there is nothing in it to lose.
+  The rule is narrow: only a nested array counts (not the result envelope, so
+  an empty `items: []` next to a filled `goods[]` does not hide drift), and
+  only when it is empty on every element; `sizes` entries that exist without
+  a price key stay drift, on a mixed page too.
+- Avito: `SEARCH_REQUIRED_FAMILIES` gained the aliases of the third envelope
+  `data.items[]`, which `_parse_search_items` already read. A payload served
+  only through `data.items` parsed fine but every family read as missing — a
+  false alarm; a family actually lost inside that envelope is still named.
+- The `shape_reference.py` headers of aliexpress, citilink, dns, lamoda and
+  taobao now state what the family check runs on: the extractor's own output,
+  where every key is emitted on every tile, so marketplace markup drift reaches
+  the agent as empty values caught by `validate_items` (`no_prices_on_page`,
+  `title_missing`) while a vanished key means the extractor stopped emitting
+  it. AliExpress carried the opposite claim that the extractor emits keys
+  conditionally; that is corrected.
+- The nightly job now runs the doctor alarm step BEFORE the canary. Both steps
+  book into one live-request ledger (`.live-budget.json` at the repository
+  root, 8 requests per source per run, neither step resets it), so a canary
+  running first spent WB's budget on its live tests, the doctor's
+  `wb_selfcheck` was refused, read inconclusive (2) and the job stayed green on
+  real WB drift. The alarm has priority; the canary stays informational and
+  green as before.
+- `scripts/live_check.py` returns 4 for its own usage errors and a failed
+  budget install instead of the old 2, and the nightly job fails the step on 4.
+  The doctor's 2 means "sources could not be judged, stay green" — right for a
+  blocked marketplace, but a broken `live_check` invocation must not hide in
+  the same code.
+- `coerce_rating` больше не выдаёт рейтинг из счётчика отзывов: строка,
+  содержащая число, сгруппированное по тысячам пробелом (обычным, неразрывным
+  U+00A0, узким неразрывным U+202F или тонким U+2009), теперь даёт `None` и
+  с буквами, и без них. Раньше правило требовало букв, поэтому голое
+  «1 299» превращалось в выдуманный рейтинг 1.0. Текст без букв с запятой не
+  тронут: «4,9» остаётся рейтингом, а «4,500» читается как раньше.
+- `coerce_rating` no longer turns a review counter into a rating: a string
+  containing a number grouped by thousands with a space (plain, no-break
+  U+00A0, narrow no-break U+202F or thin U+2009) is now None with or without
+  letters. The old rule required letters, so a bare '1 299' came back as a
+  fabricated 1.0 rating. Letter-free comma text is untouched: '4,9' stays a
+  rating and '4,500' keeps its old reading.
+- `server.json` получил потерянную строку cian: список серверов для реестра
+  MCP-серверов перечислял четырнадцать площадок из пятнадцати, и cian в нём
+  отсутствовал. Теперь этот список сверяется с реестром источников тестом.
+
+- `server.json` gained its missing cian row: the server list for the MCP
+  registry named fourteen of the fifteen marketplaces, and cian was absent. A
+  test now compares that list with the source registry.
+- Цена, которую парсер не смог получить, больше не проходит молча. `validate_offer`
+  теперь сообщает о неразобранной цене (`price_unparseable`), о пустой или
+  пробельной строке цены (`price_blank`), умеет читать ценовое поле коннектора
+  (`price_cny` у Taobao) и видит противоречие `in_stock` с неразобранной ценой;
+  раньше пробельная цена не давала ни одного предупреждения. Новый общий
+  `validate_items` собирает поверки по позициям в одно предупреждение на код,
+  когда сломана хотя бы половина выдачи, и подставляет привычный код
+  `no_prices_on_page`, если цены нет ни у одной позиции. Он подключён к поиску и
+  карточкам avito, cian, citilink, detmir, dns, lamoda, megamarket, taobao и
+  yandex (у wb и ozon такая проверка уже была); mpstats не подключён — его
+  строки это аналитические метрики, а не нормализованные заявки с ценой и
+  заголовком.
+
+- `meta.healthy` означает одно и то же во всех коннекторах: `true` только когда
+  ответ полный и его значениям можно верить, `false` при любом предупреждении о
+  дрейфе, валидации или полноте — включая предупреждение, которое коннектор
+  пишет в модель ответа вручную (общий хелпер `health_warnings` отделяет
+  информационные заметки от сомнений в данных). Предупреждение с префиксом
+  `info:` — это контекст, а не сомнение в данных, и флаг не гасит (так помечена
+  заметка WB о том, что регион задаёт браузер, а не `dest`). В WB это
+  исправляет `healthy=True` рядом с непустыми предупреждениями (поиск через DOM,
+  `wb_categories`), а карточка через DOM, у которой не разобрался ни один
+  запрошенный SKU, теперь несёт `no_items` вместо `healthy=true` с пустым
+  списком. Три-состояние канарейки (healthy/drift/inconclusive) не изменилось.
+
+- Пустой ответ и отказ площадки больше не выглядят успехом: поиск WB через DOM
+  на странице ≥2 без плашки «ничего не нашлось» отдаёт `no_results` с
+  предупреждением `page_end_unverified` и `healthy=false` (страница 1
+  по-прежнему даёт `parser_drift`, а пустая страница с плашкой остаётся
+  честной); пустой ответ API WB, когда v9 честно пуст и legacy-фолбэк упал,
+  несёт `fallback_failed` и `healthy=false`; megamarket помечает страницу без
+  единой цены (`no_prices_on_page`) и проверяет карточку (`no_price`); в
+  `compare_prices` источник с нулём заявок считается `ok` только если его
+  собственный ответ не сообщает о проблеме, иначе это `unhealthy` с
+  `unhealthy_empty` и `complete=false`. Докстрока `ozon_search` приведена в
+  соответствие с кодом: ноль позиций — это предупреждение `no_items` и
+  `healthy=false`.
+
+- A price the parser could not obtain no longer passes in silence. `validate_offer`
+  now reports an unparseable price (`price_unparseable`), a blank or
+  whitespace-only price string (`price_blank`), reads a connector's own price
+  field (`price_cny` on Taobao) and sees `in_stock` contradicting an unparsed
+  price; a whitespace price used to draw no warning at all. The new shared
+  `validate_items` rolls per-item findings into one warning per code when at
+  least half the page breaks it, and substitutes the established
+  `no_prices_on_page` code when not one item carries a price. It is wired into
+  the search and card tools of avito, cian, citilink, detmir, dns, lamoda,
+  megamarket, taobao and yandex (wb and ozon already had such a check); mpstats
+  is excluded because its rows are analytics metrics, not normalized offers with
+  a title and a price.
+
+- `meta.healthy` means one thing in every connector: `true` only when the answer
+  is complete and its values can be trusted, `false` for any drift, validation or
+  completeness warning — including one a connector writes into its response model
+  by hand (the shared `health_warnings` helper separates informational notes from
+  doubts about the data). A warning prefixed `info:` is context rather than doubt
+  about the data and does not flip the flag (WB's note that the region comes from
+  the browser, not from `dest`, is marked that way). In WB this fixes
+  `healthy=True` next to non-empty warnings (DOM search, `wb_categories`), and a
+  DOM card whose every requested SKU failed to parse now carries `no_items`
+  instead of `healthy=true` with an empty list. The tri-state canary
+  (healthy/drift/inconclusive) is unchanged.
+
+- An empty answer and a marketplace refusal no longer read as success: WB DOM
+  search on page 2 or later without the «nothing found» notice returns
+  `no_results` with a `page_end_unverified` warning and `healthy=false` (page 1
+  still raises `parser_drift`, and an empty page WITH the notice stays honest);
+  an empty WB API answer where v9 is positively empty and the legacy fallback
+  died carries `fallback_failed` and `healthy=false`; megamarket marks a page
+  where not one price alias matched (`no_prices_on_page`) and validates its card
+  (`no_price`); in `compare_prices` a source with zero offers counts as `ok`
+  only when its own answer reports no problem, otherwise it is `unhealthy` with
+  `unhealthy_empty` and `complete=false`. The `ozon_search` docstring now matches
+  the code: zero items means a `no_items` warning and `healthy=false`.
+
+- Неудачный автозапуск Chrome запоминается на 45 секунд
+  (`_AUTOSTART_FAILURE_TTL_S`): следующие вызовы, включая уже ждущие блокировку,
+  получают тот же отказ сразу, с подсказкой о возрасте попытки, вместо
+  повторного ожидания готовности CDP. Успешный запуск (в том числе
+  `browser start`/`start_browser`) память очищает, а явный запуск всегда
+  пробует по-настоящему.
+
+- A failed Chrome autostart is remembered for 45 seconds
+  (`_AUTOSTART_FAILURE_TTL_S`): later callers, including those already waiting
+  on the lock, get the same failure at once with an age hint instead of
+  repeating the CDP readiness wait. A success (also `browser start` /
+  `start_browser`) clears the memory, and an explicit start always tries for
+  real.
+- Раннер оценки маршрутизации (`scripts/model_routing_eval.py run`) больше не
+  ставит `ok: true` прогону с меньшим числом сэмплов, чем требует протокол:
+  обёртка с `samples_per_case` меньше 3 или не целым числом теперь ошибка.
+  Голая карта ответов по-прежнему принимается, но отчёт пишет в
+  `protocol_unchecked`, что сэмплирование не проверено.
+
+- The routing eval runner (`scripts/model_routing_eval.py run`) no longer reports
+  `ok: true` for a run with fewer samples than the protocol asks: a wrapper with
+  `samples_per_case` below 3 or not an integer is now a problem. A bare answer
+  map is still accepted, and the report says in `protocol_unchecked` that its
+  sampling was not checked.
+- `compare_prices` больше не считает «1 ТБ» и «1024 ГБ» разными размерами:
+  размеры сравниваются в гигабайтах (1 ТБ = 1024 ГБ, как продают память
+  телефонов и ноутбуков). «1000 ГБ» по-прежнему не совпадает с «1 ТБ».
+
+- `compare_prices` no longer treats "1 TB" and "1024 GB" as different sizes:
+  sizes are compared in gigabytes (1 TB = 1024 GB, as phone and laptop storage
+  is sold). "1000 GB" still does not match "1 TB".
+- `compare_prices` сохраняет тип цены в новом необязательном `price_kind`:
+  цена с WB Кошельком, по подписке или с другим явным условием не выбирается
+  в `cheapest` и `cheapest_comparable`. Если обычная цена известна, ранжируется
+  она; иначе `price_rub` остаётся `null`, а исходная сумма — в `price_native`.
+  Предупреждения называют условие и исключённую сумму, а сумму с WB Кошельком —
+  и рядом с обычной ценой. Зачёркнутая цена не подставляется вместо обычной.
+
+- `compare_prices` preserves the price kind in the new optional `price_kind`:
+  WB Wallet, subscription and other explicitly conditional prices cannot become
+  `cheapest` or `cheapest_comparable`. The regular price ranks when available;
+  otherwise `price_rub` stays `null` and the quoted amount remains in `price_native`.
+  Warnings name the condition and excluded amount, and a WB Wallet amount also
+  next to a regular price. A struck-through price is never substituted for the regular one.
+- Гейт стоимости MCP-схем падает закрыто: в режиме проверки (`--baseline` без
+  `--update-baseline`) отсутствующий или нечитаемый файл базлайна и проверяемый
+  профиль без бюджета `wire_tokens` — теперь ошибка с понятным сообщением, а не
+  молчаливый пропуск любого снимка. Обычная проверка по закоммиченному базлайну и
+  создание базлайна через `--update-baseline` работают как раньше. Ночной прогон
+  дополнительно запускает `marketplace-mcp doctor --status-file` (через
+  `scripts/live_check.py`, под общим бюджетом живых запросов) и падает только на
+  коде «парсер дрейфовал» (1); заблокированные источники (2) не будят никого.
+  Live-тесты самопроверки считают `drift_detected` провалом, а `inconclusive`
+  (блок, челлендж, сеть) — скипом, не провалом.
+
+- The MCP wire-cost gate fails closed: in gate mode (`--baseline` without
+  `--update-baseline`) a missing or unreadable baseline file and a checked
+  profile without a `wire_tokens` budget are clear failures, not a silent pass
+  of any snapshot. The normal regression check against the committed baseline
+  and baseline creation with `--update-baseline` keep working. The nightly job
+  additionally runs `marketplace-mcp doctor --status-file` (through
+  `scripts/live_check.py`, under the shared live-request budget) and fails only
+  on the parser-drift exit code (1); blocked sources (2) page no one. Live
+  selfcheck tests treat `drift_detected` as a failure and `inconclusive`
+  (block, challenge, network) as a skip, not a failure.
+- `coerce_price`, `coerce_int` и `coerce_rating` из `mcp_core.resilience` больше не
+  выдумывают число из неоднозначного текста. Цены: две цены, склеенные пробелом
+  («1 999 2 999», «1 999 2 999 ₽», «1,999,2,999»), дробь с тремя знаками
+  («3 983.999»), месячный платёж («от 5 751 ₽/ мес.»), выгода («выгода 5 000 ₽»)
+  и скидка («скидка 30%») дают `None`, а `validate_offer` помечает такую цену.
+  Счёт с суффиксом в любой письменности («12万») или со знаком валюты
+  («24 088₽») и рейтинг с не-пятибалльным знаменателем словами («4.5 из 10»)
+  тоже дают `None`. Цена «от 1 999 ₽» и обычные формы («1 999 ₽»,
+  «1 999,50 ₽», «1999.00») работают по-прежнему.
+
+- `coerce_price`, `coerce_int` and `coerce_rating` in `mcp_core.resilience` no
+  longer turn ambiguous text into a number. Prices: two prices glued by the
+  thousands-separator space ("1 999 2 999", "1 999 2 999 ₽", "1,999,2,999"), a
+  three-digit fraction ("3 983.999"), a monthly instalment
+  ("от 5 751 ₽/ мес."), a saving ("выгода 5 000 ₽") and a discount
+  ("скидка 30%") return `None`, and `validate_offer` flags such a price. A count
+  with a magnitude letter in any script ("12万") or a currency glyph ("24 088₽"),
+  and a rating with a non-5 denominator in words ("4.5 из 10"), also return
+  `None`. The "from" price ("от 1 999 ₽") and the ordinary shapes
+  ("1 999 ₽", "1 999,50 ₽", "1999.00") keep working.
+- Бюджет навигаций CDP: запрос, стоявший в очереди, когда у хоста открылся
+  размыкатель, больше не получает разрешение — когда подходит его очередь, он
+  получает тот же `HostRefusingError`, что и новый запрос, а взятые слоты
+  возвращаются сразу. Ожидание занятого хоста больше не занимает глобальный
+  слот, поэтому запрос к свободному хосту не ждёт за занятым. Освобождение
+  слотов при отказе и при отмене (`asyncio.CancelledError`) ровно одно.
+- `detmir_card` больше не выдаёт свежий ответ за кешированный: `meta.cached`
+  снимается до запроса, а `_fetch_json` пишет свежий ответ в кеш, поэтому первое
+  сетевое обращение теперь `cached=false`, а повтор — `cached=true`.
+- Из всех коннекторов убрана бесполезная привязка FastMCP `RetryMiddleware`: она
+  ретраит только сырые `ConnectionError`/`TimeoutError`, а коннекторы отдают
+  `mcp_core` `ToolError`, поэтому не срабатывала ни разу. Повторные попытки
+  остаются за HTTP-слоем; `mcp-core` монтирует только `BearerAuthMiddleware`.
+
+- CDP navigation budget: a request queued while its host's breaker opened is no
+  longer handed a permit — when its turn comes it is refused with the same
+  `HostRefusingError` a new request gets, and the permits are given back at once.
+  Waiting for a busy host no longer holds a global slot, so a request for a free
+  host is not delayed behind it. Slots are released exactly once on refusal and
+  on cancellation (`asyncio.CancelledError`).
+- `detmir_card` no longer passes off a fresh answer as cached: `meta.cached` is
+  sampled before the fetch, and `_fetch_json` writes the fresh payload into the
+  cache, so a first network-backed call is now `cached=false` and a replay is
+  `cached=true`.
+- Every connector dropped its inert FastMCP `RetryMiddleware` mount: it retries
+  only raw `ConnectionError`/`TimeoutError`, while connectors raise an `mcp_core`
+  `ToolError`, so it never fired. Bounded retries stay in the HTTP tier;
+  `mcp-core` mounts only `BearerAuthMiddleware`.
+
+- `compare_prices` больше не выбирает в `cheapest_comparable` вариант другого
+  объёма: размеры, названные в запросе (`128GB`, `128 ГБ`, `1 ТБ`),
+  сравниваются с размерами в заголовке каждой заявки. Заявка, в заголовке
+  которой нет ни одного запрошенного размера, остаётся в `offers` и может быть
+  простым `cheapest`, но не `cheapest_comparable`; заголовок без размера или
+  запрос без размера не исключают ничего, а `8/128GB` не противоречит запросу
+  `128GB`. Об исключении сообщает одно компактное предупреждение
+  `identity_mismatch` на вызов.
+
+- `compare_prices` no longer picks a different-capacity variant as
+  `cheapest_comparable`: sizes stated in the query (`128GB`, `128 ГБ`, `1 ТБ`)
+  are compared with the sizes named in each offer title. An offer whose title
+  names none of the asked sizes stays in `offers` and may be plain `cheapest`,
+  but never `cheapest_comparable`; a title without a size, or a query without
+  one, excludes nothing, and `8/128GB` does not contradict a `128GB` query. One
+  compact `identity_mismatch` warning per call reports the exclusions.
+
+- `compare_prices` больше не теряет поля восстановления из ошибки источника:
+  `SourceOutcome` несёт `retry_after_s` (сколько ждать после открытого
+  предохранителя CDP-хоста), `retryable_now`, `retry_when` и `user_action`
+  (контракт `challenge_required`), а описание `status` называет `unhealthy`.
+  Раньше через эту границу проходили только `error_code` и `retryable`, поэтому
+  «повторите» приходило без времени ожидания, а «нужно действие человека» — без
+  самого действия.
+- `compare_verify_offer` больше не подтверждает условную цену: карточка WB, у
+  которой `price_rub` — цена Wallet (`price_kind="wallet"`, DOM-транспорт),
+  получает `observed_price_rub=null`, `delta_rub=null`, `matches=null` и
+  названный `price_kind` вместо вердикта о цене, доступной только владельцу
+  Wallet.
+- `wb_search` больше не падает на честно пустом ответе v9: отказ legacy-фолбэка,
+  поднятый обычным `ToolError` (через `raise_tool_error`), теперь тоже ловится,
+  поэтому ответ остаётся `no_results` с `fallback_failed` и `healthy=false`, а
+  предупреждение называет код и сообщение фолбэка. Если v9 уже упал, ошибка
+  по-прежнему поднимается наверх.
+- `coerce_price` использует единственный список `DECOY_MARKERS` (переехал в
+  `mcp_core.resilience`, из него же генерируется decoy-regex DOM-слоя), поэтому
+  «Рассрочка 5 751 ₽» и «в 1356 пунктов» больше не становятся ценой; суффикс
+  магнитуды («12万», «1.2K») на ценовом пути отвергается, как в `coerce_int`, а
+  `coerce_rating` отвергает счётчик без своего разделителя («1 2999»).
+- Приведены в соответствие тексты: докстроки `ozon_search` (ноль позиций —
+  `no_items` и `healthy=false`) и `megamarket_search` (любое предупреждение без
+  префикса `info:` гасит `healthy`), справочник `marketplace://errors`
+  перечисляет `retryable_now`, `retry_when` и `user_action`, докстрока
+  `registered_tools` говорит, что возвращает локальные инструменты, а склейка
+  предложений в `instructions` девяти серверов получила потерянный пробел.
+
+- `compare_prices` no longer drops the recovery fields of a source error:
+  `SourceOutcome` carries `retry_after_s` (how long to wait after an open CDP
+  host breaker), `retryable_now`, `retry_when` and `user_action` (the
+  `challenge_required` contract), and the `status` description names
+  `unhealthy`. Only `error_code` and `retryable` used to cross that boundary, so
+  "retry" arrived with no clock and "a human must act" with no action.
+- `compare_verify_offer` no longer certifies a conditional price: a WB card
+  whose `price_rub` is the Wallet price (`price_kind="wallet"`, DOM transport)
+  answers `observed_price_rub=null`, `delta_rub=null`, `matches=null` and the
+  named `price_kind` instead of a verdict on a price only a Wallet holder gets.
+- `wb_search` no longer dies on a positively empty v9 answer: a legacy-fallback
+  refusal raised as a plain `ToolError` (through `raise_tool_error`) is caught
+  too, so the answer stays `no_results` with `fallback_failed` and
+  `healthy=false`, and the warning names the fallback's code and message. When
+  v9 already failed, the error is still raised as before.
+- `coerce_price` uses the one `DECOY_MARKERS` list (moved to
+  `mcp_core.resilience`, which also generates the DOM decoy regex), so
+  'Рассрочка 5 751 ₽' and 'в 1356 пунктов' are no longer read as prices; a
+  magnitude suffix ('12万', '1.2K') is refused on the price path exactly as
+  `coerce_int` refuses it, and `coerce_rating` refuses a counter missing its own
+  separator ('1 2999').
+- Texts corrected: the `ozon_search` docstring (zero parsed items means
+  `no_items` and `healthy=false`) and the `megamarket_search` docstring (any
+  warning without the `info:` prefix flips `healthy`), the
+  `marketplace://errors` reference now lists `retryable_now`, `retry_when` and
+  `user_action`, the `registered_tools` docstring says it returns local tools
+  only, and the appended sentence in nine servers' `instructions` got its
+  missing space back.
+
+## [2.7.0] - 2026-10-30
+
+Установка и первый запуск: `install --write` с профилями и мастер `setup`, Chrome и проверка сайтов из CLI, фолбэк Wildberries на отрисованную страницу при отказе API, сгенерированный справочник инструментов и подготовка к PyPI (публикация выключена).
+
+Install and first run: `install --write` with profiles and a `setup` wizard, Chrome and site checks from the CLI, a Wildberries fallback to the rendered page when the API refuses, a generated tool reference, and PyPI preparation (publishing off).
+
+### Added
+
+- Подготовлен один дополнительный PyPI-бандл `ru-marketplace-mcp`: скрипт
+  `scripts/build_pypi_bundle.py` выводит метаданные из манифестов workspace,
+  отказывает при конфликте зависимостей или консольных имён и собирает wheel/sdist
+  со всеми импортами и `py.typed`; README идёт в описание пакета, а не файлом в site-packages. Алиас `ru-marketplace-mcp` ведёт в CLI;
+  workspace, его 16 отдельных пакетов и Docker остаются. Общие минимумы
+  `curl-cffi` и Playwright согласованы с более высокими уже существовавшими
+  требованиями; версии runtime в lock-файле не меняются. Новый CI job проверяет
+  wheel в чистом pip-venv. Trusted publishing выключен до регистрации владельцем
+  одного pending publisher и включения переменной; шаги — в DEPLOYMENT.md.
+- `install` и `setup`, запущенные из кеша uv tool, пишут абсолютный путь к uv и
+  `tool run --from ru-marketplace-mcp==<версия>` вместо временной консольной
+  команды. Вывод объясняет пин релиза и обновление через `install --write --force`;
+  запуск из checkout и обычного venv остаётся прежним.
+
+- `wb_card` и `wb_search` в режиме `api` сами перечитывают запрос через
+  отрисованную страницу в scraping-Chrome, когда API WB отказывает адресу:
+  HTTP 401/403/498 или HTML-стена на месте JSON. Ответ получает предупреждение
+  `dom_fallback` в `meta.warnings`; 429, сетевые ошибки, дрейф парсера и кривые
+  запросы по-прежнему возвращают свою ошибку. Фолбэк один: один запрос к API и
+  не больше одной попытки через DOM; если DOM тоже упал, ошибка DOM сохраняет
+  свой тип и называет предшествующий отказ API. Включён по умолчанию,
+  `WB_DOM_FALLBACK=0` возвращает прежнее поведение. `doctor` при включённом
+  фолбэке говорит, что инструменты уже переключаются сами, и что
+  `WB_TRANSPORT=dom` заставляет doctor проверять и отрисованный путь.
+- `marketplace-mcp install <client> --write` пишет конфиг клиента сам. По умолчанию
+  в блок входит одна запись `marketplace` — объединённый сервер; `--per-source`
+  оставляет старый блок по источникам. Путь к `uv` и к консольной команде
+  абсолютный, если он найден: у десктопного клиента часто нет PATH терминала, и
+  голое `uv` — это сервер, который молча не стартует. Запись сливается в
+  `mcpServers`, чужие серверы и остальные настройки файла не теряются, старый
+  файл перед изменением копируется в `<файл>.bak-<метка>`, новая версия пишется
+  временным файлом и подменяется через `os.replace`. Кривой JSON и запись с тем
+  же именем, но другим содержимым — отказ с кодом 2 (конфликт снимается
+  `--force`); такая же запись — «already configured», без записи и без копии.
+  `--dry-run` печатает записи, которые добавит, только имена остальных серверов
+  и настроек (их содержимое, например ключи в `env`, не выводится) и путь, и
+  ничего не пишет. Конфиг с BOM читается; файл не в UTF-8 (например, UTF-16) —
+  отказ с кодом 2 и подсказкой сохранить его как UTF-8. Вторая запись в ту же
+  секунду получает копию `-1`, `-2`…, так что прежняя копия не затирается.
+  Конфиг-симлинк остаётся симлинком: пишется файл, на который он указывает.
+  `install claude-code --write` печатает готовую строку `claude mcp add`, без
+  `--write` — сначала её, потом блок для `.mcp.json` проекта под поясняющим
+  комментарием. `install dsh --write` отказывается: у dsh свой формат, не
+  `mcpServers`. Ctrl-C на вопросах `setup` и `unblock` — «cancelled» и код 130.
+- `marketplace-mcp --help` (и `help`) печатает короткий экран usage: команды, по
+  примеру на каждую, и ссылку на `docs/QUICKSTART.md`. Неизвестная команда
+  печатает объяснение и этот же usage, и завершается с кодом 2.
+- `marketplace-mcp doctor` печатает под каждой нездоровой строкой один следующий
+  шаг: поднять scraping Chrome, пройти проверку сайта или войти руками и
+  перепроверить источник, переключить Wildberries на `WB_TRANSPORT=dom`, задать
+  `MPSTATS_MP_AUTH`, разобрать дрейф парсера, подождать при отказе по частоте
+  запросов или открыть `docs/ANTI_BOT.md`. Тот же шаг попадает в `--status-file`
+  отдельным полем `next_step`. Шаг выбирается из кодов причин, которые реально
+  шлют коннекторы (`blocked`, `login_wall`, `not_authenticated`,
+  `transport_down`, `rate_limited`, `auth_missing`), и всегда один: без советов
+  про решатели капч, stealth-инструменты, пулы прокси и повторные попытки. Если
+  упал сам selfcheck (`error`), это не стена сайта: шаг предлагает открыть issue с
+  его выводом.
+- `marketplace-mcp browser status` и `marketplace-mcp browser show`: окно
+  scraping-Chrome на Windows стартует за экраном, поэтому человек не может ни
+  войти руками, ни пройти проверку сайта. `status` отвечает, достижим ли
+  CDP-эндпоинт, какая версия Chrome там отвечает, сколько открыто page-таргетов
+  и в каком состоянии окно (видно, за экраном, свёрнуто); при недостижимом
+  эндпоинте — код возврата 1 и подсказка, как запустить scraping Chrome.
+  `show` сворачивает и снова разворачивает окно (только так Windows поднимает
+  окно, которое лежит позади других), переносит его на экран
+  (80, 40; текущий размер сохраняется, если окно не меньше 800x600, иначе
+  1280x900) и активирует первую вкладку. Обе команды отправляют только
+  браузерные CDP-команды и не ходят ни в один сайт. Совет doctor'а для
+  источника, закрытого браузером, теперь называет `marketplace-mcp unblock
+  <source>`.
+- `marketplace-mcp browser start [--hidden]` запускает scraping-Chrome сам:
+  по умолчанию окно видно (без off-screen аргументов и без скрытия), `--hidden`
+  сохраняет прежнее поведение автозапуска коннектора. Если CDP уже отвечает,
+  команда ничего не запускает и подсказывает `browser show`; на удалённом
+  `CHROME_CDP_HOST` отказывает, а если порт не поднялся — называет профиль,
+  который может держать другой Chrome без remote debugging.
+- `marketplace-mcp unblock [sources...] [--wait SECONDS] [--dry-run]`: для
+  каждого браузерного источника из `doctor` открывает в новой вкладке страницу,
+  где человек проходит проверку или входит (карта `UNBLOCK_PAGES`), поднимает
+  окно на этой вкладке и ждёт Enter в терминале или `--wait` секунд (по
+  умолчанию 180), затем перепроверяет только эти источники и печатает те же
+  строки и следующие шаги, что `doctor`. `--dry-run` только печатает страницы.
+  Ничего не решается и не обходится автоматически: страницу проходит человек.
+- `scripts/start_chrome_cdp.ps1` и `.sh` больше не требуют закрыть обычный
+  Chrome: если CDP-эндпоинт уже отвечает на порту, лаунчер сообщает об этом и
+  выходит с кодом 0; если тот же профиль (`--user-data-dir`) уже занят другим
+  Chrome — отказ с кодом 2; иначе Chrome запускается, даже когда другие окна
+  Chrome открыты. Ручной запуск теперь видимый по умолчанию; `-Hidden` в
+  PowerShell возвращает окно за экран, `--hidden` в shell на macOS прячет
+  приложение (⌘H), на Linux ничего не меняет, `-Visible` по-прежнему
+  принимается и ничего не меняет. Скрытый запуск заканчивает подсказкой
+  `marketplace-mcp browser show`; автозапуск коннектора остаётся за экраном.
+- `scripts/check_lock_revision.py` — новый гейт: лок-файл, перезаписанный старым
+  uv (revision 3 вместо 5), больше не проходит молча. Это не
+  `required-version` в `pyproject.toml`: тот флаг запретил бы оператору со
+  старым uv на PATH запустить сервер через запись `uv run --directory ...`,
+  которую пишет `install --write`. Правильный путь — перелочить uv не старше
+  0.13.6 (`uvx --from uv==0.13.6 uv lock`).
+- `marketplace-mcp install --profile compare|decision|full` выбирает, какой сервер
+  запускает одна запись `marketplace`: `compare-mcp` (профиль по умолчанию для
+  новых установок, 4 инструмента сравнения, около 2,2 тыс. токенов на запрос),
+  `decision-mcp` (5 инструментов) или `marketplace-mcp` (все инструменты
+  источников, около 17,5 тыс. токенов). Имя записи не меняется. `--per-source`
+  по-прежнему пишет блок по источникам и с `--profile` не сочетается. Если в
+  конфиге уже есть другая запись, отказ без `--force` теперь называет и текущий
+  профиль, и запрошенный; вывод команды называет профиль и подсказывает
+  `--profile full`. Без `--profile` повторный `install --write` и `setup`
+  сохраняют профиль, который уже записан в конфиге: `compare` по умолчанию
+  только для новых установок.
+- `marketplace-mcp setup` ведёт от нуля до первого ответа теми же командами:
+  находит Claude Desktop, Cursor и Claude Code (или берёт `--client`), пишет
+  конфиг с профилем `compare` по умолчанию, запускает scraping-Chrome, прогоняет
+  проверки `doctor` с их таблицей и предлагает `unblock` для закрытых браузером
+  источников. `--dry-run` печатает шаги и файлы и ничего не пишет, не запускает
+  и не запрашивает; `--no-browser` и `--no-doctor` пропускают эти шаги. Код 0 —
+  конфиг записан хотя бы одному клиенту, 1 — не нашлось ни клиента, ни записи,
+  2 — неверные аргументы.
+- `scripts/bump_version.py` поднимает версию во всех 85 объявлениях из общей
+  таблицы `scripts/version_sites.py`, которую использует и `check_versions.py`;
+  `--dry-run` только печатает план. `.gitattributes` держит LF в checkout,
+  workflow `Image check` собирает оба образа и прогоняет stdio-образ через
+  MCP до тега, а живые запросы ограничены бюджетом 40/8/3 с через
+  `scripts/live_budget.py` и `scripts/live_check.py`.
+- `docs/TOOLS.md` теперь генерируется (`scripts/gen_tools_doc.py`) из тех же
+  схем `tools/list`, что видит клиент: по каждому профилю (compare, decision,
+  full) — консольная команда, число инструментов, размер JSON в байтах и
+  примерное число токенов (та же оценка, что в `scripts/mcp_wire.py`), а по
+  каждому источнику — имя, параметры из JSON-схемы и первый абзац описания.
+  README ссылается на файл, а ручные цифры стоимости в README и в таблице
+  режимов `dsh/README.md` заменены блоками, которые генератор переписывает из
+  того же замера. `--check` в CI (`lint`) падает, если файл или блок устарели.
+  Прежние цифры были устаревшими: compare стоит около 2,2 тыс. токенов на
+  запрос, а не 0,9 тыс., полный набор — около 17,5 тыс., а не 13,6 тыс.
+
+- Prepared one additional `ru-marketplace-mcp` PyPI bundle. The builder derives
+  metadata from workspace manifests, rejects dependency/script conflicts, and
+  builds a wheel/sdist with every import package and `py.typed`; the README is the package description, not a file in site-packages. The
+  `ru-marketplace-mcp` alias enters the CLI; the 16-member workspace, subset
+  artifacts and Docker builds remain. Shared curl-cffi/Playwright minimums are
+  aligned with the higher requirements already present; locked runtime versions
+  stay unchanged. A new CI job checks a clean pip-venv install. Trusted publishing
+  stays off until the owner registers one pending publisher and enables the
+  repository switch; DEPLOYMENT.md contains the owner steps.
+- `install` and `setup` running from uv's tool cache now persist an absolute uv
+  command and `tool run --from ru-marketplace-mcp==<version>`, never the temporary
+  console-script path. The note explains the release pin and refresh through
+  `install --write --force`; checkout and ordinary-venv entries are unchanged.
+
+- In `api` mode, `wb_card` and `wb_search` now re-read the same request through the
+  rendered page in the scraping Chrome when WB's API refuses the address: HTTP
+  401/403/498 or an HTML wall where JSON belongs. The response carries a
+  `dom_fallback` warning in `meta.warnings`; 429, network errors, parser drift and
+  bad requests keep their own errors. There is one API attempt and at most one DOM
+  attempt; if the DOM path fails too, its error type is preserved and its message
+  names the API refusal. On by default; `WB_DOM_FALLBACK=0` restores the previous
+  behaviour. With the fallback on, `doctor` says the tools switch by themselves and
+  that `WB_TRANSPORT=dom` makes doctor check the rendered path too.
+- `marketplace-mcp install <client> --write` writes the client config itself. The
+  default block is one `marketplace` entry running the unified server; `--per-source`
+  keeps the old per-source block. `uv` and the console script are resolved to
+  absolute paths when found: a desktop client often has no terminal PATH, and a
+  bare `uv` is a server that silently never starts. The entry is merged into
+  `mcpServers` without dropping other servers or settings, the old file is copied
+  to `<file>.bak-<timestamp>` before any change, and the new version is written
+  through a temporary file and `os.replace`. Malformed JSON and a same-name entry
+  with different content are refused with exit 2 (the conflict needs `--force`);
+  an identical entry prints "already configured" and writes nothing. `--dry-run`
+  prints the entries it would add, only the names of the other servers and
+  settings (never their content, such as keys in `env`) and the target path,
+  and writes nothing. A config saved with a BOM is read; a file that is not UTF-8
+  (UTF-16, for example) is refused with exit 2 and a save-as-UTF-8 hint. A second
+  write in the same second gets a `-1`, `-2`... backup, so an earlier backup is
+  never overwritten. A symlinked config stays a symlink: its target is written.
+  `install claude-code --write` prints the exact `claude mcp add` line; without
+  `--write` it prints that line first, then the block for a project's
+  `.mcp.json` under a comment that says so. `install dsh --write` is refused:
+  dsh has its own format, not `mcpServers`. Ctrl-C at a `setup` or `unblock`
+  prompt prints "cancelled" and exits 130.
+- `marketplace-mcp --help` (and `help`) prints a short usage screen: the verbs,
+  one example each, and a pointer to `docs/QUICKSTART.md`. An unknown command
+  prints the explanation and that screen, and exits 2.
+- `marketplace-mcp doctor` prints one next step under every source that is not ok:
+  start the scraping Chrome, pass the site's check or log in by hand and recheck
+  the source, switch Wildberries to `WB_TRANSPORT=dom`, set `MPSTATS_MP_AUTH`,
+  diagnose a parser drift, wait out a rate limit, or open `docs/ANTI_BOT.md`. The
+  same step lands in `--status-file` as a `next_step` field. The step is chosen
+  from the reason codes the connectors really send (`blocked`, `login_wall`,
+  `not_authenticated`, `transport_down`, `rate_limited`, `auth_missing`), and it is
+  always one instruction — never a captcha solver, stealth tooling, a proxy pool or
+  a retry loop. A selfcheck that failed itself (`error`) is not a site wall: its
+  step asks for an issue with the output above.
+- `marketplace-mcp browser status` and `marketplace-mcp browser show`: the
+  scraping Chrome's window starts off-screen on Windows, so a human can neither
+  log in nor pass a site's check. `status` says whether the CDP endpoint is
+  reachable, which Chrome answers, how many page targets it holds and whether
+  the window is visible, off-screen or minimized; when the endpoint does not
+  answer it exits 1 and prints how to start the scraping Chrome. `show`
+  minimizes and restores the window (only a restore makes Windows raise a
+  window that sits behind others), moves it on-screen (80, 40;
+  the current size is kept when the window is at least 800x600, otherwise
+  1280x900) and activates the first tab. Both send browser-level CDP commands
+  only and request nothing from any website. The doctor's advice for a source
+  blocked by the browser now names `marketplace-mcp unblock <source>`.
+- `marketplace-mcp browser start [--hidden]` launches the scraping Chrome
+  itself: the window is visible by default (no off-screen arguments, nothing
+  hidden), while `--hidden` keeps the connector autostart's off-screen
+  behaviour. If CDP already answers it starts nothing and points at
+  `browser show`; a remote `CHROME_CDP_HOST` is refused, and a port that never
+  binds names the profile another Chrome may hold without remote debugging.
+- `marketplace-mcp unblock [sources...] [--wait SECONDS] [--dry-run]`: for each
+  browser-backed source from `doctor`, opens the page where a human passes the
+  check or logs in (the `UNBLOCK_PAGES` map) in a new tab, raises the window on
+  that tab and waits for Enter on a terminal or `--wait` seconds (180 by
+  default), then re-checks only those sources and prints doctor's rows and next
+  steps. `--dry-run` only prints the pages. Nothing is solved or bypassed
+  automatically: the human passes the page.
+- `scripts/start_chrome_cdp.ps1` and `.sh` no longer demand closing the
+  everyday Chrome: when the CDP endpoint already answers on the port, the
+  launcher says so and exits 0; when another Chrome holds the same profile
+  (`--user-data-dir`), it refuses with exit 2; otherwise Chrome starts even
+  while other Chrome windows are open. The manual launch is now visible by
+  default; `-Hidden` in PowerShell parks the window off-screen, `--hidden` in the
+  shell hides the app (⌘H) on macOS and changes nothing on Linux, and `-Visible` is still accepted and changes nothing. A hidden
+  launch ends with a pointer to `marketplace-mcp browser show`; the connector's
+  autostart stays off-screen.
+- `scripts/check_lock_revision.py` — a new gate: a lockfile rewritten by an
+  older uv (revision 3 instead of 5) no longer passes silently. This is not a
+  `required-version` floor in `pyproject.toml`: that flag would stop an
+  operator whose PATH carries an older uv from starting the server through the
+  `uv run --directory ...` entry that `install --write` writes. The fix is to
+  relock with uv 0.13.6 or newer (`uvx --from uv==0.13.6 uv lock`).
+- `marketplace-mcp install --profile compare|decision|full` picks which server the
+  one `marketplace` entry runs: `compare-mcp` (the default for new installs: 4
+  price-comparison tools, about 2.2k tokens per request), `decision-mcp` (5 tools)
+  or `marketplace-mcp` (every per-source tool, about 17.5k tokens). The entry name
+  does not change. `--per-source` still writes the per-source block and cannot be
+  combined with `--profile`. Without `--force`, a conflicting existing entry now
+  names both the configured and the asked profile; the command output names the
+  profile and points at `--profile full`. Without `--profile`, a repeated
+  `install --write` and `setup` keep the profile the config already runs: compare
+  is the default for new installs only.
+- `marketplace-mcp setup` walks from zero to the first answer through the existing
+  verbs: it detects Claude Desktop, Cursor and Claude Code (or takes `--client`),
+  writes the config with the compare profile by default, starts the scraping
+  Chrome, runs doctor's checks and table, and offers `unblock` for a source the
+  site walls off. `--dry-run` prints the steps and files and writes, starts and
+  requests nothing; `--no-browser` and `--no-doctor` skip those steps. Exit 0
+  when at least one client's config was written, 1 when no client and no config
+  were found, 2 on bad arguments.
+- `scripts/bump_version.py` bumps all 85 declarations from the one site table in
+  `scripts/version_sites.py` that `check_versions.py` also uses; `--dry-run`
+  only prints the plan. `.gitattributes` keeps checkouts on LF, the `Image
+  check` workflow builds both images and drives the stdio image through MCP
+  before the tag, and live requests are capped at 40 total / 8 per marketplace
+  / 3 s between requests by `scripts/live_budget.py` and `scripts/live_check.py`.
+- `docs/TOOLS.md` is now generated by `scripts/gen_tools_doc.py` from the same
+  `tools/list` schemas a client pays for: per profile (compare, decision, full)
+  it lists the console script, tool count, JSON payload bytes and an approximate
+  token count (the same estimate as `scripts/mcp_wire.py`), and per source it
+  lists every tool's name, JSON-schema parameters and first description
+  paragraph. The README links to it, and the hand-typed cost figures in the
+  README and in the `dsh/README.md` mode table are replaced by blocks the
+  generator rewrites from the same measurement. A CI `--check` in the lint job
+  fails when any of them is stale. The old figures were out of date: compare
+  costs about 2.2k tokens per request, not 0.9k, and the full set about 17.5k,
+  not 13.6k.
+
+### Fixed
+
+- Фолбэк Wildberries на страницу: если после отказа API упал сам браузерный
+  драйвер (Playwright бросает свою ошибку, а не ошибку инструмента), ответ
+  теперь тоже говорит, что сначала API отказал адресу. Раньше такая ошибка
+  уходила общим `transport_down` без этой причины, и было непонятно, при чём
+  тут Chrome. Найдено живым прогоном 30 октября.
+- Поиск Wildberries по странице (`WB_TRANSPORT=dom` и автоматический фолбэк):
+  одна плитка с несколькими ценами без зачёркнутой больше не роняет весь поиск.
+  Раньше её `in_stock` оставался пустым, ответ не проходил проверку модели, а
+  через фолбэк это выглядело как `transport_down`. Теперь такая плитка приходит
+  с `price_rub: null` и `in_stock: false`, а предупреждение называет её и
+  советует `wb_card`. Ошибка была с v2.5.3; найдена аудитом перед релизом.
+- Taobao: страница со ссылками на вход или регистрацию и без товаров больше не
+  считается сеткой, которая ещё грузится, даже если на ней написано «加载中» и
+  ссылок больше обычного. Раньше такая страница ждала 10 секунд и отвечала
+  повторяемым `timeout`; теперь сразу `parser_drift`, как до v2.6.0, если не
+  сработал признак стены входа. Найдено аудитом перед релизом.
+- `wb_selfcheck` учитывает `WB_TRANSPORT=dom`: проверки `card` и `search_v9`
+  читают отрисованные страницы теми же парсерами, что инструменты, вместо
+  неиспользуемых API-хостов. Капча остаётся `inconclusive` без решения и повторов;
+  ошибки транспорта и дрейф парсера различаются по коду. Остальные пробы сохранены.
+- `compare_prices` считает цены Taobao в `source_outcomes[].detail` по
+  `price_native`, а не по пустому `price_rub`: например, `20 results, 20 priced
+  in CNY (not ranked)`. Рублёвые строки и ранжирование не изменились.
+- Чек-лист релиза называл порог покрытия 70 %, а гейт требует 80 %
+  (`--cov-fail-under=80`). В тексте теперь стоит то значение, которое
+  проверяется.
+- Запуск Chrome из PowerShell (`start_chrome_cdp.ps1`): путь к профилю с
+  пробелом больше не разрывается на два аргумента. Раньше `-AllowMainProfile`
+  (папка `User Data`) и любое имя пользователя Windows с пробелом запускали
+  Chrome с другой папкой профиля, без входа на площадки. Если CDP не ответил за
+  ~12 секунд, скрипт выходит с кодом 1, а не 0. Проверка «профиль уже занят»
+  больше не путает профиль с соседним `Chrome-Scraping-2`.
+- Запуск Chrome из shell (`start_chrome_cdp.sh`): «Chrome уже запущен» скрипт
+  пишет, только когда порт отвечает как CDP. Чужой процесс на порту — отказ с
+  кодом 2 и подсказкой `--port`; раньше скрипт молча выходил с кодом 0.
+- Скрытие окна scraping-Chrome на Windows находит и процессы Edge и не трогает
+  соседний профиль с похожим именем.
+- `CHROME_CDP_HOST` с IPv6-адресом (`::1` или `[::1]`) работает: в URL адрес
+  берётся в скобки и считается локальным.
+- Предупреждение фолбэка Wildberries говорит, что цены и доставка взяты в
+  регионе, выбранном в браузере, а не по `dest`. Раньше при регионе по
+  умолчанию об этом не говорилось.
+- `docs/DEPLOYMENT.md`: команды установки из wheelhouse оставались на версии
+  прошлого релиза, потому что `bump_version.py` и `check_versions.py` их не
+  видели. Теперь это три места в таблице версий: 88 вместо 85.
+- Бюджет живых запросов мейнтейнера теперь считает страницу товара AliExpress,
+  открытую через `window.open`, и вкладки `unblock`. Журнал защищён файловой
+  блокировкой, поэтому два параллельных прогона больше не теряют записи. Чек-лист
+  релиза запускает doctor как `python scripts/live_check.py doctor`, под тем же
+  бюджетом.
+- Бюджет живых запросов говорит, когда он сам не пустил запрос: строка
+  `[refused]` в stderr и итог `refused before sending` после команды. Раньше
+  отказ выглядел в doctor как `transport_down`, будто площадка заблокировала
+  адрес. Чек-лист релиза объясняет, как проверить отзывы Ozon, которым не
+  хватает лимита в 8 запросов.
+
+- Wildberries' fallback to the rendered page: when the browser driver itself
+  fails after an API refusal (Playwright raises its own error, not a tool
+  error), the answer now also says the API refused this address first. Before,
+  such a failure surfaced as a bare `transport_down` that never explained why
+  Chrome was involved. Found in the 30 October live run.
+- Wildberries search over the rendered page (`WB_TRANSPORT=dom` and the
+  automatic fallback): one tile showing several prices without a struck one no
+  longer fails the whole search. Its `in_stock` stayed empty, the answer failed
+  model validation, and through the fallback that looked like `transport_down`.
+  Such a tile now comes back with `price_rub: null` and `in_stock: false`, and
+  the warning names it and points at `wb_card`. The bug dates from v2.5.3; the
+  pre-release audit found it.
+- Taobao: a page with login or registration links and no products is no longer
+  taken for a grid that is still loading, even when it says «加载中» and has
+  more links than usual. It used to wait 10 seconds and answer a retryable
+  `timeout`; it now answers `parser_drift` at once, as before v2.6.0, unless a
+  login-wall marker fires. Found by the pre-release audit.
+- `wb_selfcheck` respects `WB_TRANSPORT=dom`: `card` and `search_v9` check
+  rendered pages with the tools' parsers rather than unused API hosts. Captchas
+  remain `inconclusive` without solving or retries; transport failures and parser
+  drift are distinguished by error code. The other probes are preserved.
+- `compare_prices` counts Taobao's native prices in `source_outcomes[].detail`
+  instead of reporting zero rouble prices: for example, `20 results, 20 priced
+  in CNY (not ranked)`. Rouble-source detail and ranking are unchanged.
+- The release checklist named the coverage floor as 70 % while the gate enforces
+  80 % (`--cov-fail-under=80`). The text now states the value that is checked.
+- Starting Chrome from PowerShell (`start_chrome_cdp.ps1`): a profile path
+  with a space is no longer split into two arguments. `-AllowMainProfile` (the
+  `User Data` folder) and any Windows user name with a space used to start
+  Chrome on a different profile folder, without the marketplace logins. When
+  CDP does not answer within about 12 seconds the script now exits 1, not 0.
+  The "profile already in use" check no longer mistakes a sibling such as
+  `Chrome-Scraping-2` for the profile.
+- Starting Chrome from the shell (`start_chrome_cdp.sh`): the script says
+  "already running" only when the port answers as CDP. Another process on the
+  port is refused with exit 2 and a `--port` hint; it used to exit 0 silently.
+- Hiding the scraping Chrome window on Windows also finds Edge processes and
+  leaves a sibling profile with a similar name alone.
+- An IPv6 `CHROME_CDP_HOST` (`::1` or `[::1]`) works: the address is bracketed
+  in URLs and counts as loopback.
+- The Wildberries fallback warning says prices and delivery follow the region
+  set in the browser, not `dest`. With the default region it used to say
+  nothing about it.
+- `docs/DEPLOYMENT.md`: the wheelhouse install commands kept the previous
+  release, because `bump_version.py` and `check_versions.py` never saw them.
+  They are now three sites in the version table: 88 instead of 85.
+- The maintainer's live request budget now counts the AliExpress item page
+  opened through `window.open` and the `unblock` tabs. A lock file guards the
+  ledger, so two parallel runs no longer lose bookings. The release checklist
+  runs doctor as `python scripts/live_check.py doctor`, under the same budget.
+- The live request budget says when it refused a request itself: a `[refused]`
+  line on stderr and a closing `refused before sending` summary. The refusal
+  used to show in doctor as `transport_down`, as if the marketplace had blocked
+  the address. The release checklist explains how to check Ozon reviews, which
+  do not fit the cap of 8 requests.
+
+### Security
+
+- Публикующие workflow по тегу: `mcp-publisher` сверяется с SHA-256 до
+  распаковки, checkout не оставляет токен на диске, сборка релиза не берёт кэш
+  uv, и один тег публикуется одним запуском за раз (`concurrency`). Найдено
+  аудитом перед релизом.
+
+- Tag-triggered publishing workflows: `mcp-publisher` is checked against its
+  SHA-256 before it is unpacked, checkout leaves no token on disk, the release
+  build restores no uv cache, and one tag publishes in one run at a time
+  (`concurrency`). Found by the pre-release audit.
+
+## [2.6.0] - 2026-10-30
+
+FastMCP 4 без смены публичного контракта инструментов; три исправления Taobao из замечаний к v2.5.4; Dependabot следит и за npm lock-файлом.
+
+FastMCP 4 with the public tool contract unchanged; the three Taobao issues recorded in v2.5.4 are addressed; Dependabot also watches the npm lockfile.
+
+### Changed
+
+- Все пакеты перешли с FastMCP 3.x на 4.1.4 (MCP Python SDK v2), минимальная
+  версия pydantic — 2.12 (#138). Поддерживаются прежнее рукопожатие
+  (`initialize`, протокол 2025-11-25 и старше) и новый протокол 2026-07-28
+  без сессий (`server/discover`). Имена инструментов, параметры и поля ответов
+  не изменились: `_meta` остаётся `_meta`, вложенный блок карточки в
+  `compare_verify_offer` — `meta`.
+- Сохранённая вкладка проверки в протоколе без сессий привязана к процессу
+  stdio-сервера: повтор от его единственного клиента продолжает ту же вкладку.
+  По HTTP без сессии вкладка не сохраняется, потому что запросы нельзя связать
+  с одним клиентом. У клиентов с рукопожатием сохраняется прежняя привязка к
+  MCP-сессии (#138).
+- `compare_browser_snapshot` читает объявленные клиентом возможности в обоих
+  протоколах, в том числе сигнал поддержки изображений (#138).
+- `scripts/e2e_stdio_check.py` проверяет оба протокола: ожидается 32 stdio-сессии
+  вместо 16. Добавлены офлайн-тесты настоящих stdio- и локальных HTTP-серверов
+  для привязки клиента и проверки bearer-токена (#138).
+- Dependabot уже следит за закреплёнными по digest базовыми образами Docker
+  (#134, включено в v2.5.4); теперь он проверяет и npm lock-файл для офлайн-тестов
+  DOM-экстракторов, еженедельно, с группировкой minor- и patch-обновлений (#140).
+
+- FastMCP 4 (4.1.4, MCP Python SDK v2) replaces the 3.x line in every
+  package; pydantic's floor rises to 2.12 with it. The servers now speak both
+  protocol eras: the handshake era (`initialize`, 2025-11-25 and older) and the
+  sessionless 2026-07-28 era (`server/discover`). The tool contract is
+  unchanged: the 20 card/search tools that return a `_meta` block still
+  advertise and return `_meta` (FastMCP 4 would have renamed it to `meta`), and
+  `compare_verify_offer` still nests the card's block as `meta`.
+- Browser handoff on the sessionless era: such a connection has no session, and
+  FastMCP gives every request a new `session_id`, so a retry could never find
+  its retained tab, which then stayed open until it expired. A stdio server now
+  keeps the tab for its one client (the process) instead; over HTTP nothing
+  names the caller between requests, so the challenge is reported without
+  retaining the tab. Handshake-era clients keep the per-session behaviour.
+- `compare_browser_snapshot` reads the client's declared capabilities on both
+  eras (the vision hint was lost on 2026-07-28 connections, which send no
+  `initialize` params).
+- The stdio smoke test (`scripts/e2e_stdio_check.py`) probes every server in
+  both eras: 32 sessions instead of 16. New offline tests start real stdio and
+  loopback HTTP servers to pin the client scope and the bearer-token check in
+  both eras.
+- Dependabot already watches the digest-pinned Docker base images (#134,
+  shipped in v2.5.4); it now also watches the dev-only npm lockfile for offline
+  DOM-extractor tests, weekly, with minor and patch updates grouped (#140).
+
+### Fixed
+
+- Taobao кодирует пробел в поисковом запросе как `%20`, а не `+`: площадка
+  больше не ищет буквальное «iphone+15». Настоящий плюс остаётся `%2B`;
+  канонический URL один для поиска, кэша и сохранённой вкладки (#141).
+- Поиск Taobao возвращает обычные товары Tmall (`detail.tmall.com`) с их
+  настоящими URL, id, названием, ценой в юанях и магазином. Рекламные трекеры
+  `click.simba.taobao.com` намеренно исключены: переход оплачивает рекламодатель
+  и это не URL товара (#141).
+- `taobao_card` явно отказывает для Tmall: невосстановимый `bad_request`
+  объясняет, что карточки Tmall не поддерживаются, а основные данные уже есть
+  в поисковой выдаче. Политика разрешённых хостов не расширена (#141).
+- Сетка Taobao с маркером «加载中» перечитывается в той же вкладке около 10 с.
+  Если загрузка не закончилась, возвращается повторяемый `timeout`, в том числе
+  в `compare_prices`, а не `parser_drift`. Вход и капча по-прежнему сразу дают
+  `challenge_required`; пустая сетка без признака загрузки — `parser_drift`
+  (#141).
+
+- Taobao search: a space in the query is sent as `%20`, not `+`. Taobao read
+  `q=iphone+15` as the literal text "iphone+15", while the page's own search
+  box held "iphone 15" for `q=iphone%2015`. The URL is built in one place and
+  stays the cache and browser-handoff key; a literal plus in the query is still
+  escaped as `%2B`.
+- Taobao search: Tmall listings are no longer skipped. A `detail.tmall.com`
+  tile is an ordinary product — often the official brand store — and leaving it
+  out skewed price comparisons, so search now returns Tmall items with their
+  real host, id, title, price and shop. The `click.simba.taobao.com` ad-click
+  trackers stay out on purpose: visiting one bills the advertiser, and it is
+  not a product URL.
+- Taobao card: a Tmall listing is refused with a clear, non-retryable
+  `bad_request` instead of a raw navigation-policy error. Taobao redirects
+  Tmall items to `detail.tmall.com`, which the card's host policy refuses;
+  the tool now says that Tmall listings are not readable by `taobao_card` and
+  that the search result already carries the title, price, shop and URL. The
+  host policy itself is unchanged.
+- Taobao search: a grid that is still rendering («加载中») is no longer
+  reported as `parser_drift`. The extractor transports the loading marker as a
+  structural flag, the browser read re-checks the same page for about 10
+  seconds, and a grid that never finishes is a retryable `timeout` — in
+  `compare_prices` too, where the source now reads as `timeout` instead of
+  `parser_drift`. A login wall or a CAPTCHA never waits and still answers
+  `challenge_required`; a genuinely empty page is still `parser_drift`.
+
+## [2.5.4] - 2026-10-30
+
+### Fixed
+
+- Browser navigation: a 403 main document is no longer a block on sight. Ozon
+  answers the first request with 403 and a JS check that reloads the page by
+  itself, so `ozon_search` failed several times a week without any captcha.
+  Now the page gets up to 10 s for that reload; only a 403 that survives it
+  raises `NavBlocked`. The Playwright path waits for the new document to land,
+  so the host check sees its URL and a redirect resolves to its final status.
+  The raw-CDP path counts only main-frame documents: a 200 iframe on a block
+  page no longer turns the block into data. Thanks @dont99code (#133).
+- Browser handoff: the idle bound no longer switches off when the event-loop
+  clock is young (under ~60 s since boot). `last_used` used `0.0` as "never
+  used", but loop time counts from boot, so a real timestamp can be zero or
+  negative; the marker is now `None`. Caught by the nightly CI on a fresh VM.
+
+### Security
+
+- Locked dependencies moved past every published advisory: pip-audit on the
+  exported lock went from 64 known vulnerabilities in 10 packages (Authlib,
+  certifi, cryptography, dnspython, FastMCP, filelock, mcp, opentelemetry-api,
+  PyJWT, virtualenv) to none, and npm audit on the dev-only lock from 2 high
+  to none. FastMCP stays on the 3.x line (3.4.11). Workflow actions are pinned
+  to commit SHAs and the Docker base images to digests. Thanks @ilodezis (#132).
+- Dependabot now also watches the Docker base images, so the digest pins pick
+  up rebuilt images; the builder's uv moved to 0.13.6 and CI's setup-uv to
+  v10 (#134, #135, #136).
+
 ## [2.5.3] - 2026-10-13
 
 ### Fixed

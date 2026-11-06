@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import socket
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from mcp_core.transport import chrome_cdp
@@ -77,6 +78,36 @@ def test_a_malformed_host_falls_back_to_loopback(monkeypatch, bad):
 def test_an_ipv6_host_with_colons_is_kept(monkeypatch):
     monkeypatch.setenv("CHROME_CDP_HOST", "::1")
     assert chrome_cdp._host_from_env() == "::1"
+
+
+@pytest.mark.parametrize("spelling", ["::1", "[::1]"])
+def test_an_ipv6_host_dials_in_brackets_and_stays_loopback(monkeypatch, spelling):
+    """(audit S1-F7) Bare ::1 used to build http://::1:9222; [::1] used to count as remote."""
+    monkeypatch.setenv("CHROME_CDP_HOST", spelling)
+    host = chrome_cdp._host_from_env()
+
+    assert host == "::1"
+    assert host in chrome_cdp._LOOPBACK_HOSTS
+    url = urlsplit(f"http://{chrome_cdp._url_host(host)}:9222/json/version")
+    assert (url.hostname, url.port) == ("::1", 9222)
+
+
+@pytest.mark.parametrize("bad", ["[::1", "::1]", "[[::1]]"])
+def test_a_half_bracketed_ipv6_host_falls_back_to_loopback(monkeypatch, bad):
+    monkeypatch.setenv("CHROME_CDP_HOST", bad)
+    assert chrome_cdp._host_from_env() == "127.0.0.1"
+
+
+def test_the_browser_websocket_of_an_ipv6_host_is_bracketed(monkeypatch):
+    monkeypatch.setattr(chrome_cdp, "CDP_HOST", "::1")
+    monkeypatch.setattr(chrome_cdp, "CDP_PORT", 9222)
+    monkeypatch.setattr(
+        chrome_cdp,
+        "_cdp_http_json",
+        lambda path, timeout_s: {"webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/x"},
+    )
+
+    assert chrome_cdp._browser_ws_url() == "ws://[::1]:9222/devtools/browser/x"
 
 
 def test_cdp_url_uses_the_configured_host(monkeypatch):
@@ -436,12 +467,12 @@ async def test_open_page_keeps_the_tab_count_when_raw_fallback_fails_too(monkeyp
     from mcp_core.errors import TransportDownError
 
     @asynccontextmanager
-    async def attach_times_out(_url, _wait_ms):
+    async def attach_times_out(_url, _wait_ms, *, navigation_timeout_ms):
         raise chrome_cdp._CdpConnectTimeout("attach timed out after 10 s; 12 tabs are open in the scraping Chrome.")
         yield
 
     @asynccontextmanager
-    async def raw_fails(_url, _wait_ms):
+    async def raw_fails(_url, _wait_ms, *, navigation_timeout_ms):
         raise TimeoutError("raw navigation stalled")
         yield
 
@@ -632,6 +663,8 @@ class _FakeWs:
         import json as _json
 
         await _asyncio.sleep(0)
+        if not self._responses:
+            await _asyncio.Event().wait()
         return _json.dumps(self._responses.pop(0))
 
 
@@ -699,9 +732,11 @@ def test_goto_and_status_returns_the_last_document_status_and_stops_on_load():
     assert page.url == "https://x/final"
 
 
-def test_goto_and_status_reports_a_block_page():
-    """A 403 main document is a verdict open_page turns into NavBlocked."""
+def test_goto_and_status_reports_a_block_page(monkeypatch):
+    """A 403 that outlives the anti-bot recheck is a verdict open_page turns into NavBlocked."""
     import asyncio
+
+    monkeypatch.setattr(chrome_cdp, "_ANTIBOT_RECHECK_S", 0.05)
 
     ws = _FakeWs(
         [
@@ -716,3 +751,137 @@ def test_goto_and_status_reports_a_block_page():
     page = chrome_cdp._RawCdpPage(ws, "T1")
 
     assert asyncio.run(page.goto_and_status("https://x/")) == 403
+
+
+def test_goto_and_status_waits_out_an_antibot_reload():
+    """Ozon's 403 + self-reloading JS check ends on the real page, not a block."""
+    import asyncio
+
+    ws = _FakeWs(
+        [
+            {"id": 1, "result": {"frameId": "F"}},
+            {"method": "Network.responseReceived", "params": {"type": "Document", "response": {"status": 403}}},
+            {"method": "Page.loadEventFired", "params": {}},
+            {
+                "method": "Network.responseReceived",
+                "params": {"type": "Document", "response": {"status": 200, "url": "https://x/real"}},
+            },
+            {"method": "Page.loadEventFired", "params": {}},
+        ]
+    )
+    page = chrome_cdp._RawCdpPage(ws, "T1")
+
+    assert asyncio.run(page.goto_and_status("https://x/")) == 200
+    assert page.url == "https://x/real"
+
+
+def test_goto_and_status_ignores_a_subframe_document(monkeypatch):
+    """A 200 iframe on a 403 block page is not the page's status or URL."""
+    import asyncio
+
+    monkeypatch.setattr(chrome_cdp, "_ANTIBOT_RECHECK_S", 0.05)
+
+    ws = _FakeWs(
+        [
+            {"id": 1, "result": {"frameId": "F"}},
+            {
+                "method": "Network.responseReceived",
+                "params": {"type": "Document", "frameId": "F", "response": {"status": 403, "url": "https://x/"}},
+            },
+            {"method": "Page.loadEventFired", "params": {}},
+            {
+                "method": "Network.responseReceived",
+                "params": {"type": "Document", "frameId": "IF", "response": {"status": 200, "url": "https://widget/"}},
+            },
+        ]
+    )
+    page = chrome_cdp._RawCdpPage(ws, "T1")
+
+    assert asyncio.run(page.goto_and_status("https://x/")) == 403
+    assert page.url == "https://x/"
+
+
+class _FakeNavigation:
+    """page.expect_navigation(): resolves to a response, to None, or times out."""
+
+    def __init__(self, page, outcome):
+        self._page = page
+        self._outcome = outcome
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._outcome == "timeout":
+            raise chrome_cdp._PlaywrightTimeoutError("no navigation")
+        if self._outcome is not None:
+            self._page.url = "https://shop.test/real"
+        return False
+
+    @property
+    async def value(self):
+        from types import SimpleNamespace
+
+        return None if self._outcome is None else SimpleNamespace(status=self._outcome)
+
+
+class _FakeNavPage:
+    """Just enough of a Playwright page for _playwright_page's 403 recheck."""
+
+    def __init__(self, outcome):
+        self.url = "https://shop.test/p"
+        self._outcome = outcome
+        self.waits: list[dict] = []
+
+    async def goto(self, url, **_kwargs):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(status=403)
+
+    def expect_navigation(self, **kwargs):
+        self.waits.append(kwargs)
+        return _FakeNavigation(self, self._outcome)
+
+    async def wait_for_timeout(self, _ms):
+        return None
+
+    async def close(self):
+        return None
+
+
+def _patch_playwright_tab(monkeypatch, fake_page):
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_context():
+        yield object()
+
+    async def fake_new_tab(_ctx):
+        return fake_page
+
+    monkeypatch.setattr(chrome_cdp, "STEALTH", False)
+    monkeypatch.setattr(chrome_cdp, "get_context", fake_context)
+    monkeypatch.setattr(chrome_cdp, "_new_tab", fake_new_tab)
+
+
+async def test_playwright_403_recovers_when_the_main_frame_reloads_to_200(monkeypatch):
+    """The recheck waits for the new document to land, so page.url is already the new one."""
+    fake_page = _FakeNavPage(outcome=200)
+    _patch_playwright_tab(monkeypatch, fake_page)
+
+    async with chrome_cdp._playwright_page("https://shop.test/p", wait_ms=0) as page:
+        assert page.url == "https://shop.test/real"
+
+    assert fake_page.waits == [{"wait_until": "domcontentloaded", "timeout": chrome_cdp._ANTIBOT_RECHECK_S * 1000}]
+
+
+@pytest.mark.parametrize("outcome", ["timeout", None, 403], ids=["no-reload", "history-api", "reload-403"])
+async def test_playwright_403_stays_a_block_without_a_good_reload(monkeypatch, outcome):
+    """No navigation, a History API change or another 403 all end as NavBlocked(403)."""
+    _patch_playwright_tab(monkeypatch, _FakeNavPage(outcome=outcome))
+
+    with pytest.raises(chrome_cdp.NavBlocked) as blocked:
+        async with chrome_cdp._playwright_page("https://shop.test/p", wait_ms=0):
+            pass
+
+    assert blocked.value.status == 403

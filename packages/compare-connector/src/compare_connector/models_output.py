@@ -5,6 +5,18 @@ omits a marketplace is worse than one that says it failed. Hence per-source
 outcomes alongside the merged offer list, and a ``complete`` flag the caller can
 check before drawing conclusions.
 """
+# START_MODULE_CONTRACT
+# PURPOSE: Describe comparison offers, everyday-price ranking and per-source outcomes.
+# SCOPE: Additive typed outputs; preserve native conditional prices without ranking them.
+# DEPENDS: Pydantic; compare_connector.identity.
+# LINKS: M-COMPARE; R-COMPARE-CONDITIONAL-PRICE; R-COMPARE-VARIANT-IDENTITY; R-NO-FABRICATION; R-TOOL-SCHEMA;
+#        R-CDP-HOST-PAUSE; R-CHALLENGE-ACTION.
+# END_MODULE_CONTRACT
+# START_MODULE_MAP
+# MarketOffer: Carry everyday/native prices and optional source price kind.
+# SourceOutcome: Report source access, diagnostics and recovery signals.
+# CompareResponse: Return eligible winners, all offers and warnings.
+# END_MODULE_MAP
 
 from __future__ import annotations
 
@@ -13,6 +25,7 @@ from pydantic import BaseModel, Field, model_validator
 from compare_connector.identity import OfferEvidence, ProductIdentity
 
 
+# START_BLOCK_OUTPUT_MODELS
 class MarketOffer(BaseModel):
     """One offer, normalised across marketplaces so prices are comparable."""
 
@@ -29,6 +42,13 @@ class MarketOffer(BaseModel):
             "and always None for a marketplace that quotes in another currency."
         ),
     )
+    price_kind: str | None = Field(
+        default=None,
+        description=(
+            "Kind of price_native: 'regular', 'wallet', 'subscription', or another source-reported condition. "
+            "None when unreported. Conditional amounts never rank; price_rub stays None without an everyday price."
+        ),
+    )
     currency: str = Field(
         default="rub",
         description="Currency of price_native, lowercase ISO code. Only 'rub' offers enter the ranking.",
@@ -36,8 +56,8 @@ class MarketOffer(BaseModel):
     price_native: float | None = Field(
         default=None,
         description=(
-            "Price as the marketplace quotes it, in `currency`. Equals price_rub for Russian "
-            "sources; for Taobao it carries the yuan price that price_rub deliberately omits."
+            "Price as the marketplace quotes it, in `currency`. Mirrors an available everyday price_rub; "
+            "also preserves conditional-only amounts when price_rub is None. For Taobao it carries the yuan price."
         ),
     )
     price_with_subscription_rub: float | None = Field(
@@ -62,11 +82,10 @@ class MarketOffer(BaseModel):
 
     @model_validator(mode="after")
     def _mirror_rouble_price_into_native(self) -> MarketOffer:
-        """For rouble sources the native price is the rouble price.
+        """Mirror everyday RUB prices only when no explicit native price is supplied.
 
-        Filling this here rather than in nine adapters means price_native is
-        always the number the marketplace actually showed, whatever the source,
-        so a caller can read one field without special-casing Taobao.
+        Conditional-only quotes supplied by an adapter remain in price_native
+        without inventing an everyday price_rub.
         """
         if self.price_native is None and self.currency == "rub":
             self.price_native = self.price_rub
@@ -83,7 +102,7 @@ class SourceOutcome(BaseModel):
     source: str = Field(default="", description="Marketplace name.")
     status: str = Field(
         default="",
-        description="ok, blocked (anti-bot or rate limit), timeout, error, or not_installed.",
+        description="ok, blocked (anti-bot or rate limit), timeout, error, unhealthy, or not_installed.",
     )
     detail: str = Field(default="", description="Human-readable outcome detail; the error text when it failed.")
     warnings: list[str] = Field(
@@ -95,6 +114,14 @@ class SourceOutcome(BaseModel):
     retryable: bool = Field(
         default=False, description="Retry may succeed; user action must be completed first if required."
     )
+    retry_after_s: float | None = Field(
+        default=None, description="Seconds to wait before retrying, when the source reports a pause."
+    )
+    retryable_now: bool | None = Field(
+        default=None, description="False when a plain retry now cannot work; None when unreported."
+    )
+    retry_when: str | None = Field(default=None, description="When to call again, e.g. after_user_confirmation.")
+    user_action: str | None = Field(default=None, description="Human step that unblocks this source, when named.")
     requires_user_action: bool = Field(
         default=False, description="Pause retries for this source until browser action completes."
     )
@@ -126,7 +153,8 @@ class CompareResponse(BaseModel):
     cheapest_comparable: MarketOffer | None = Field(
         default=None,
         description=(
-            "Lowest everyday price among offers whose titles do not identify an accessory or a used/display condition. "
+            "Lowest everyday price among offers whose titles do not name an accessory, a used/display "
+            "condition, or a storage/memory size contradicting the size the query states. "
             "Use this for a like-for-like recommendation; cheapest retains the raw lowest listing."
         ),
     )
@@ -144,3 +172,6 @@ class CompareResponse(BaseModel):
     )
     warnings: list[str] = Field(default_factory=list, description="Connector-level warnings (partial data, no prices).")
     server_version: str = Field(default="", description="Connector version.")
+
+
+# END_BLOCK_OUTPUT_MODELS

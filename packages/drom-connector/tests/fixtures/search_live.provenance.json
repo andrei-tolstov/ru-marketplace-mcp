@@ -1,0 +1,9 @@
+{
+  "url": "https://baza.drom.ru/vladivostok/sell_spare_parts/+/%D1%84%D0%B0%D1%80%D0%B0+camry/",
+  "captured_at": "2026-10-18",
+  "sha256": "1abb891ba6d9bce9f67a9f9065499aa066e3ee64f98c5d67b39b0aaa44867abc",
+  "method": "Captured HTML from baza.drom.ru using Chrome CDP and residential proxy",
+  "ground_truth": {
+    "note": "Search results HTML for query fara camry"
+  }
+}

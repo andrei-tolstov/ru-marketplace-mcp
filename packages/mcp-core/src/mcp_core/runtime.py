@@ -20,15 +20,17 @@ Two rules this module exists to enforce, both protocol- or security-critical:
 """
 # START_MODULE_CONTRACT
 # PURPOSE: Resolve and launch stdio or authenticated HTTP-family MCP servers.
-# SCOPE: Environment parsing, launch diagnostics and graceful handoff cleanup.
-# DEPENDS: FastMCP; mcp_core.logging; loaded browser_handoff at shutdown; stdlib.
+# SCOPE: Environment parsing, launch diagnostics, per-era client scope and graceful handoff cleanup.
+# DEPENDS: FastMCP; mcp_types protocol versions; mcp_core.logging; loaded browser_handoff at shutdown; stdlib.
 # LINKS: M-RUNTIME; M-LOGGING; M-BROWSER-HANDOFF.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
-# current_mcp_session_id: Resolve tool-call session identity or None for CLI probes.
+# STDIO_CLIENT_SCOPE: Stand in for the one stdio client on sessionless connections.
+# current_client_scope: Resolve the calling client per protocol era, or None.
 # browser_handoff_lifespan: Close already-loaded handoffs on server shutdown.
 # TransportConfig: Hold transport and loopback/default endpoint configuration.
 # BearerAuthMiddleware: Compare bearer token and optional static tenant identity.
+# ToolErrorRedactionMiddleware: Redact credentials FastMCP leaves in an unexpected ToolError.
 # _parse_transport: Reject unsupported transport names; blank defaults to stdio.
 # _parse_port: Validate configured TCP port bounds.
 # _parse_host: Trim the bind host or select loopback.
@@ -49,21 +51,44 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_context, get_http_request
 from fastmcp.server.middleware import Middleware
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from mcp_core.logging import log_event
+from mcp_core.redact import redact_error_text
 
 if TYPE_CHECKING:
     from fastmcp import Context, FastMCP
 
 
-def current_mcp_session_id(ctx: Context | None = None) -> str | None:
-    """Resolve direct and mounted tool calls; CLI probes have no MCP session."""
+# One stdio process serves exactly one client, the one holding its pipes, so on
+# a sessionless connection the process stands in for that client's session.
+STDIO_CLIENT_SCOPE = "stdio-process"
+
+
+def current_client_scope(ctx: Context | None = None) -> str | None:
+    """Identify the client a tool call belongs to, or None when nothing does.
+
+    FastMCP 4 serves two protocol eras. A handshake-era connection (2025-11-25
+    and older) has a session whose id stays the same across calls. A 2026-07-28
+    connection has no session: FastMCP mints a new ``session_id`` per request,
+    so it cannot tie a retry to the call that opened a challenge tab. There a
+    stdio server uses the process scope; HTTP and in-memory servers get None,
+    because nothing names the caller from one request to the next. CLI probes
+    run outside any request and also get None.
+    """
     try:
-        return (ctx or get_context()).session_id
+        context = ctx or get_context()
+        request = context.request_context
+        if request is None:
+            return None
+        if request.protocol_version not in MODERN_PROTOCOL_VERSIONS:
+            return context.session_id
     except RuntimeError:
         return None
+    return STDIO_CLIENT_SCOPE if context.transport == "stdio" else None
 
 
 @asynccontextmanager
@@ -77,7 +102,7 @@ async def browser_handoff_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             await handoff.close_handoffs()
 
 
-# The transport strings FastMCP 3.x accepts for these servers. "stdio" is the
+# The transport strings FastMCP 4.x accepts for these servers. "stdio" is the
 # default and the only one existing client configs rely on. "http" is the
 # modern streamable-HTTP transport; "streamable-http" is its explicit alias and
 # "sse" is the older Server-Sent-Events transport, both kept so operators who
@@ -154,6 +179,38 @@ class BearerAuthMiddleware(Middleware):
 
                 raise AuthorizationError("HTTP tenant identity mismatch")
         return await call_next(context)
+
+
+class ToolErrorRedactionMiddleware(Middleware):
+    """Redact credentials FastMCP's own error boundary leaves in a ToolError.
+
+    FastMCP answers any non-FastMCP exception raised by a tool with
+    ``ToolError(f"Error calling tool {name!r}: {e}")`` built from the raw
+    exception text, and that happens outside every tool's own error handling: a
+    ``ValueError`` carrying a proxy URL or a token reaches the client before any
+    connector code can redact it. This is the one place that closes the hole for
+    every server and every transport. Errors this project raises itself go
+    through ``raise_tool_error``, which already redacts, so their text does not
+    change under the same rules and they pass through untouched
+    (R-SECRET-REDACTION).
+    """
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            return await call_next(context)
+        except ToolError as exc:
+            text = str(exc)
+            # No bound: this middleware redacts, it does not truncate. Cutting a
+            # structured JSON error at redact_error_text's default 500
+            # characters would hand the agent unparseable JSON, and even the
+            # text's own length can cut it, because a secret shorter than
+            # "<redacted>" grows the text.
+            redacted = redact_error_text(text, max_len=sys.maxsize)
+            if redacted == text:
+                raise
+            # __cause__ keeps the original ToolError for a traceback; only the
+            # text the client reads changes.
+            raise ToolError(redacted) from exc
 
 
 def _parse_transport(raw: str | None) -> Transport:
@@ -246,6 +303,11 @@ def run_server(mcp: FastMCP, *, server_name: str) -> int:
     stdout to the JSON-RPC stream.
     """
     config = resolve_transport()
+
+    # Installed before anything can run, on every transport: this is the only
+    # boundary that sees the ToolError FastMCP builds from an unexpected
+    # exception, which carries the raw exception text (R-SECRET-REDACTION).
+    mcp.add_middleware(ToolErrorRedactionMiddleware())
 
     try:
         if config.is_http:

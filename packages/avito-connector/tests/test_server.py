@@ -14,7 +14,10 @@ from pathlib import Path
 
 import pytest
 from avito_connector import server
+from avito_connector.shape_reference import SEARCH_REQUIRED_FAMILIES
 from fastmcp.exceptions import ToolError
+from mcp_core.transport import chrome_cdp
+from mcp_core.transport.cdp_budget import NavigationBudget
 
 # ---------------------------------------------------------------- fixtures ----
 
@@ -96,6 +99,18 @@ def _patch_item_page(monkeypatch, result):
     monkeypatch.setattr(server, "_fetch_item_page", fake_fetch_item_page)
 
 
+def _patch_item_page_recording(monkeypatch, result):
+    """Patch the card fetch and report every URL the tool tried to open."""
+    calls = []
+
+    async def fake_fetch_item_page(url, ctx):
+        calls.append(url)
+        return result
+
+    monkeypatch.setattr(server, "_fetch_item_page", fake_fetch_item_page)
+    return calls
+
+
 def _patch_selfcheck_pages(monkeypatch, product_html):
     fixtures = Path(__file__).parent / "fixtures"
     block = (fixtures / "item_seller_block_7924452716.html").read_text(encoding="utf-8")
@@ -106,6 +121,21 @@ def _patch_selfcheck_pages(monkeypatch, product_html):
         return 200, profile if "/brands/" in url else card, "cdp"
 
     monkeypatch.setattr(server, "_fetch_item_page", fake_fetch_item_page)
+
+
+async def _open_breaker(host: str, *, cooldown_s: float = 47.0) -> NavigationBudget:
+    """Drive a real budget through its public API until its breaker opens.
+
+    A dedicated instance with a frozen clock: two 4xx refusals with a 2-refusal
+    threshold open the breaker, leaving ``cooldown_s`` seconds of pause and the
+    refusal count the mapped error must report.
+    """
+    budget = NavigationBudget(breaker_threshold=2, breaker_cooldown_s=cooldown_s, clock=lambda: 1000.0)
+    for _ in range(2):
+        slot = await budget.acquire(host)
+        slot.refused(403)
+        slot.release()
+    return budget
 
 
 # --------------------------------------------------------------- avito_search ----
@@ -174,6 +204,35 @@ async def test_search_maps_non_json_to_parser_drift(monkeypatch):
         await server.avito_search("ноутбук")
 
 
+async def test_search_reports_the_host_pause_with_its_remaining_cooldown(monkeypatch):
+    """R-CDP-HOST-PAUSE: an open navigation breaker surfaces as rate_limited
+    with retry_after_s, through the real _fetch path (tier-1 refusal, then
+    CDP), not as a generic retryable transport failure. On the old code the
+    budget's HostRefusingError was swallowed by _fetch's except Exception and
+    the agent saw transport_down with no pause at all."""
+
+    async def no_wait():
+        return None
+
+    def refused_get(url, proxy=None):
+        return 403, "denied"
+
+    monkeypatch.setattr(server, "_polite_wait", no_wait)
+    monkeypatch.setattr(server, "_sync_curl_get", refused_get)
+    budget = await _open_breaker("www.avito.ru")
+    monkeypatch.setattr(chrome_cdp, "navigation_budget", lambda: budget)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.avito_search("ноутбук")
+
+    error = json.loads(str(excinfo.value))
+    assert error["error"] == "rate_limited"
+    assert error["retryable"] is True
+    assert error["retry_after_s"] == 47.0
+    assert error["provider"] == "www.avito.ru"
+    assert "paused for 47 s after 2 refusals" in error["message"]
+
+
 async def test_search_warns_on_empty_items_with_nonzero_total(monkeypatch):
     payload = {"totalCount": 41, "items": []}
     _patch_fetch(monkeypatch, _ok(payload))
@@ -183,6 +242,67 @@ async def test_search_warns_on_empty_items_with_nonzero_total(monkeypatch):
     assert result.count == 0
     assert result.meta.healthy is False
     assert "empty_items_with_nonzero_total" in result.meta.warnings
+
+
+async def test_search_warns_when_a_required_key_family_vanishes(monkeypatch):
+    """A payload that still parses but lost a whole alias family is drift the
+    agent must see in the tool's own response, not only via doctor."""
+    price_family = next(family for family in SEARCH_REQUIRED_FAMILIES if "items[].price" in family)
+    payload = {
+        **SEARCH_PAYLOAD,
+        "items": [{key: value for key, value in item.items() if key != "price"} for item in SEARCH_PAYLOAD["items"]],
+    }
+    _patch_fetch(monkeypatch, _ok(payload))
+
+    result = await server.avito_search("ноутбук")
+
+    assert result.count == 2
+    assert result.meta.healthy is False
+    # The warning names the WHOLE family (both envelopes' aliases, catalog
+    # first), so compare against the registry's own join.
+    assert f"shape_drift: avito_search: missing {'/'.join(price_family)}" in result.meta.warnings
+
+
+async def test_search_a_complete_payload_carries_no_shape_drift_warning(monkeypatch):
+    _patch_fetch(monkeypatch, _ok(SEARCH_PAYLOAD))
+
+    result = await server.avito_search("thinkpad")
+
+    assert result.meta.healthy is True
+    assert not [w for w in result.meta.warnings if w.startswith("shape_drift:")]
+
+
+async def test_search_reads_the_data_items_envelope_without_shape_drift(monkeypatch):
+    """The third envelope ``_parse_search_items`` accepts: listings served only
+    under data.items[] must answer healthy, not read as a page whose every key
+    family vanished."""
+    _patch_fetch(monkeypatch, _ok({"totalCount": 137, "data": {"items": SEARCH_PAYLOAD["items"]}}))
+
+    result = await server.avito_search("ноутбук")
+
+    assert result.count == 2
+    assert result.meta.healthy is True
+    assert not [w for w in result.meta.warnings if w.startswith("shape_drift:")]
+
+
+async def test_search_flags_a_family_lost_in_the_data_items_envelope(monkeypatch):
+    """The aliases make the check honest rather than silent: with the price keys
+    gone, the missing family named is the price one, not the id family the old
+    registry could only see."""
+    price_family = next(family for family in SEARCH_REQUIRED_FAMILIES if "price" in family[0])
+    payload = {
+        "totalCount": 137,
+        "data": {
+            "items": [{key: value for key, value in item.items() if key != "price"} for item in SEARCH_PAYLOAD["items"]]
+        },
+    }
+    _patch_fetch(monkeypatch, _ok(payload))
+
+    result = await server.avito_search("ноутбук")
+
+    assert result.count == 2
+    assert result.meta.healthy is False
+    assert f"shape_drift: avito_search: missing {'/'.join(price_family)}" in result.meta.warnings
 
 
 @pytest.mark.parametrize(
@@ -338,11 +458,163 @@ async def test_card_rejects_input_without_an_item_id(bad):
         await server.avito_card(bad)
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://www.avito.ru/profile/x_1234567890",
+        "https://avito.ru/account/x_1234567890",
+        "https://www.avito.ru/orders/x_1234567890",
+        "https://www.avito.ru/favorites/x_1234567890",
+        "https://www.avito.ru/profile/favorites/saved/x_1234567890",
+        "https://www.avito.ru/x_1234567890/extra",
+        "https://www.avito.ru/api/1/anything",
+        "https://www.avito.ru/api/personal/x_1234567890",
+        "https://www.avito.ru/profile/items/x_1234567890",
+        "https://www.avito.ru/profile",
+        "https://www.avito.ru/account",
+        "https://www.avito.ru/orders",
+        "https://www.avito.ru/favorites",
+    ],
+    ids=[
+        "profile-item-tail",
+        "account-item-tail",
+        "orders-item-tail",
+        "favorites-item-tail",
+        "deep-personal-path",
+        "item-tail-then-path",
+        "api-path",
+        "api-prefix-item-shape",
+        "profile-prefix-item-shape",
+        "profile",
+        "account",
+        "orders",
+        "favorites",
+    ],
+)
+async def test_card_refuses_non_item_page_paths_before_transport(monkeypatch, bad):
+    """R-INPUT-TRUST: the card opens pages in the operator's logged-in Chrome,
+    so a full URL is fetched only when its path is an item-page shape. A
+    personal prefix with an item-like tail (/profile/x_1234567890 passes the
+    bare item-id regex) must be refused as bad_request before any navigation,
+    not fetched and later misclassified."""
+    calls = _patch_item_page_recording(monkeypatch, (200, CARD_HTML, "cdp"))
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.avito_card(bad)
+
+    assert "bad_request" in str(excinfo.value)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://www.avito.ru/profile\\x_1234567890",
+        "https://www.avito.ru/profile%2Fx_1234567890",
+        "https://www.avito.ru/profile%2fx_1234567890",
+        "https://www.avito.ru/profile%5Cx_1234567890",
+        "https://www.avito.ru/profile%5cx_1234567890",
+    ],
+    ids=["backslash", "percent-2F", "percent-2f", "percent-5C", "percent-5c"],
+)
+async def test_card_refuses_separator_escapes_before_transport(monkeypatch, bad):
+    """R-AVITO-ITEM-PATH: an item path is a plain ASCII slug, so a backslash or
+    a percent escape is refused outright. Both make the browser read a path the
+    check never saw — Chromium treats "\\" as "/" in http(s) URLs, and a server
+    decodes %2F/%5C into a separator — so /profile\\x_1234567890 and
+    /profile%2Fx_1234567890 would open the personal route this check exists to
+    refuse. On the pre-fix code each of these was fetched, not refused."""
+    calls = _patch_item_page_recording(monkeypatch, (200, CARD_HTML, "cdp"))
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.avito_card(bad)
+
+    assert "bad_request" in str(excinfo.value)
+    assert calls == []
+
+
+async def test_card_still_opens_a_plain_city_category_slug_path(monkeypatch):
+    """The same guard must not touch ordinary slugs: plain ASCII item paths keep
+    working, fetched exactly as validated."""
+    calls = _patch_item_page_recording(monkeypatch, (200, CARD_HTML, "cdp"))
+
+    result = await server.avito_card("https://www.avito.ru/moskva/telefony/iphone_15_4612345678")
+
+    assert calls == ["https://www.avito.ru/moskva/telefony/iphone_15_4612345678"]
+    assert result.item_id == 4612345678
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_url"),
+    [
+        (
+            "https://www.avito.ru/moskva/noutbuki/noutbuk_thinkpad_x1_carbon_4612345678",
+            "https://www.avito.ru/moskva/noutbuki/noutbuk_thinkpad_x1_carbon_4612345678",
+        ),
+        (
+            "http://avito.ru/moskva/noutbuki/noutbuk_thinkpad_x1_carbon_4612345678",
+            "http://avito.ru/moskva/noutbuki/noutbuk_thinkpad_x1_carbon_4612345678",
+        ),
+        (
+            "https://www.avito.ru/noutbuk_thinkpad_x1_carbon_4612345678/",
+            "https://www.avito.ru/noutbuk_thinkpad_x1_carbon_4612345678/",
+        ),
+        (
+            "https://avito.ru/moskva/noutbuki/noutbuk_thinkpad_x1_carbon_4612345678?context=1#details",
+            "https://avito.ru/moskva/noutbuki/noutbuk_thinkpad_x1_carbon_4612345678",
+        ),
+    ],
+    ids=["www-https", "no-www-http", "slug-with-trailing-slash", "query-fragment-dropped"],
+)
+async def test_card_keeps_opening_real_item_urls_normalized(monkeypatch, raw, expected_url):
+    """Real item URLs keep working: city/category slug segments, with or
+    without www, http or https, a trailing slash and a query string — the
+    validated path is opened unchanged, the query/fragment dropped."""
+    calls = _patch_item_page_recording(monkeypatch, (200, CARD_HTML, "cdp"))
+
+    result = await server.avito_card(raw)
+
+    assert calls == [expected_url]
+    assert result.item_id == 4612345678
+
+
+async def test_card_accepts_a_bare_id_item_url(monkeypatch):
+    """/<id> is the item-page shape the bare-id branch itself navigates to."""
+    calls = _patch_item_page_recording(monkeypatch, (200, CARD_HTML, "cdp"))
+
+    result = await server.avito_card("https://www.avito.ru/4612345678")
+
+    assert calls == ["https://www.avito.ru/4612345678"]
+    assert result.item_id == 4612345678
+
+
 async def test_card_maps_404_to_not_found(monkeypatch):
     _patch_item_page(monkeypatch, (404, "<html><body>Объявление не найдено</body></html>", "cdp"))
 
     with pytest.raises(ToolError):
         await server.avito_card("4612345678")
+
+
+async def test_card_reports_the_host_pause_with_its_remaining_cooldown(monkeypatch):
+    """R-CDP-HOST-PAUSE: same contract through _fetch_item_page, whose broad
+    except Exception used to swallow the pause into a generic CDP failure."""
+
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr(server, "_polite_wait", no_wait)
+    budget = await _open_breaker("www.avito.ru")
+    monkeypatch.setattr(chrome_cdp, "navigation_budget", lambda: budget)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.avito_card("4612345678")
+
+    error = json.loads(str(excinfo.value))
+    assert error["error"] == "rate_limited"
+    assert error["retryable"] is True
+    assert error["retry_after_s"] == 47.0
+    assert error["provider"] == "www.avito.ru"
+    assert "paused for 47 s after 2 refusals" in error["message"]
 
 
 # --------------------------------------------------------------- avito_seller ----

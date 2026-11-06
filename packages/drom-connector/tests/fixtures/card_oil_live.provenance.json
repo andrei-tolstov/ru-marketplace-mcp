@@ -1,0 +1,9 @@
+{
+  "url": "https://baza.drom.ru/vladivostok/chemistry/motoroil/motornoe-maslo-toyota-motor-oil-0w-20-4l-sinteticheskoe-08880-12605-g12841036510.html",
+  "captured_at": "2026-10-18",
+  "sha256": "bb64da66385d9ce8cc125212d92959a5a2fa9967681d9ebf67be361aed8ca354",
+  "method": "Captured HTML from baza.drom.ru using Chrome CDP and residential proxy",
+  "ground_truth": {
+    "note": "Card of motor oil with price, attributes and seller"
+  }
+}

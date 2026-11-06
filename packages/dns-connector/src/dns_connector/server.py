@@ -22,15 +22,16 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 # START_MODULE_CONTRACT
 # PURPOSE: Expose DNS-Shop product search and cards from rendered pages.
 # SCOPE: Read-only paced CDP reads; reject Qrator walls before mapping or caching.
-# DEPENDS: FastMCP; mcp_core DOM/CDP/cache/pacing; models_output; settings; shape_reference.
-# LINKS: M-DNS; M-COMPARE; M-MARKETPLACE; packages/dns-connector/tests.
+# DEPENDS: FastMCP; mcp_core DOM/CDP/cache/pacing/kit; models_output; settings; shape_reference.
+# LINKS: M-DNS; M-KIT; M-COMPARE; M-MARKETPLACE; packages/dns-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
-# _extract_product_id: Validate bare handles or product URLs before navigation.
+# _polite_wait: Delegate this source's pacing gap to mcp_core.kit.polite_wait.
+# _extract_product_id: Validate bare handles or dns-shop.ru product URLs before navigation (shared host check).
 # _search_item_from_tile: Adapt DOM price/availability fields into public models.
-# _cdp_render: Serialize paced browser navigation and extractor execution.
+# _cdp_render: Delegate paced browser navigation and extractor execution to mcp_core.kit.render_json.
 # _is_qrator_wall: Detect positive document-title or Qrator-markup evidence.
-# dns_search: Reject walls before mapping/cache; flag unrecognized empty grids.
+# dns_search: Reject walls before mapping/cache; flag unrecognized empty grids; warn when a required key vanishes.
 # dns_card: Read product-only title/price/stock; reject walls before mapping/cache.
 # dns_selfcheck: Classify walls as inconclusive/blocked; not an MCP tool.
 # END_MODULE_MAP
@@ -39,13 +40,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import json
 import re
 import urllib.parse
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
@@ -57,12 +56,15 @@ from mcp_core.errors import (
     ToolError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import host_checked_id, polite_wait, render_json
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
-from mcp_core.transport.chrome_cdp import NavBlocked, open_page
+from mcp_core.resources import register_reference_resources
+from mcp_core.transport.chrome_cdp import NavBlocked
 from pydantic import Field
 
 from dns_connector.models_output import (
@@ -77,7 +79,7 @@ from dns_connector.shape_reference import SEARCH_REQUIRED_KEYS, SEARCH_SHAPE_REF
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://www.dns-shop.ru"
@@ -108,10 +110,10 @@ mcp = FastMCP(
         "DNS-Shop electronics catalog: search and product cards. Every read "
         "runs in the operator's own Chrome over CDP — Qrator's proof-of-work "
         "blocks all anonymous access. Start with dns_search; dns_card takes a "
-        "product id or dns-shop.ru product URL."
+        "product id or dns-shop.ru product URL. "
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
     ),
 )
-mcp.add_middleware(RetryMiddleware())
 
 _cache: TTLCache = TTLCache(ttl_s=_settings.cache_ttl, max_entries=128)
 _pacer = Pacer(_min_gap)
@@ -122,9 +124,11 @@ async def _polite_wait() -> None:
     """Space this source's requests out, and back off if it refused us.
 
     Reads ``_min_gap`` at call time so an operator or a test can retune the
-    pace without rebuilding the pacer.
+    pace without rebuilding the pacer. The pacing itself is shared
+    (mcp_core.kit); this module-level name stays because the tools call it and
+    the tests patch it.
     """
-    await _pacer.wait(min_gap=_min_gap)
+    await polite_wait(_pacer, _min_gap)
 
 
 def _extract_product_id(raw: str) -> str | None:
@@ -133,27 +137,10 @@ def _extract_product_id(raw: str) -> str | None:
     Host-checked on purpose. The id is the only thing that survives this
     function, and the card URL is rebuilt from SITE_BASE, so a caller cannot
     smuggle ``/product/<id>`` into a path on someone else's domain and
-    steer the operator's logged-in Chrome there. Anything that is not
-    dns-shop.ru, or carries a scheme we do not navigate, returns None.
+    steer the operator's logged-in Chrome there. The check is the shared one
+    (mcp_core.kit.host_checked_id); this pattern and this host are ours.
     """
-    raw = raw.strip()
-    if not raw:
-        return None
-    if _BARE_ID_RE.fullmatch(raw):
-        return raw.lower()
-    parts = urllib.parse.urlsplit(raw)
-    if parts.scheme:
-        if parts.scheme not in ("http", "https"):
-            return None
-        host = (parts.hostname or "").rstrip(".").lower()
-        if host != "dns-shop.ru" and not host.endswith(".dns-shop.ru"):
-            return None
-        raw = parts.path
-    elif raw.startswith("//"):
-        # Scheme-relative: the authority is someone else's, so treat it as off-host.
-        return None
-    match = _PRODUCT_ID_RE.search(raw)
-    return match.group(1).lower() if match else None
+    return host_checked_id(raw, hosts=("dns-shop.ru",), path_re=_PRODUCT_ID_RE, bare_re=_BARE_ID_RE)
 
 
 # Why this extractor returns TEXT and not numbers
@@ -370,17 +357,10 @@ async def _cdp_render(url: str, extract_js: str, wait_ms: int, ctx: Context | No
 
     The first navigation pays the proof-of-work (wait_ms is generous for that
     reason); later reads on the same session are fast. Serialized via _cdp_lock.
+    The mechanism is shared (mcp_core.kit.render_json); this module-level name
+    stays because the tools call it and the tests patch it.
     """
-    async with _cdp_lock:
-        await _polite_wait()
-        async with open_page(url, wait_ms=wait_ms) as page:
-            raw = await asyncio.wait_for(page.evaluate(extract_js), timeout=30.0)
-    if not isinstance(raw, str) or len(raw.encode()) > MAX_BODY_BYTES:
-        raise ToolError(TransportDownError("extracted page data missing or over the body cap"))
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise ToolError(ParserDriftError("page extractor returned a non-object payload"))
-    return data
+    return await render_json(url, extract_js, wait_ms, lock=_cdp_lock, wait=_polite_wait, max_body_bytes=MAX_BODY_BYTES)
 
 
 def _is_qrator_wall(data: dict[str, Any]) -> bool:
@@ -393,7 +373,7 @@ def _is_qrator_wall(data: dict[str, Any]) -> bool:
 @mcp.tool(
     name="dns_search",
     annotations=ToolAnnotations(
-        title="DNS-Shop Search", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+        title="DNS-Shop Search", read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True
     ),
 )
 async def dns_search(
@@ -402,16 +382,9 @@ async def dns_search(
 ) -> DnsSearchResponse:
     """Search DNS-Shop, rendered in the operator's Chrome.
 
-    ## Return Format
+    price_rub is None when the tile states no price — never 0.
 
-    DnsSearchResponse: {status, query, tier_used, count, items[], meta}.
-    price_rub is None when absent — never 0.
-
-    ## Error Format
-
-    ToolError: ChallengeRequiredError on a Qrator wall (never cached);
-    TransportDownError on CDP/navigation failures; ParserDriftError when
-    a rendered page yields zero product tiles without challenge evidence.
+    Full field list and error codes: `guide://dns/dns_search`.
     """
     log_event("dns_search.start", query=query[:60])
     try:
@@ -446,9 +419,17 @@ async def dns_search(
                 )
             )
         items = [_search_item_from_tile(it) for it in items_raw if isinstance(it, dict)]
-        warnings: list[str] = []
-        if items and all(it.price_rub is None for it in items):
-            warnings.append("no_prices_on_page")
+        warnings: list[str] = R.validate_items(
+            [it.model_dump() for it in items], require_title=True, absent_price="no_prices_on_page"
+        )
+        # The selfcheck compares this payload against the captured
+        # required-key registry; the tool's own answer now carries the same
+        # drift signal, so an agent does not need a human running doctor to
+        # learn the shape moved. Zero tiles raise before this point, so the
+        # key check never runs on a vacuously empty payload.
+        drift = R.shape_drift_warning(payload, ((key,) for key in SEARCH_REQUIRED_KEYS), source="dns_search")
+        if drift:
+            warnings.append(drift)
         result = DnsSearchResponse(query=query, tier_used=tier, count=len(items), items=items)
         attached = R.attach_meta(result.model_dump(by_alias=True, exclude={"meta"}), warnings, source="dns_search")
         result.meta = MetaOut(**attached["_meta"])
@@ -459,13 +440,17 @@ async def dns_search(
         raise
     except Exception as exc:
         log_event("dns_search.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"dns_search failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"dns_search failed: {exc}"))
 
 
 @mcp.tool(
     name="dns_card",
     annotations=ToolAnnotations(
-        title="DNS-Shop Product Card", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+        title="DNS-Shop Product Card",
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def dns_card(
@@ -481,17 +466,9 @@ async def dns_card(
 ) -> DnsCardResponse:
     """Fetch one DNS-Shop product card.
 
-    ## Return Format
+    price_rub and old_price_rub are None when the card states none — never 0.
 
-    DnsCardResponse: {status, product_id, title, price_rub, old_price_rub,
-    is_available, url, tier_used, meta}.
-
-    ## Error Format
-
-    ToolError: BadRequestError when the URL carries no product id;
-    ChallengeRequiredError on a Qrator wall (never cached); TransportDownError
-    on CDP/navigation failures; ParserDriftError when a rendered card has neither
-    product title nor price and no challenge evidence.
+    Full field list and error codes: `guide://dns/dns_card`.
     """
     log_event("dns_card.start", input=product_url[:80])
     try:
@@ -545,7 +522,8 @@ async def dns_card(
             url=url,
             tier_used=tier,
         )
-        attached = R.attach_meta(result.model_dump(by_alias=True, exclude={"meta"}), [], source="dns_card")
+        card = result.model_dump(by_alias=True, exclude={"meta"})
+        attached = R.attach_meta(card, R.validate_offer(card), source="dns_card")
         result.meta = MetaOut(**attached["_meta"])
         if tier == "cdp":
             _cache.set(url, payload)
@@ -554,7 +532,7 @@ async def dns_card(
         raise
     except Exception as exc:
         log_event("dns_card.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"dns_card failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"dns_card failed: {exc}"))
 
 
 # CLI-only drift canary: ``marketplace-mcp doctor`` imports and calls dns_selfcheck()
@@ -588,7 +566,7 @@ async def dns_selfcheck(ctx: Context | None = None) -> DnsSelfcheckResponse:
         raise
     except Exception as exc:
         log_event("dns_selfcheck.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"dns_selfcheck failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"dns_selfcheck failed: {exc}"))
 
 
 async def _dns_selfcheck_impl(ctx: Context | None) -> DnsSelfcheckResponse:
@@ -670,3 +648,8 @@ async def _dns_selfcheck_impl(ctx: Context | None) -> DnsSelfcheckResponse:
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)

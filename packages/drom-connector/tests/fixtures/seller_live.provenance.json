@@ -1,0 +1,9 @@
+{
+  "url": "https://baza.drom.ru/user/autotrade/",
+  "captured_at": "2026-10-18",
+  "sha256": "44c2d12f095ae5665b0af0a715b8f9c535babf15a664660e25ef1b7226b20735",
+  "method": "Captured HTML from baza.drom.ru using Chrome CDP and residential proxy",
+  "ground_truth": {
+    "note": "Seller profile page for autotrade"
+  }
+}

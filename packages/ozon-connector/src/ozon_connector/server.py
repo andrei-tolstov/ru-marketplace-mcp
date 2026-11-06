@@ -17,8 +17,8 @@ NEVER use print() in stdio MCP — corrupts JSON-RPC. Use ctx.info/error.
 # PURPOSE: Expose Ozon product cards, reviews and search through composer data.
 # SCOPE: Read-only tools; allowlisted paths; bounded impersonated HTTP/CDP fallback.
 # INVARIANTS: Require a dict widgetStates before any success; keep later-page drift partial; preserve valid empty containers.
-# DEPENDS: FastMCP; httpx; curl_cffi; mcp_core process/CDP; models_output; settings.
-# LINKS: M-OZON; M-COMPARE; M-MARKETPLACE; packages/ozon-connector/tests.
+# DEPENDS: FastMCP; httpx; curl_cffi; mcp_core process/CDP/kit; models_output; settings; shape_reference.
+# LINKS: M-OZON; M-KIT; M-COMPARE; M-MARKETPLACE; packages/ozon-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
 # _sync_call_in_process: Bound synchronous work in a scrubbed, terminable child.
@@ -29,7 +29,10 @@ NEVER use print() in stdio MCP — corrupts JSON-RPC. Use ctx.info/error.
 # _parse_search_tile: Preserve offer identity, price kinds and stock warnings.
 # ozon_card: Read a validated SKU/product path with a required widgetStates object.
 # ozon_reviews: Raise on first-page widgetStates drift; later-page failures return partial data.
-# ozon_search: Search and normalize composer result tiles from a required widgetStates object.
+# ozon_search: Search and normalize composer result tiles from a required widgetStates object,
+#              publish count as the number of returned items, name the parsed total
+#              separately and warn when the 30-item cap cut the page; a runtime
+#              shape-drift warning fires when a required key family vanishes.
 # ozon_selfcheck: Report operator transport/parser health; not an MCP tool.
 # END_MODULE_MAP
 
@@ -48,13 +51,12 @@ import tempfile
 import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any
 
 import httpx
 from curl_cffi import requests as cffi
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
@@ -63,7 +65,9 @@ from mcp_core.errors import (
     ParserDriftError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import polite_wait, sync_curl_get
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
@@ -73,6 +77,7 @@ from mcp_core.process import (
     worker_process_kwargs,
 )
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.resources import register_reference_resources
 from mcp_core.transport import proxy_from_env
 from mcp_core.transport.chrome_cdp import NavBlocked, cdp_setup_hint, open_page
 from pydantic import Field
@@ -84,15 +89,18 @@ from ozon_connector.models_output import (
     OzonSelfcheckResponse,
 )
 from ozon_connector.settings import get_settings
+from ozon_connector.shape_reference import SEARCH_REQUIRED_FAMILIES
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 mcp = FastMCP(
     name="ozon-connector",
     version=SERVER_VERSION,
+    instructions=(
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
+    ),
 )
-mcp.add_middleware(RetryMiddleware(max_retries=3, base_delay=1.0))
 
 # Strict allowlist for paths we are willing to navigate inside the operator's authenticated
 # ozon.ru session. /product/<digits>/ and /search/?text=... are the only routes
@@ -125,6 +133,10 @@ _REVIEW_SORT_ALIASES = {
     "complaints": "score_asc",
 }
 PRODUCT_SLUG_RE = re.compile(r"^/product/(?:[^/]*-)?(\d+)/?$")
+
+# How many search tiles one answer carries. The composer page holds more, so
+# the answer names the parsed total separately and says when it cut the page.
+SEARCH_ITEM_LIMIT = 30
 
 OZON_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -276,9 +288,11 @@ async def _polite_wait() -> None:
     """Space this source's requests out, and back off if it refused us.
 
     Reads ``_min_gap`` at call time so an operator or a test can retune the
-    pace without rebuilding the pacer.
+    pace without rebuilding the pacer. The pacing itself is shared
+    (mcp_core.kit.polite_wait); this module-level name stays because the tools
+    call it and the tests patch it.
     """
-    await _pacer.wait(min_gap=_min_gap)
+    await polite_wait(_pacer, _min_gap)
 
 
 def _sync_curl_get(url: str, proxy: str | None = None) -> tuple[int, str]:
@@ -286,53 +300,24 @@ def _sync_curl_get(url: str, proxy: str | None = None) -> tuple[int, str]:
 
     Streams the response and aborts mid-download once MAX_BODY_BYTES is
     exceeded. Defense-in-depth match for httpx-based connectors which all
-    stream rather than buffer-then-check.
+    stream rather than buffer-then-check. The loop is the shared one
+    (mcp_core.kit.sync_curl_get); this wrapper keeps the module-level name the
+    fetch path and its tests patch.
 
     Maintenance note: IMPERSONATE='chrome' is auto-latest WITHIN the
     installed curl-cffi version; uv.lock pins that version. Run
     `uv lock --upgrade-package curl-cffi --project ozon` quarterly to
     keep the JA3/JA4 fingerprint pool current with Chrome stable.
     """
-    chunks: list[bytes] = []
-    total = 0
-    encoding = "utf-8"
-    # The proxy arrives as an explicit argument rather than an environment
-    # variable because this function runs in a subprocess whose environment is
-    # deliberately reduced to an allowlist (mcp_core.process.safe_child_env), and
-    # that allowlist excludes proxy vars on purpose. Passing it as an argument
-    # keeps the child's environment minimal while still honouring OZON_PROXY.
-    kwargs: dict[str, Any] = {}
-    if proxy:
-        kwargs["proxies"] = {"http": proxy, "https": proxy}
-    r = cffi.get(
+    return sync_curl_get(
         url,
+        get=cffi.get,
         headers=OZON_HEADERS,
-        # curl_cffi types this as a Literal of known profiles, but the value is
-        # operator-configurable via OZON_IMPERSONATE, so the check is deferred to
-        # curl_cffi itself (which raises clearly on an unknown profile).
-        impersonate=cast(Any, IMPERSONATE),
+        impersonate=IMPERSONATE,
         timeout=TIMEOUT,
-        stream=True,
-        **kwargs,
+        max_body_bytes=MAX_BODY_BYTES,
+        proxy=proxy,
     )
-    try:
-        encoding = r.encoding or "utf-8"
-        for chunk in r.iter_content(chunk_size=64 * 1024):
-            total += len(chunk)
-            if total > MAX_BODY_BYTES:
-                raise ValueError(f"body exceeds {MAX_BODY_BYTES} bytes (aborted at {total} during stream)")
-            chunks.append(chunk)
-        body = b"".join(chunks)
-        try:
-            text = body.decode(encoding, errors="replace")
-        except (LookupError, TypeError):
-            text = body.decode("utf-8", errors="replace")
-        return r.status_code, text
-    finally:
-        try:
-            r.close()
-        except Exception:
-            pass
 
 
 def _canonical_composer_path(api_path: str) -> str:
@@ -544,7 +529,7 @@ async def _fetch_composer(api_path: str, ctx: Context | None) -> tuple[int, str,
             await ctx.debug("Ozon Tier-1 403 (Cloudflare __cf_bm); trying CDP")
     except Exception as exc:
         if ctx:
-            await ctx.debug(f"Ozon Tier-1 exception: {exc}; trying CDP")
+            await ctx.debug(_redact(f"Ozon Tier-1 exception: {exc}; trying CDP"))
 
     try:
         status, body = await _cdp_fetch_json(api_url, ctx)
@@ -555,6 +540,10 @@ async def _fetch_composer(api_path: str, ctx: Context | None) -> tuple[int, str,
         if exc.status:
             return exc.status, str(exc), "cdp_blocked"
         return 0, str(exc), "cdp_failed"
+    except ToolError:
+        # R-CDP-HOST-PAUSE: keep the mapped host-pause error and its
+        # retry_after_s, instead of relabelling it a generic CDP failure.
+        raise
     except Exception as exc:
         return 0, str(exc), "cdp_failed"
 
@@ -633,10 +622,10 @@ def _search_tile_product_link(link: str) -> tuple[str, str] | None:
     name="ozon_card",
     annotations=ToolAnnotations(
         title="Ozon Product Card",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def ozon_card(
@@ -655,22 +644,9 @@ async def ozon_card(
     9222) when Tier-1 hits Cloudflare 403. Tier-2 requires the operator running Chrome
     via scripts/start_chrome_cdp.ps1 (Windows) or scripts/start_chrome_cdp.sh (Linux/macOS) first.
 
-    ## Return Format
+    fields the page does not carry are None, never 0; an empty payload is a healthy response, not an error.
 
-    OzonCardResponse: {status, price, card_price, price_original, is_available,
-    rating_score, rating_count, title, seller, characteristics, url, tier_used,
-    meta} on success. Fields are None when the page does not carry them.
-
-    ## Error Format
-
-    Raises ToolError on validation (BadRequestError), transport/block
-    (TransportDownError — including the catch-all for unexpected internal
-    errors), or parser drift (ParserDriftError). No-results is NOT an error —
-    an empty widgetStates payload returns a healthy response with null fields.
-
-    Args:
-        sku_or_path: SKU integer-as-string, full Ozon URL, or /product/<digits>/ path.
-                     Other paths are rejected (SSRF prevention).
+    Full field list and error codes: `guide://ozon/ozon_card`.
     """
     log_event("ozon_card.start", sku=str(sku_or_path)[:120])
     try:
@@ -723,7 +699,7 @@ async def ozon_card(
         raise
     except Exception as exc:
         log_event("ozon_card.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"ozon_card failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"ozon_card failed: {exc}"))
 
 
 def _ts_to_iso(ts: Any) -> str | None:
@@ -809,10 +785,10 @@ def _parse_review_item(r: dict) -> dict[str, Any]:
     name="ozon_reviews",
     annotations=ToolAnnotations(
         title="Ozon Product Reviews",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def ozon_reviews(
@@ -863,21 +839,9 @@ async def ozon_reviews(
     drawing any conclusion about a product, and say so when `own_reviews` is 0 —
     a headline 4.8 can be borrowed entirely from neighbours.
 
-    ## Return Format
+    a later page that fails after reviews were collected is a PARTIAL SUCCESS (partial=True, stop_reason set), not an error.
 
-    OzonReviewsResponse: {status, sort, rating_score, reviews_count, distribution,
-    returned, partial, stop_reason, last_error, requested_limit, reviews,
-    requested_item_id, own_reviews, pool_variants, meta}
-    on success. A later-page transport, JSON-decode or pagination failure with
-    reviews already collected is a PARTIAL SUCCESS (partial=True, stop_reason
-    set), and so is a later page without a widgetStates object.
-
-    ## Error Format
-
-    Raises ToolError on validation (BadRequestError), transport/block
-    (TransportDownError), or parser drift (ParserDriftError) — but ONLY when no
-    reviews have been collected yet. Once at least one page yielded reviews, a
-    later-page failure degrades to a partial-success return.
+    Full field list and error codes: `guide://ozon/ozon_reviews`.
     """
     log_event("ozon_reviews.start", sku=str(sku_or_path)[:120], limit=limit, sort=sort)
     try:
@@ -888,7 +852,7 @@ async def ozon_reviews(
         raise
     except Exception as exc:
         log_event("ozon_reviews.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"ozon_reviews failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"ozon_reviews failed: {exc}"))
 
 
 async def _ozon_reviews_impl(
@@ -974,14 +938,14 @@ async def _ozon_reviews_impl(
                 )
             partial = True
             stop_reason = "all_tiers_failed"
-            last_error = {"type": "all_tiers_failed", "message": body[:300]}
+            last_error = {"type": "all_tiers_failed", "message": _redact(body[:300])}
             break
         if status_code == 403:
             if not collected:
                 raise_tool_error(_ozon_blocked_error(tier, body))
             partial = True
             stop_reason = "blocked"
-            last_error = {"type": "blocked", "code": 403, "tier": tier, "message": body[:200]}
+            last_error = {"type": "blocked", "code": 403, "tier": tier, "message": _redact(body[:200])}
             break
         if status_code != 200:
             if not collected:
@@ -993,7 +957,7 @@ async def _ozon_reviews_impl(
                 )
             partial = True
             stop_reason = "http"
-            last_error = {"type": "http", "code": status_code, "tier": tier, "preview": body[:200]}
+            last_error = {"type": "http", "code": status_code, "tier": tier, "preview": _redact(body[:200])}
             break
         try:
             payload = json.loads(body)
@@ -1002,7 +966,7 @@ async def _ozon_reviews_impl(
                 raise_tool_error(ParserDriftError(f"non-JSON response body via {tier}; preview: {body[:200]}"))
             partial = True
             stop_reason = "parse"
-            last_error = {"type": "parse", "tier": tier, "preview": body[:200]}
+            last_error = {"type": "parse", "tier": tier, "preview": _redact(body[:200])}
             break
         if not isinstance(payload, dict) or not isinstance(payload.get("widgetStates"), dict):
             if not collected:
@@ -1259,10 +1223,12 @@ def _parse_search_tile(item: Any) -> dict[str, Any]:
                 if not rating and re.match(r"^\d[.,]\d", txt):
                     rating = txt
                 # Review count: Nov-2026 format "24 086 отзывов" (no parens);
-                # older format was "(15 374)". Extract the integer either way.
+                # older format was "(15 374)". The label is split off and the
+                # number parsed strictly (mcp_core.coerce_count): a glued
+                # digit run turned "1.2K отзывов" into the plausible-but-wrong
+                # 12 and kept the answer healthy (R05).
                 elif not rating_count and ("отзыв" in txt or ("(" in txt and ")" in txt)):
-                    digits = re.sub(r"[^\d]", "", txt)
-                    rating_count = int(digits) if digits else txt
+                    rating_count = R.coerce_count(txt)
 
     out["title"] = title
     out["price"] = price_text
@@ -1301,10 +1267,10 @@ def _aggregate_offer_warnings(items: list[dict]) -> list[str]:
     name="ozon_search",
     annotations=ToolAnnotations(
         title="Ozon Catalog Search",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def ozon_search(
@@ -1328,16 +1294,10 @@ async def ozon_search(
     Returns sku/title/price/rating per item. Schema parses Nov 2026
     `tileGridDesktop-*` widgets with `mainState` atom structure.
 
-    ## Return Format
+    zero parsed items is NOT an error, but not healthy either: count=0 carries a
+    `no_items` warning (meta.healthy=false).
 
-    OzonSearchResponse: {status, query, page, tier_used, count, items, meta} on
-    success. Zero matching items is NOT an error — it returns a healthy response
-    with count=0 and empty items.
-
-    ## Error Format
-
-    Raises ToolError on validation (BadRequestError), transport/block
-    (TransportDownError), or parser drift (ParserDriftError).
+    Full field list and error codes: `guide://ozon/ozon_search`.
     """
     log_event("ozon_search.start", query=str(query)[:100], page=page)
     try:
@@ -1348,7 +1308,7 @@ async def ozon_search(
         raise
     except Exception as exc:
         log_event("ozon_search.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"ozon_search failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"ozon_search failed: {exc}"))
 
 
 def _search_items_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1439,6 +1399,33 @@ async def _ozon_search_impl(
         raise_tool_error(ParserDriftError("expected object payload with widgetStates object"))
 
     items = _search_items_from_payload(payload)
+    # The tool returns at most 30 items, so the delivered answer and the parsed
+    # page are two different numbers. `count` is the delivered one (it always
+    # equals len(items)); the parsed one travels as parsed_count and the
+    # answer says so in a truncation warning — the old code published the
+    # parsed total as `count` and called a cut page complete (R06).
+    delivered = items[:SEARCH_ITEM_LIMIT]
+    parsed_count = len(items)
+
+    # The selfcheck compares this payload against the captured family
+    # registry; the tool's own answer now carries the same drift signal, so
+    # an agent does not need a human running doctor to learn the shape moved.
+    # A tile parser that stopped reading action.link still yields titled,
+    # priced tiles — but every result silently lost its url/card_input, and
+    # only this family check notices. The health check runs on exactly the
+    # items the agent receives, never on the ones the cap dropped. Zero items
+    # stay out: every per-item family is vacuously absent there and the
+    # no_items warning covers it.
+    warnings = _aggregate_offer_warnings(delivered)
+    if delivered:
+        drift = R.shape_drift_warning({"items": delivered}, SEARCH_REQUIRED_FAMILIES, source="ozon_search")
+        if drift:
+            warnings.append(drift)
+    if parsed_count > len(delivered):
+        warnings.append(
+            f"info:truncated: {parsed_count} tiles parsed from the page, {len(delivered)} returned "
+            f"(this tool returns at most {SEARCH_ITEM_LIMIT} items); count is the returned number"
+        )
 
     return OzonSearchResponse(
         **R.attach_meta(
@@ -1447,10 +1434,12 @@ async def _ozon_search_impl(
                 "query": query,
                 "page": page,
                 "tier_used": tier,
-                "count": len(items),
-                "items": items[:30],
+                "count": len(delivered),
+                "parsed_count": parsed_count,
+                "truncated": parsed_count > len(delivered),
+                "items": delivered,
             },
-            _aggregate_offer_warnings(items[:30]),
+            warnings,
             source="ozon_search",
         )
     )
@@ -1495,7 +1484,7 @@ async def ozon_selfcheck(ctx: Context | None = None) -> OzonSelfcheckResponse:
         raise
     except Exception as exc:
         log_event("ozon_selfcheck.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"ozon_selfcheck failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"ozon_selfcheck failed: {exc}"))
 
 
 async def _ozon_selfcheck_impl(ctx: Context | None) -> OzonSelfcheckResponse:
@@ -1573,12 +1562,15 @@ async def _ozon_selfcheck_impl(ctx: Context | None) -> OzonSelfcheckResponse:
                 notes=[f"critical widget(s) vanished: {d['missing']}"],
             )
         elif not sm.get("ok"):
+            notes = ["widgets present but parse smoke yielded nothing (inner shape drift)"]
+            if sm.get("shape_drift"):
+                notes.insert(0, sm["shape_drift"])
             checks[name] = R.selfcheck_entry(
                 "drift",
                 baseline=baseline,
                 missing_widgets=[],
                 smoke=sm,
-                notes=["widgets present but parse smoke yielded nothing (inner shape drift)"],
+                notes=notes,
             )
         else:
             checks[name] = R.selfcheck_entry("healthy", baseline=baseline, added_widgets=d["added"][:10], smoke=sm)
@@ -1603,7 +1595,11 @@ async def _ozon_selfcheck_impl(ctx: Context | None) -> OzonSelfcheckResponse:
                 parsed = _parse_search_tile(it)
                 if parsed.get("title"):
                     items.append(parsed)
-        return {"ok": len(items) > 0, "parsed_items": len(items)}
+        # Tiles parsing is not enough: the search tool's own answer warns
+        # through the same required-family registry, and the canary must
+        # fail the same way when a parser-critical family vanishes.
+        drift = R.shape_drift_warning({"items": items}, SEARCH_REQUIRED_FAMILIES, source="ozon_search")
+        return {"ok": bool(items) and drift is None, "parsed_items": len(items), "shape_drift": drift}
 
     def _smoke_reviews(payload: dict) -> dict:
         widgets = payload.get("widgetStates") or {}
@@ -1670,6 +1666,11 @@ async def _ozon_selfcheck_impl(ctx: Context | None) -> OzonSelfcheckResponse:
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)
 
 
 if __name__ == "__main__":

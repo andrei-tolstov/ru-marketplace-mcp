@@ -33,11 +33,12 @@ NEVER use print() in stdio MCP — corrupts JSON-RPC. Use ctx.debug/info/error.
 """
 # START_MODULE_CONTRACT
 # PURPOSE: Expose MPStats SKU analytics and warehouse stock for Ozon/Wildberries.
-# SCOPE: Read-only paid-account API; secret mp_auth cookie; bounded batch requests.
-# DEPENDS: FastMCP; httpx; mcp_core cache/pacing/redaction; models_output; settings.
-# LINKS: M-MPSTATS; M-MARKETPLACE; packages/mpstats-connector/tests.
+# SCOPE: Read-only paid-account API; secret mp_auth cookie; bounded batch requests; unified-mount availability gate.
+# DEPENDS: FastMCP; httpx; mcp_core cache/pacing/redaction/kit; models_output; settings.
+# LINKS: M-MPSTATS; M-KIT; M-MARKETPLACE; R-MPSTATS-MOUNT-GATE; packages/mpstats-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
+# mount_unavailable_reason: Why the unified server must not mount these tools, or None.
 # _cookie_header: Resolve the required auth secret without exposing its value.
 # _post_json_budgeted: Bound paced HTTP retries and response size.
 # _call: Classify HTTP/body auth, rate-limit, transport and parser failures.
@@ -56,12 +57,11 @@ import datetime
 import json
 import os
 import time
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, get_args
 
 import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
@@ -73,11 +73,14 @@ from mcp_core.errors import (
     RateLimitedError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import polite_wait
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.resources import register_reference_resources
 from mcp_core.transport import proxy_from_env
 from pydantic import Field
 
@@ -91,18 +94,20 @@ from mpstats_connector.models_output import (
     MpStatsWarehousesItem,
     MpStatsWarehousesResponse,
 )
-from mpstats_connector.settings import get_settings
+from mpstats_connector.settings import MPStatsSettings, get_settings
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 mcp = FastMCP(
     name="mpstats-connector",
     version=SERVER_VERSION,
+    instructions=(
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
+    ),
 )
-mcp.add_middleware(RetryMiddleware(max_retries=3, base_delay=1.0))
 
 # Verified live Jul 2026: the plugin endpoint answers from the chrome-extension
 # origin, but a cold replay with only the mp_auth cookie works, so we do not
@@ -128,12 +133,18 @@ MPSTATS_URL = f"https://{MPSTATS_HOST}/pluginapi"
 # per-day graphs; wildberries uses the same RPC shape (entry [6] in the source
 # HAR is a wb utm metric, confirming wb is a first-class Place). ozFBS is an
 # Ozon-specific flag (Fulfilled-by-Seller mode) — harmless to send for wb.
-PLACES = frozenset({"ozon", "wildberries"})
+# The tool signature carries the same closed set, so the advertised schema
+# refuses an unknown marketplace instead of describing the rule in prose only.
+Place = Literal["ozon", "wildberries"]
+PLACES = frozenset(get_args(Place))
 # Batch analytics accepts up to 100 SKUs per call — the same ceiling WB v4 uses,
 # and the source HAR's batch entry [7] sent 25 without complaint. Beyond 100 the
 # endpoint has not been verified and the politeness argument against bulk also
-# grows, so the cap is enforced client-side.
+# grows, so the cap is enforced client-side AND advertised in the schema.
 MAX_SKUS = 100
+# A SKU is a positive integer; the schema says so, so an invalid batch is
+# refused before the request instead of after it.
+Sku = Annotated[int, Field(gt=0)]
 _SELFCHECK_SKU = 5107857210  # Ozon SKU verified live Jul 2026 to return analytics
 
 _min_gap = _settings.min_gap
@@ -180,9 +191,11 @@ async def _polite_wait() -> None:
     refunded, so the cost of hammering lands on the user, not on us.
 
     Reads ``_min_gap`` at call time so an operator or a test can retune the pace
-    without rebuilding the pacer.
+    without rebuilding the pacer. The pacing itself is shared
+    (mcp_core.kit.polite_wait); this module-level name stays because the tools
+    call it and the tests patch it.
     """
-    await _pacer.wait(min_gap=_min_gap)
+    await polite_wait(_pacer, _min_gap)
 
 
 def _cookie_header() -> str:
@@ -194,6 +207,25 @@ def _cookie_header() -> str:
     """
     token = (_settings.mp_auth.get_secret_value() or "").strip()
     return f"mp_auth={token}" if token else ""
+
+
+def mount_unavailable_reason() -> str | None:
+    """Why the unified server must not mount these tools, or ``None``.
+
+    Every call preflights ``MPSTATS_MP_AUTH`` and returns ``auth_missing``
+    without a token, so mounting the two schemas would make the agent pay for
+    them on every request with nothing behind them (R-MPSTATS-MOUNT-GATE). The
+    unified marketplace server asks this before mounting. The standalone
+    ``mpstats-mcp`` server never consults it and keeps its tools, answering
+    ``auth_missing`` exactly as before.
+
+    Reads the settings fresh rather than the module-level ``_settings``: the
+    mount decision happens once, and it must reflect the environment the
+    process was given. A blank value is not a token, matching ``_cookie_header``.
+    """
+    if (MPStatsSettings().mp_auth.get_secret_value() or "").strip():
+        return None
+    return "auth_missing: MPSTATS_MP_AUTH not set"
 
 
 async def _post_json_budgeted(
@@ -333,7 +365,7 @@ async def _call(body: dict[str, Any], *, label: str) -> dict[str, Any]:
             # to the model and into the client's transcript. Every other
             # connector redacts here; this is the only one holding a secret.
             log_event(f"{label}.network_error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-            raise_tool_error(TransportDownError(_redact(str(exc)), provider="mpstats"))
+            raise_tool_error_from(exc, _redact(str(exc)), provider="mpstats")
 
         if err:
             log_event(f"{label}.network_error", error=_redact(err))
@@ -534,19 +566,23 @@ def _validate_skus(skus: list[int], label: str) -> None:
     name="mpstats_item",
     annotations=ToolAnnotations(
         title="MPStats Item Analytics",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def mpstats_item(
     skus: Annotated[
-        list[int],
-        Field(description="1..100 SKU integers (positive). Per-SKU 30-day sales/price/stock analytics from MPStats."),
+        list[Sku],
+        Field(
+            min_length=1,
+            max_length=MAX_SKUS,
+            description="1..100 SKU integers (positive). Per-SKU 30-day sales/price/stock analytics from MPStats.",
+        ),
     ],
     place: Annotated[
-        str,
+        Place,
         Field(
             description="Marketplace: 'ozon' or 'wildberries'. Determines which MPStats dataset the SKUs resolve against.",
         ),
@@ -571,26 +607,9 @@ async def mpstats_item(
     Requires the ``MPSTATS_MP_AUTH`` env var (a paid MPStats account JWT cookie).
     Without it the tool returns an ``auth_missing`` error.
 
-    ## Return Format
+    missing values are None, never 0, and a zero in a per-day graph means 'no data for that day'.
 
-    MpStatsItemResponse: {place, days, count, items, meta}. Each item carries
-    sku, place, seller, seller_id, brand, stock_now, price_avg_rub,
-    orders_per_day, days_on_stocks, totals {orders, sum, sum_prev} and four
-    per-day graphs (orders, prices, count, rubrics), oldest-first. Missing
-    values are None, never 0; a zero graph cell means "no data for that day".
-
-    ## Error Format
-
-    ToolError: BadRequestError on malformed skus or place; AuthMissingError
-    when MPSTATS_MP_AUTH is missing or rejected; RateLimitedError on HTTP
-    429; TransportDownError on network failures, non-200 responses and HTML
-    blocks; ParserDriftError on a non-JSON or mis-shaped body; NotFoundError
-    when no requested SKU has analytics.
-
-    Args:
-        skus: 1..100 positive SKU integers.
-        place: 'ozon' or 'wildberries'.
-        oz_fbs: Ozon FBS mode flag (default true).
+    Full field list and error codes: `guide://mpstats/mpstats_item`.
     """
     log_event("mpstats_item.start", sku_count=len(skus), place=place)
     if ctx is not None:
@@ -644,7 +663,7 @@ async def mpstats_item(
         days=days,
         count=len(items),
         items=items,
-        meta=MetaOut(source="mpstats_item", healthy=not warnings, warnings=warnings),
+        meta=MetaOut(source="mpstats_item", healthy=not R.health_warnings(warnings), warnings=warnings),
     )
 
 
@@ -652,19 +671,23 @@ async def mpstats_item(
     name="mpstats_warehouses",
     annotations=ToolAnnotations(
         title="MPStats Warehouse Stock",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def mpstats_warehouses(
     skus: Annotated[
-        list[int],
-        Field(description="1..100 SKU integers (positive). Per-SKU warehouse stock split from MPStats."),
+        list[Sku],
+        Field(
+            min_length=1,
+            max_length=MAX_SKUS,
+            description="1..100 SKU integers (positive). Per-SKU warehouse stock split from MPStats.",
+        ),
     ],
     place: Annotated[
-        str,
+        Place,
         Field(
             description="Marketplace: 'ozon' or 'wildberries'. Determines which MPStats dataset the SKUs resolve against.",
         ),
@@ -680,23 +703,9 @@ async def mpstats_warehouses(
     Requires the ``MPSTATS_MP_AUTH`` env var (a paid MPStats account JWT cookie).
     Without it the tool returns an ``auth_missing`` error.
 
-    ## Return Format
+    missing stock counts are None, never 0.
 
-    MpStatsWarehousesResponse: {place, days, count, items, meta}. Each item
-    carries sku and stocks {fbs, fbo, fbo_warehouses, last_update}. Missing
-    stock counts are None, never 0.
-
-    ## Error Format
-
-    ToolError: BadRequestError on malformed skus or place; AuthMissingError
-    when MPSTATS_MP_AUTH is missing or rejected; RateLimitedError on HTTP
-    429; TransportDownError on network failures, non-200 responses and HTML
-    blocks; ParserDriftError on a non-JSON or mis-shaped body; NotFoundError
-    when no requested SKU has stock data.
-
-    Args:
-        skus: 1..100 positive SKU integers.
-        place: 'ozon' or 'wildberries'.
+    Full field list and error codes: `guide://mpstats/mpstats_warehouses`.
     """
     log_event("mpstats_warehouses.start", sku_count=len(skus), place=place)
     if ctx is not None:
@@ -748,7 +757,7 @@ async def mpstats_warehouses(
         days=days,
         count=len(items),
         items=items,
-        meta=MetaOut(source="mpstats_warehouses", healthy=not warnings, warnings=warnings),
+        meta=MetaOut(source="mpstats_warehouses", healthy=not R.health_warnings(warnings), warnings=warnings),
     )
 
 
@@ -887,3 +896,8 @@ async def mpstats_selfcheck(ctx: Context | None = None) -> MpStatsSelfCheckRespo
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)

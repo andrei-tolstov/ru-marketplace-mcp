@@ -36,8 +36,8 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 # START_MODULE_CONTRACT
 # PURPOSE: Expose AliExpress search and cards from the operator's rendered pages.
 # SCOPE: Read-only CDP; owned card popups and bounded cleanup; x5sec refusal classification.
-# DEPENDS: FastMCP; mcp_core DOM/CDP/cache/pacing; models_output; settings.
-# LINKS: M-ALIEXPRESS; M-COMPARE; M-MARKETPLACE; packages/aliexpress-connector/tests.
+# DEPENDS: FastMCP; mcp_core DOM/CDP/cache/pacing/kit; models_output; settings; shape_reference.
+# LINKS: M-ALIEXPRESS; M-KIT; M-COMPARE; M-MARKETPLACE; R-CDP-NAV-TIMEOUT; packages/aliexpress-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
 # _extract_item_id: Validate numeric item handles and AliExpress URLs.
@@ -45,7 +45,8 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 # _cdp_render_search: Read the rendered search grid from a landing page.
 # _cdp_card: Match the full item ID on an owned popup and bound cleanup on all exits.
 # _card_prices: Pair glyph-scored card prices without inventing absent modules.
-# aliexpress_search: Return normalized rendered offers and price warnings.
+# aliexpress_search: Return normalized rendered offers and price warnings,
+#                    plus a runtime shape-drift warning when a required key vanishes.
 # aliexpress_card: Return item details, ratings and orders, not review texts.
 # aliexpress_selfcheck: Diagnose operator browser/parser health; not an MCP tool.
 # END_MODULE_MAP
@@ -60,22 +61,25 @@ import urllib.parse
 from typing import Annotated, Any, cast
 
 from fastmcp import Context, FastMCP
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
 from mcp_core.dom import JS_HELPERS, title_from_tile
 from mcp_core.errors import (
     BadRequestError,
+    ChallengeRequiredError,
     ParserDriftError,
     ToolError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import polite_wait
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.resources import register_reference_resources
 from mcp_core.transport.chrome_cdp import NavBlocked, open_page
 from pydantic import Field
 
@@ -87,10 +91,11 @@ from aliexpress_connector.models_output import (
     MetaOut,
 )
 from aliexpress_connector.settings import get_settings
+from aliexpress_connector.shape_reference import SEARCH_REQUIRED_KEYS, SEARCH_SHAPE_REFERENCE
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://aliexpress.ru"
@@ -99,6 +104,7 @@ SEARCH_URL = f"{SITE_BASE}/wholesale"
 # cache-friendly; measured clean across headless and two real-Chrome profiles.
 _LANDING = f"{SEARCH_URL}?SearchText={urllib.parse.quote('часы')}"
 
+# R-CDP-NAV-TIMEOUT: ALI_TIMEOUT is a navigation budget in seconds, not a tool deadline.
 TIMEOUT = _settings.timeout
 MAX_BODY_BYTES = _settings.max_body_bytes
 _min_gap = _settings.min_gap
@@ -116,10 +122,10 @@ mcp = FastMCP(
         "AliExpress catalog: search and product cards, read inside the operator's "
         "own Chrome over CDP — x5sec blocks anonymous access. Start with "
         "aliexpress_search; aliexpress_card takes an item id or aliexpress.ru item URL. "
-        "Review TEXTS are not exposed: only the rating and order counts are read."
+        "Review TEXTS are not exposed: only the rating and order counts are read. "
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
     ),
 )
-mcp.add_middleware(RetryMiddleware())
 
 _cache: TTLCache = TTLCache(ttl_s=_settings.cache_ttl, max_entries=128)
 _pacer = Pacer(_min_gap)
@@ -130,9 +136,11 @@ async def _polite_wait() -> None:
     """Space this source's requests out, and back off if it refused us.
 
     Reads ``_min_gap`` at call time so an operator or a test can retune the
-    pace without rebuilding the pacer.
+    pace without rebuilding the pacer. The pacing itself is shared
+    (mcp_core.kit.polite_wait); this module-level name stays because the tools
+    call it and the tests patch it.
     """
-    await _pacer.wait(min_gap=_min_gap)
+    await polite_wait(_pacer, _min_gap)
 
 
 def _extract_item_id(raw: str) -> str | None:
@@ -166,7 +174,10 @@ def _is_punish(payload: dict[str, Any]) -> bool:
     return bool(payload.get("punish")) or bool(payload.get("url") and "punish" in str(payload["url"]))
 
 
-def _challenge_error(detail: str = "") -> TransportDownError:
+def _challenge_error(detail: str = "") -> ChallengeRequiredError:
+    # A human must pass x5sec, so this is challenge_required (retryable_now
+    # false), as for Taobao's x5sec (R-CHALLENGE-ACTION). There is no
+    # `marketplace-mcp unblock aliexpress`, so the manual step is spelled out.
     message = (
         "AliExpress challenged the session (x5sec). Open aliexpress.ru in the "
         "scraping-profile Chrome, pass the check by hand, then retry; the "
@@ -177,7 +188,15 @@ def _challenge_error(detail: str = "") -> TransportDownError:
         message += f" {hint}"
     if detail:
         message += f" Detail: {detail[:160]}"
-    return TransportDownError(message, status_code=403)
+    return ChallengeRequiredError(
+        message,
+        provider="aliexpress",
+        user_action=(
+            "Open aliexpress.ru in the scraping-profile Chrome (run `marketplace-mcp browser show` "
+            "if the window is off-screen) and have the user pass the check there. Then call this "
+            "tool again after the user confirms it is done."
+        ),
+    )
 
 
 # --------------------------------------------------------------- search JS ----
@@ -374,20 +393,20 @@ async def _cdp_render_search(url: str, ctx: Context | None) -> dict[str, Any]:
     """Open the search URL in the operator's Chrome and extract tiles."""
     async with _cdp_lock:
         await _polite_wait()
-        async with open_page(url, wait_ms=10000) as page:
+        async with open_page(url, wait_ms=10000, navigation_timeout_ms=TIMEOUT * 1000) as page:
             raw = await asyncio.wait_for(page.evaluate(_SEARCH_EXTRACT_JS), timeout=30.0)
     return _unwrap_extract(raw, "search")
 
 
 def _unwrap_extract(raw: Any, what: str) -> dict[str, Any]:
     if not isinstance(raw, str) or len(raw.encode()) > MAX_BODY_BYTES:
-        raise ToolError(TransportDownError("extracted page data missing or over the body cap"))
+        raise_tool_error(TransportDownError("extracted page data missing or over the body cap"))
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ToolError(ParserDriftError(f"non-JSON {what} extract; preview: {str(raw)[:200]}")) from exc
+    except json.JSONDecodeError:
+        raise_tool_error(ParserDriftError(f"non-JSON {what} extract; preview: {str(raw)[:200]}"))
     if not isinstance(data, dict):
-        raise ToolError(ParserDriftError(f"{what} extractor returned a non-object payload"))
+        raise_tool_error(ParserDriftError(f"{what} extractor returned a non-object payload"))
     return data
 
 
@@ -406,12 +425,12 @@ async def _cdp_card(url: str, ctx: Context | None) -> dict[str, Any]:
     wants = re.compile(rf"/item/{re.escape(item_id)}(?!\d)")
     async with _cdp_lock:
         await _polite_wait()
-        async with open_page(_LANDING, wait_ms=9000) as page:
+        async with open_page(_LANDING, wait_ms=9000, navigation_timeout_ms=TIMEOUT * 1000) as page:
             # Raw CDP has no sibling-page handles: refuse before opening a popup
             # that this transport could neither identify nor clean up.
             context = getattr(page, "context", None)
             if context is None:
-                raise ToolError(
+                raise_tool_error(
                     TransportDownError(
                         "aliexpress_card needs the Playwright-managed CDP page (tab-hopping); "
                         "the raw-CDP fallback carries no page context. Run with the default transport."
@@ -435,7 +454,7 @@ async def _cdp_card(url: str, ctx: Context | None) -> dict[str, Any]:
             listen = getattr(page, "on", None)
             unlisten = getattr(page, "remove_listener", None)
             if not callable(listen) or not callable(unlisten):
-                raise ToolError(TransportDownError("aliexpress_card needs Playwright popup events"))
+                raise_tool_error(TransportDownError("aliexpress_card needs Playwright popup events"))
             listen("popup", observe_popup)
 
             async def collect_owned() -> None:
@@ -481,7 +500,7 @@ async def _cdp_card(url: str, ctx: Context | None) -> dict[str, Any]:
                 )
                 opened = await asyncio.wait_for(page.evaluate(opener), timeout=10.0)
                 if not isinstance(opened, str) or "opened" not in opened:
-                    raise ToolError(TransportDownError(f"could not open the item tab ({opened})"))
+                    raise_tool_error(TransportDownError(f"could not open the item tab ({opened})"))
                 target = None
                 for _ in range(20):
                     await asyncio.sleep(1)
@@ -497,7 +516,7 @@ async def _cdp_card(url: str, ctx: Context | None) -> dict[str, Any]:
                         break
                 if target is None:
                     # No delivered item is a transport outcome, not a proven refusal.
-                    raise ToolError(
+                    raise_tool_error(
                         TransportDownError(
                             "the item tab never materialised (popup blocked, closed, or challenged); "
                             "open aliexpress.ru in the scraping profile and retry — this is not a parser failure"
@@ -522,11 +541,11 @@ async def _cdp_card(url: str, ctx: Context | None) -> dict[str, Any]:
                         pass
                     await asyncio.sleep(1)
                 if raw is None:
-                    raise ToolError(TransportDownError("item tab produced no extractable content"))
+                    raise_tool_error(TransportDownError("item tab produced no extractable content"))
                 data = _unwrap_extract(raw, "card")
                 if _is_punish(data):
                     _pacer.record_refusal()
-                    raise ToolError(_challenge_error("the item tab opened onto an x5sec challenge"))
+                    raise_tool_error(_challenge_error("the item tab opened onto an x5sec challenge"))
                 return data
             finally:
                 task = asyncio.create_task(cleanup())
@@ -578,7 +597,11 @@ def _card_prices(payload: dict[str, Any]) -> tuple[float | None, float | None]:
 @mcp.tool(
     name="aliexpress_search",
     annotations=ToolAnnotations(
-        title="AliExpress Search", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+        title="AliExpress Search",
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def aliexpress_search(
@@ -587,16 +610,9 @@ async def aliexpress_search(
 ) -> AliSearchResponse:
     """Search AliExpress, rendered in the operator's Chrome.
 
-    ## Return Format
+    price_rub is None when the tile states no price — never 0; zero tiles with no challenge is parser drift, not an empty catalog.
 
-    AliSearchResponse: {status, query, tier_used, count, items[], meta}.
-    price_rub is None when absent — never 0.
-
-    ## Error Format
-
-    ToolError: TransportDownError on x5sec challenges or CDP failures (with the
-    manual-check hint inline); ParserDriftError when a rendered page yields zero
-    product tiles.
+    Full field list and error codes: `guide://aliexpress/aliexpress_search`.
     """
     log_event("aliexpress_search.start", query=query[:60])
     try:
@@ -643,6 +659,14 @@ async def aliexpress_search(
                 f"{coupon_seen} tile(s) advertise a coupon price; price_rub carries the regular "
                 f"price and the coupon value is not part of the response — treat 'cheapest' ranking with care"
             )
+        # The selfcheck compares this payload against the captured
+        # required-key registry; the tool's own answer now carries the same
+        # drift signal, so an agent does not need a human running doctor to
+        # learn the shape moved. Zero tiles raise before this point, so the
+        # key check never runs on a vacuously empty payload.
+        drift = R.shape_drift_warning(payload, ((key,) for key in SEARCH_REQUIRED_KEYS), source="aliexpress_search")
+        if drift:
+            warnings.append(drift)
         result = AliSearchResponse(query=query, tier_used=tier, count=len(items), items=items)
         attached = R.attach_meta(
             result.model_dump(by_alias=True, exclude={"meta"}), warnings, source="aliexpress_search"
@@ -653,17 +677,17 @@ async def aliexpress_search(
         raise
     except Exception as exc:
         log_event("aliexpress_search.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"aliexpress_search failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"aliexpress_search failed: {exc}"))
 
 
 @mcp.tool(
     name="aliexpress_card",
     annotations=ToolAnnotations(
         title="AliExpress Product Card",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def aliexpress_card(
@@ -683,16 +707,9 @@ async def aliexpress_card(
     review tab, which x5sec challenges; this tool returns the rating and the
     order count instead.
 
-    ## Return Format
+    price_rub is None when the card states no price — never 0.
 
-    AliCardResponse: {status, item_id, title, price_rub, old_price_rub, rating,
-    orders_count, url, tier_used, meta}.
-
-    ## Error Format
-
-    ToolError: BadRequestError when no item id can be extracted;
-    TransportDownError on x5sec challenges or CDP failures; ParserDriftError
-    when a rendered card has neither title nor price.
+    Full field list and error codes: `guide://aliexpress/aliexpress_card`.
     """
     log_event("aliexpress_card.start", input=item_id_or_url[:80])
     try:
@@ -766,7 +783,7 @@ async def aliexpress_card(
         raise
     except Exception as exc:
         log_event("aliexpress_card.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"aliexpress_card failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"aliexpress_card failed: {exc}"))
 
 
 # CLI-only drift canary: ``marketplace-mcp doctor`` imports and calls
@@ -801,7 +818,7 @@ async def aliexpress_selfcheck(ctx: Context | None = None) -> AliSelfcheckRespon
         raise
     except Exception as exc:
         log_event("aliexpress_selfcheck.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"aliexpress_selfcheck failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"aliexpress_selfcheck failed: {exc}"))
 
 
 async def _aliexpress_selfcheck_impl(ctx: Context | None) -> AliSelfcheckResponse:
@@ -856,12 +873,45 @@ async def _aliexpress_selfcheck_impl(ctx: Context | None) -> AliSelfcheckRespons
                     ],
                 )
             else:
-                notes = [
-                    f"{len(items_raw)} tiles extracted",
-                    f"{len(priced)} tiles with an attached price"
-                    + (f", {len(totals)} with an orders line" if totals else ""),
+                # Tiles extract — now ask the second question: did the SHAPE
+                # move? The registry was measured on a captured page; a live
+                # payload that loses a parser-critical path is structural drift
+                # even while tiles still come back. Types may vary with the
+                # data (str/null), so the required check is on key presence,
+                # not on the full signature. Array members need the "["
+                # separator: "price_texts.attached[]:str" must count as the
+                # key "price_texts.attached" being present.
+                live_signature = R.shape_signature(payload)
+                drift = R.diff_keys(SEARCH_SHAPE_REFERENCE, live_signature)
+                missing_required = [
+                    key
+                    for key in SEARCH_REQUIRED_KEYS
+                    if not any(entry.startswith(f"{key}{sep}") for entry in live_signature for sep in (":", "[", "."))
                 ]
-                checks["search"] = R.selfcheck_entry("healthy", baseline=baseline, notes=notes)
+                if missing_required:
+                    checks["search"] = R.selfcheck_entry(
+                        "drift",
+                        baseline=baseline,
+                        reason="shape_drift",
+                        notes=[
+                            f"{len(items_raw)} tiles extracted",
+                            f"required paths missing: {', '.join(missing_required)}",
+                        ],
+                        shape_missing=drift["missing"],
+                        shape_added=drift["added"],
+                    )
+                else:
+                    notes = [
+                        f"{len(items_raw)} tiles extracted",
+                        f"{len(priced)} tiles with an attached price"
+                        + (f", {len(totals)} with an orders line" if totals else ""),
+                        "shape matches the captured reference",
+                    ]
+                    if drift["added"]:
+                        notes.append(f"{len(drift['added'])} new paths vs baseline (informational)")
+                    checks["search"] = R.selfcheck_entry(
+                        "healthy", baseline=baseline, notes=notes, shape_added=drift["added"]
+                    )
 
     # Chain the card probe off the search result so the canary never depends on
     # a hardcoded SKU that may have been delisted.
@@ -941,3 +991,8 @@ async def _aliexpress_selfcheck_impl(ctx: Context | None) -> AliSelfcheckRespons
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)

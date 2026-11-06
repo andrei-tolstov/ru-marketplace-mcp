@@ -23,16 +23,18 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 # PURPOSE: Expose Megamarket search and cards from its mobile catalog API.
 # SCOPE: Read-only browser POSTs; delivery context; explicit ServicePipe refusals.
 # INVARIANTS: Reject failed API envelopes before success pacing/cache; preserve empty results.
-# DEPENDS: FastMCP; mcp_core CDP/cache/pacing; models_output; settings.
-# LINKS: M-MEGAMARKET; M-COMPARE; M-MARKETPLACE; packages/megamarket-connector/tests.
+# DEPENDS: FastMCP; mcp_core CDP/cache/pacing/kit; models_output; settings; shape_reference.
+# LINKS: M-MEGAMARKET; M-KIT; M-COMPARE; M-MARKETPLACE; R-CDP-HOST-PAUSE; packages/megamarket-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
+# _raise_if_host_pause: Re-raise the mapped CDP host pause out of the degrade handlers that swallow other failures.
 # _post: Issue browser API reads; cache only envelopes without explicit failures.
 # _raise_failed_envelope: Distinguish not-found, refusal/service failures and malformed errors.
 # _resolve_address_id: Resolve delivery context; profile access requires opt-in.
 # _final_catalog_url: Resolve the catalog redirect before reading search parameters.
 # _is_ip_block: Detect code-7 ServicePipe refusals rather than treating them as data.
-# megamarket_search: Normalize paginated mobile catalog offers and drift states.
+# megamarket_search: Normalize paginated mobile catalog offers and drift states,
+#                    plus a runtime shape-drift warning when a required key family vanishes.
 # megamarket_card: Read one goods envelope with nullable price/stock fields.
 # megamarket_selfcheck: Diagnose operator transport/parser health; not an MCP tool.
 # END_MODULE_MAP
@@ -48,7 +50,6 @@ import urllib.parse
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
@@ -59,11 +60,14 @@ from mcp_core.errors import (
     ToolError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import blocked_error, polite_wait
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.resources import register_reference_resources
 from mcp_core.transport.chrome_cdp import NavBlocked, open_page
 from pydantic import Field
 
@@ -75,10 +79,11 @@ from megamarket_connector.models_output import (
     MetaOut,
 )
 from megamarket_connector.settings import get_settings
+from megamarket_connector.shape_reference import SEARCH_REQUIRED_FAMILIES, missing_required_families
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://megamarket.ru"
@@ -130,10 +135,10 @@ mcp = FastMCP(
         "Megamarket catalog: search and product cards. Every read runs in the "
         "operator's own Chrome over CDP — ServicePipe blocks the mobile API by "
         "IP reputation, so there is no anonymous tier. Start with "
-        "megamarket_search; megamarket_card takes a goods id or product URL."
+        "megamarket_search; megamarket_card takes a goods id or product URL. "
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
     ),
 )
-mcp.add_middleware(RetryMiddleware())
 
 _cache: TTLCache = TTLCache(ttl_s=_settings.cache_ttl, max_entries=128)
 _pacer = Pacer(_min_gap)
@@ -144,9 +149,11 @@ async def _polite_wait() -> None:
     """Space this source's requests out, and back off if it refused us.
 
     Reads ``_min_gap`` at call time so an operator or a test can retune the
-    pace without rebuilding the pacer.
+    pace without rebuilding the pacer. The pacing itself is shared
+    (mcp_core.kit.polite_wait); this module-level name stays because the tools
+    call it and the tests patch it.
     """
-    await _pacer.wait(min_gap=_min_gap)
+    await polite_wait(_pacer, _min_gap)
 
 
 def _extract_item_id(raw: str) -> str | None:
@@ -219,17 +226,38 @@ def _is_ip_block(payload: Any) -> bool:
 
 
 def _blocked_error(detail: str = "") -> TransportDownError:
+    """The refusal error, with the pacer's standing-block hint (mcp_core.kit)."""
     message = (
         "Megamarket refused the session by IP reputation (ServicePipe code 7). "
         "Open megamarket.ru in the Chrome scraping profile, let the challenge pass, then retry; "
         "a Russian residential IP for that browser is the durable fix."
     )
-    hint = _pacer.rotation_hint()
-    if hint:
-        message += f" {hint}"
-    if detail:
-        message += f" Detail: {detail[:160]}"
-    return TransportDownError(message, status_code=403)
+    return blocked_error(message, pacer=_pacer, detail=detail)
+
+
+def _raise_if_host_pause(exc: Exception) -> None:
+    """R-CDP-HOST-PAUSE: re-raise ``exc`` when it is the mapped CDP host pause.
+
+    The degrade handlers around address resolution, the catalog redirect and
+    url/parse are deliberately non-fatal for endpoint failures — a weaker
+    search is better than none, and offline tests pin that for ordinary
+    ToolErrors. A timed refusal is different: swallowing it hides the pause
+    from the agent and caches a bogus "no address" verdict that outlives the
+    cooldown, so only the rate_limited-with-retry_after_s ToolError passes
+    through; every other failure keeps the existing degrade.
+    """
+    if not isinstance(exc, ToolError):
+        return
+    try:
+        payload = json.loads(str(exc))
+    except json.JSONDecodeError:
+        return
+    if (
+        isinstance(payload, dict)
+        and payload.get("error") == "rate_limited"
+        and payload.get("retry_after_s") is not None
+    ):
+        raise exc
 
 
 def _raise_failed_envelope(payload: dict[str, Any], what: str) -> None:
@@ -361,7 +389,9 @@ async def _resolve_address_id(ctx: Context | None) -> str | None:
                     log_event("megamarket.address", source="profile", region=str(preferred.get("region") or "")[:40])
                     return _address_id
         except Exception as exc:
-            # Not logged in, or the profile endpoint refused. Fall through.
+            # Not logged in, or the profile endpoint refused. Fall through —
+            # unless the host itself is paused (R-CDP-HOST-PAUSE).
+            _raise_if_host_pause(exc)
             log_event("megamarket.address_profile_failed", error=_redact(str(exc))[:120])
     else:
         log_event(
@@ -386,6 +416,9 @@ async def _resolve_address_id(ctx: Context | None) -> str | None:
                 log_event("megamarket.address", source="suggest", query=_ADDRESS[:40])
                 return _address_id
     except Exception as exc:
+        # R-CDP-HOST-PAUSE: a swallowed pause would cache a "none" address for
+        # the process lifetime, so the search stays degraded after the cooldown.
+        _raise_if_host_pause(exc)
         log_event("megamarket.address_suggest_failed", error=_redact(str(exc))[:120])
 
     _address_source = "none"
@@ -453,6 +486,9 @@ async def _final_catalog_url(catalog_url: str, ctx: Context | None) -> str:
             async with open_page(catalog_url, wait_ms=4000) as page:
                 final_url = page.url
     except Exception as exc:
+        # R-CDP-HOST-PAUSE: let a host pause through; other probe failures
+        # keep the documented degrade (weaker search, not a failed one).
+        _raise_if_host_pause(exc)
         log_event("megamarket.redirect_failed", error=_redact(str(exc))[:120])
         return catalog_url
     if final_url and final_url not in (catalog_url, "about:blank"):
@@ -486,6 +522,8 @@ async def _resolve_search_params(query: str, ctx: Context | None) -> dict[str, A
     try:
         parsed = await _post("/urlService/url/parse", {"url": catalog_url}, ctx, "url parse")
     except Exception as exc:
+        # R-CDP-HOST-PAUSE: same as _final_catalog_url — only the pause passes.
+        _raise_if_host_pause(exc)
         log_event("megamarket.url_parse_failed", error=_redact(str(exc))[:120])
         return {}
 
@@ -650,7 +688,11 @@ def _parse_items(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | N
 @mcp.tool(
     name="megamarket_search",
     annotations=ToolAnnotations(
-        title="Megamarket Search", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+        title="Megamarket Search",
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def megamarket_search(
@@ -664,19 +706,13 @@ async def megamarket_search(
     does the logged-in profile's default address win — that reads a private
     account endpoint, and the response says so in _meta.warnings
     ("address_source:profile" plus a "profile_address_read" notice).
-    _meta.healthy is false only for that profile read and for
-    "address_source:none" (no delivery address resolved); the default suggest
-    path answers healthy with no address warning.
+    Any warning that is not prefixed "info:" makes _meta.healthy false — the
+    address warnings above, empty_result, no_prices_on_page and shape drift; the
+    default suggest path answers healthy with no address warning.
 
-    ## Return Format
+    price_rub is None when the tile states no price — never 0.
 
-    MegamarketSearchResponse: {status, query, tier_used, count, total_count,
-    items[], _meta}. price_rub is None when absent — never 0.
-
-    ## Error Format
-
-    ToolError: TransportDownError on ServicePipe refusals (with the fix inline);
-    ParserDriftError when a reached-200 body no longer parses.
+    Full field list and error codes: `guide://megamarket/megamarket_search`.
     """
     log_event("megamarket_search.start", query=query[:60])
     try:
@@ -741,6 +777,26 @@ async def megamarket_search(
                 "addressless session with an empty result rather than an error, so check the session "
                 "before concluding the product does not exist"
             )
+        else:
+            # The selfcheck compares this payload against the captured family
+            # registry; the tool's own answer now carries the same drift
+            # signal, so an agent does not need a human running doctor to
+            # learn the shape moved. The parsed items emit every key
+            # unconditionally, so the guard runs on the RAW envelope the
+            # parser binds through; the empty-result warning above already
+            # covers a vacuously empty payload.
+            drift = R.shape_drift_warning(payload, SEARCH_REQUIRED_FAMILIES, source="megamarket_search")
+            if drift:
+                warnings.append(drift)
+            # Every price alias (finalPrice/price/currentPrice) dying at once
+            # returns a full page of priceless items, which used to answer
+            # _meta.healthy=true — the WB/Ozon/Taobao/Yandex guard this
+            # connector was missing.
+            warnings.extend(
+                R.validate_items(
+                    [it.model_dump() for it in items], require_title=True, absent_price="no_prices_on_page"
+                )
+            )
         result = MegamarketSearchResponse(
             query=query, tier_used="cdp", count=len(items), total_count=total, items=items
         )
@@ -753,17 +809,17 @@ async def megamarket_search(
         raise
     except Exception as exc:
         log_event("megamarket_search.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"megamarket_search failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"megamarket_search failed: {exc}"))
 
 
 @mcp.tool(
     name="megamarket_card",
     annotations=ToolAnnotations(
         title="Megamarket Product Card",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def megamarket_card(
@@ -774,16 +830,9 @@ async def megamarket_card(
 ) -> MegamarketCardResponse:
     """Fetch one Megamarket product card.
 
-    ## Return Format
+    price_rub and old_price_rub are None when the card states none — never 0.
 
-    MegamarketCardResponse: {status, item_id, title, price_rub, old_price_rub,
-    is_available, rating, rating_count, url, tier_used, _meta}.
-
-    ## Error Format
-
-    ToolError: BadRequestError on unparseable input; NotFoundError on a missing
-    goods id; TransportDownError on ServicePipe refusals; ParserDriftError on
-    envelope drift.
+    Full field list and error codes: `guide://megamarket/megamarket_card`.
     """
     log_event("megamarket_card.start", input=item_id_or_url[:80])
     try:
@@ -812,14 +861,27 @@ async def megamarket_card(
             url=R.first_present(card, "url", "webUrl") or f"{SITE_BASE}/product/{item_id}",
             tier_used="cdp",
         )
-        attached = R.attach_meta(result.model_dump(by_alias=True, exclude={"meta"}), [], source="megamarket_card")
+        card_warnings: list[str] = []
+        card_fields = result.model_dump(by_alias=True, exclude={"meta"})
+        if result.price_rub is None and result.old_price_rub is None:
+            # No price alias matched at all. The container parsed, so this is the
+            # card's own value drift; without the warning the call answered
+            # _meta.healthy=true with price_rub=null.
+            card_warnings.append(
+                "no_price: no price alias (price/currentPrice/finalPrice) matched on the card (value selector drift?)"
+            )
+        # The card reports stock as is_available, which validate_offer does not
+        # know; map it so "available but unpriced" fires the same contradiction
+        # the search connectors report.
+        card_warnings.extend(R.validate_offer({**card_fields, "in_stock": card_fields.get("is_available")}))
+        attached = R.attach_meta(card_fields, card_warnings, source="megamarket_card")
         result.meta = MetaOut(**attached["_meta"])
         return result
     except ToolError:
         raise
     except Exception as exc:
         log_event("megamarket_card.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"megamarket_card failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"megamarket_card failed: {exc}"))
 
 
 # CLI-only drift canary: ``marketplace-mcp doctor`` imports and calls megamarket_selfcheck()
@@ -854,7 +916,7 @@ async def megamarket_selfcheck(ctx: Context | None = None) -> MegamarketSelfchec
         raise
     except Exception as exc:
         log_event("megamarket_selfcheck.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"megamarket_selfcheck failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"megamarket_selfcheck failed: {exc}"))
 
 
 async def _megamarket_selfcheck_impl(ctx: Context | None) -> MegamarketSelfcheckResponse:
@@ -883,7 +945,23 @@ async def _megamarket_selfcheck_impl(ctx: Context | None) -> MegamarketSelfcheck
     else:
         items_raw, total, container_found = _parse_items(payload)
         if items_raw:
-            checks["search"] = R.selfcheck_entry("healthy", baseline=baseline, notes=[f"{len(items_raw)} items parsed"])
+            # Items parsing is not enough: the parser binds the raw envelope
+            # through alias families, and the loss of a whole family is drift
+            # the count above cannot see. Same registry megamarket_search warns
+            # with at runtime.
+            missing = missing_required_families(R.shape_signature(payload))
+            if missing:
+                lost = "; ".join("/".join(family) for family in missing)
+                checks["search"] = R.selfcheck_entry(
+                    "drift",
+                    baseline=baseline,
+                    reason="shape_drift",
+                    notes=[f"{len(items_raw)} items parsed, but parser-critical key families lost: {lost}"],
+                )
+            else:
+                checks["search"] = R.selfcheck_entry(
+                    "healthy", baseline=baseline, notes=[f"{len(items_raw)} items parsed"]
+                )
         elif container_found and total not in (0, None):
             # total says there are matches and none of them parsed. That is a
             # contradiction inside one payload, so the item shape moved.
@@ -934,3 +1012,8 @@ async def _megamarket_selfcheck_impl(ctx: Context | None) -> MegamarketSelfcheck
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)

@@ -44,11 +44,16 @@ yourself via env; it is never stored by the project either.)
 Set `CHROME_CHALLENGE_HANDOFF_S=120` in the MCP server's environment to retain
 DOM-detected Lamoda search and Taobao search/card challenge tabs for up to two
 minutes. Default `0` disables retention; the hard maximum is 300 seconds, including
-initial browser attachment/navigation. A headed Chrome and an active MCP session
-are required. This mode does not solve CAPTCHA or log into accounts.
+initial browser attachment/navigation. A headed Chrome and a client the server can
+recognise between calls are required: an MCP session on handshake-era connections
+(protocol 2025-11-25 and older), or, on sessionless 2026-07-28 connections, the
+stdio server process itself, since one stdio process serves one client. A
+sessionless HTTP connection names no client between requests, so there the
+challenge is reported without retaining the tab. This mode does not solve CAPTCHA
+or log into accounts.
 
 An error with `handoff_expires_at` confirms a retained tab. Complete the interaction
-in that tab, then repeat the same operation and arguments in the same MCP session.
+in that tab, then repeat the same operation and arguments from the same client.
 The connector reads that exact page without navigating again; a successful read
 closes it. For comparison, repeat the original query with only the affected source.
 Pending handoffs take precedence over successful-result caches, so another
@@ -62,8 +67,8 @@ connector calls from hiding it while the handoff is active. Foreground activatio
 is best-effort, especially for remote browsers. Expiry, errors, cancellation and
 graceful shutdown close owned tabs; a hard process kill cannot guarantee expiry
 in an external Chrome. Without `handoff_expires_at`, use the ordinary retry flow:
-HTTP errors rejected before DOM extraction, headless runs and calls without an
-MCP session do not retain a tab. No cookies, screenshots or browser profile copies
+HTTP errors rejected before DOM extraction, headless runs, CLI calls and
+sessionless HTTP calls do not retain a tab. No cookies, screenshots or browser profile copies
 are written by the handoff runtime. A retained error also carries an opaque
 `handoff_id`; a vision-capable MCP client may pass it to
 `compare_browser_snapshot(handoff_id)` to receive the current viewport as an
@@ -96,14 +101,48 @@ Useful flags: `--port 9333`, `--profile /path/to/dir`, `--headless`.
 Headless is off by default and should stay off: anti-bot systems detect headless
 Chrome readily, which defeats the purpose of using a real browser.
 
-### 2. Log into the marketplaces you need — and nothing else
+**You do not need to close your everyday Chrome.** The launcher starts a second
+Chrome with its own `--user-data-dir`, which Chrome allows next to another
+profile. It refuses only the one case that cannot work: another Chrome already
+holding *this* profile, which would refuse to start a second time. If a CDP
+endpoint already answers on the port, the launcher says so and exits without
+starting anything.
+
+### 2. The window and the two ways to reach it
+
+The launcher scripts start the manual Chrome **on-screen** so you can log in.
+`-Hidden` (PowerShell) parks it off-screen instead, `--hidden` (shell) hides the
+app with ⌘H on macOS and changes nothing on Linux, and
+`-Visible` is still accepted as a no-op. The connector's own autostart is
+different: on Windows it deliberately parks the window off-screen so it never
+takes focus. That is the window you cannot see, and logging in or passing a
+site's check needs a human. These verbs answer that:
+
+```console
+marketplace-mcp browser start    # launch the scraping Chrome on-screen (--hidden: off-screen)
+marketplace-mcp browser status   # is the endpoint reachable, which Chrome, how many tabs, where is the window
+marketplace-mcp browser show     # un-minimize the window, move it on-screen, activate its first tab
+```
+
+`browser start` exits 0 when CDP answers at the end (also when it was already
+running; it then points at `browser show`), and 1 with the reason otherwise.
+`browser status` exits 0 when the endpoint answers and 1 when it does not, and
+then prints how to start the scraping Chrome. `browser show` sends browser-level
+CDP commands only: it opens no page and requests nothing from any website.
+
+### 3. Log into the marketplaces you need — and nothing else
 
 In the window that opens, sign into whichever CDP sources you use — `ozon.ru`,
 `avito.ru`, `taobao.com`, `megamarket.ru`, `lamoda.ru`, `dns-shop.ru`,
-`citilink.ru`, `aliexpress.ru`. One profile serves them all. **Do not** sign into banking, email, or
+`citilink.ru`, `aliexpress.ru`, `cian.ru`. One profile serves them all. **Do not** sign into banking, email, or
 work accounts here. Keeping it single-purpose is what bounds the risk.
 
-### 3. Verify
+When `doctor` reports a wall, `marketplace-mcp unblock <source>` opens that
+source's page in a new tab and waits while you pass the check or log in; it then
+re-runs only that source's selfcheck. It opens pages and re-checks — it never
+solves or automates a site's check.
+
+### 4. Verify
 
 ```bash
 curl -s http://127.0.0.1:9222/json/version
@@ -112,7 +151,7 @@ curl -s http://127.0.0.1:9222/json/version
 You should see Chrome's version JSON. On Windows you can also use
 `Test-NetConnection 127.0.0.1 -Port 9222`.
 
-### 4. Confirm the connector sees it
+### 5. Confirm the connector sees it
 
 ```bash
 uv run python -c "
@@ -131,6 +170,8 @@ payload shape and the connector needs updating.
 | Variable | Default | Purpose |
 |---|---|---|
 | `CHROME_CDP_PORT` | `9222` | Debugging port |
+| `CHROME_NAV_TIMEOUT_MS` | `20000` | Initial page-navigation timeout in milliseconds, shared by Playwright and raw CDP unless a connector supplies its own value; finite and greater than zero |
+| `ALI_TIMEOUT` | `45` | AliExpress search and card-landing navigation timeout in seconds; overrides the shared navigation setting; finite and greater than zero |
 | `CHROME_SCRAPING_PROFILE` | platform default above | Profile directory |
 | `CHROME_BINARY` | auto-detected | Explicit path to Chrome/Chromium/Edge |
 | `CHROME_STEALTH` | `1` | Windows: park the window off-screen; macOS: open tabs in the background and keep the app hidden (⌘H) so it never steals focus or switches your Space |
@@ -138,6 +179,23 @@ payload shape and the connector needs updating.
 
 Auto-detection covers Chrome, Chromium and Edge in the standard locations for all
 three platforms. On Linux it also consults `PATH`.
+
+Timeouts must remain finite and positive after unit conversion; a value too small
+to represent as raw-CDP seconds is rejected, not rounded to a disabled timeout.
+Set timeout variables in the MCP server's environment and restart the server to
+reload AliExpress settings. For example, `ALI_TIMEOUT=90` allows up to 90 seconds
+for its search or card landing to navigate; it does not remove any page checks.
+Playwright still waits for `DOMContentLoaded`. Raw CDP keeps its existing
+load-event/main-document-status behavior; changing the budget does not make a
+200 response proof that product data is ready. Other connectors keep the shared
+20-second default unless `CHROME_NAV_TIMEOUT_MS` is set.
+
+These are navigation limits, not end-to-end tool limits. CDP attachment, settling,
+extraction and teardown have separate bounds. `compare_prices` still applies
+`COMPARE_SOURCE_TIMEOUT` (45 seconds by default) to the whole source call, and
+AliExpress selfchecks keep their 90-second outer limit. A larger navigation setting
+does not override those ceilings. If a normal page needs more time, increase the
+appropriate budgets rather than blocking the site's anti-bot resources.
 
 ## How it behaves at runtime
 

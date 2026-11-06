@@ -28,13 +28,14 @@ price carries, because Cian leaves ``paymentPeriod`` null on daily offers.
 # START_MODULE_CONTRACT
 # PURPOSE: Expose Cian filtered real-estate search and offer cards.
 # SCOPE: Read-only browser API/state; sale, monthly rent and daily price units.
-# DEPENDS: FastMCP; mcp_core CDP/cache/pacing; models_output; settings.
-# LINKS: M-CIAN; M-MARKETPLACE; packages/cian-connector/tests.
+# DEPENDS: FastMCP; mcp_core CDP/cache/pacing/kit; models_output; settings; shape_reference.
+# LINKS: M-CIAN; M-KIT; M-MARKETPLACE; packages/cian-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
 # _build_json_query: Construct deal/property/region/range filter queries.
 # _extract_offer_id: Resolve numeric handles or Cian offer URLs.
-# cian_search: Read filtered offers with explicit price units and partial fields.
+# cian_search: Read filtered offers with explicit price units and partial fields,
+#              plus a runtime shape-drift warning when a required key family vanishes.
 # cian_card: Read embedded offer-card state and classify removed/blocked pages.
 # cian_selfcheck: Diagnose operator browser/parser health; not an MCP tool.
 # END_MODULE_MAP
@@ -45,11 +46,11 @@ import asyncio
 import datetime
 import json
 import re
-from typing import Annotated, Any, Literal
+from collections.abc import Sequence
+from typing import Annotated, Any, Literal, get_args
 
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
@@ -59,11 +60,14 @@ from mcp_core.errors import (
     ParserDriftError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import blocked_error, polite_wait
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.resources import register_reference_resources
 from mcp_core.transport.chrome_cdp import NavBlocked, open_page
 from pydantic import Field
 
@@ -78,10 +82,11 @@ from cian_connector.models_output import (
     MetaOut,
 )
 from cian_connector.settings import get_settings
+from cian_connector.shape_reference import SEARCH_REQUIRED_FAMILIES, missing_required_families
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://www.cian.ru"
@@ -128,7 +133,10 @@ _QUERY_TYPE: dict[tuple[str, str], str] = {
 }
 # 1..6 rooms; Cian's own codes for a free layout (7) and a studio (9) —
 # verified live 2026-09-09: room=[9] returns flatType studio, room=[7] openPlan.
-_ROOM_CHOICES = frozenset({1, 2, 3, 4, 5, 6, 7, 9})
+# The closed set is in the tool signature as well, so the advertised schema
+# refuses an unknown room count instead of describing the rule in prose only.
+RoomCount = Literal[1, 2, 3, 4, 5, 6, 7, 9]
+_ROOM_CHOICES = frozenset(get_args(RoomCount))
 _REGION_RE = re.compile(r"^\d{1,7}$")
 _OFFER_ID_RE = re.compile(r"cian\.ru/(?:sale|rent)/[a-z-]+/(\d{6,})(?:[/?#]|$)")
 _WAF_MARKER = "cian_waf_block"
@@ -149,10 +157,10 @@ mcp = FastMCP(
         "with cian_search (filters, not free text — region ids: 1 Москва, "
         "2 Санкт-Петербург, 4593 Московская область, 4588 Ленинградская область); "
         "cian_card takes an offer id or URL. Prices are rubles and price_unit "
-        "says what one buys (total / month / day); a missing price is None, never 0."
+        "says what one buys (total / month / day); a missing price is None, never 0. "
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
     ),
 )
-mcp.add_middleware(RetryMiddleware())
 
 _cache: TTLCache[tuple[int, str]] = TTLCache(ttl_s=_settings.cache_ttl, max_entries=256)
 _pacer = Pacer(_min_gap)
@@ -160,8 +168,12 @@ _cdp_lock = asyncio.Lock()
 
 
 async def _polite_wait() -> None:
-    """Space this source's requests out, and back off if it refused us."""
-    await _pacer.wait(min_gap=_min_gap)
+    """Space this source's requests out, and back off if it refused us.
+
+    Shared mechanism (mcp_core.kit.polite_wait); this module-level name stays
+    because the tools call it and the tests patch it.
+    """
+    await polite_wait(_pacer, _min_gap)
 
 
 # ------------------------------------------------------------ transport ----
@@ -290,6 +302,10 @@ async def _fetch_search(json_query: dict[str, Any], ctx: Context | None) -> tupl
     except NavBlocked as exc:
         _pacer.record_refusal()
         return exc.status or 0, str(exc), "cdp_blocked"
+    except ToolError:
+        # R-CDP-HOST-PAUSE: keep the mapped host-pause error and its
+        # retry_after_s, instead of relabelling it a generic CDP failure.
+        raise
     except Exception as exc:
         return 0, _redact(str(exc)), "cdp_failed"
     if status == 200 and _looks_like_json(body):
@@ -317,6 +333,10 @@ async def _fetch_card(offer_id: int, ctx: Context | None) -> tuple[int, str, str
     except NavBlocked as exc:
         _pacer.record_refusal()
         return exc.status or 0, str(exc), "cdp_blocked"
+    except ToolError:
+        # R-CDP-HOST-PAUSE: keep the mapped host-pause error and its
+        # retry_after_s, instead of relabelling it a generic CDP failure.
+        raise
     except Exception as exc:
         return 0, _redact(str(exc)), "cdp_failed"
     if status == 200 and _looks_like_json(body) and _CARD_OK_RE.search(body[:80]):
@@ -326,17 +346,13 @@ async def _fetch_card(offer_id: int, ctx: Context | None) -> tuple[int, str, str
 
 
 def _blocked_error(tier: str, detail: str = "") -> TransportDownError:
+    """The refusal error, with the pacer's standing-block hint (mcp_core.kit)."""
     message = (
         f"Cian answered with its WAF block page via {tier}. "
         "Open cian.ru in the Chrome CDP profile, pass the check if one is shown, then retry; "
         "from a datacenter IP the block is expected until the browser session is warmed up."
     )
-    hint = _pacer.rotation_hint()
-    if hint:
-        message += f" {hint}"
-    if detail:
-        message += f" Detail: {detail[:160]}"
-    return TransportDownError(message, status_code=403)
+    return blocked_error(message, pacer=_pacer, detail=detail)
 
 
 def _raise_for_fetch_failure(status: int, body: str, tier: str, what: str) -> None:
@@ -670,7 +686,7 @@ def _build_json_query(
     deal: str,
     offer_type: str,
     region: str,
-    rooms: list[int] | None,
+    rooms: Sequence[int] | None,
     price_min: int | None,
     price_max: int | None,
     area_min: float | None,
@@ -716,10 +732,10 @@ def _validate_region(region: str | None) -> str:
     name="cian_search",
     annotations=ToolAnnotations(
         title="Cian Real-Estate Search",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def cian_search(
@@ -752,7 +768,7 @@ async def cian_search(
         ),
     ] = None,
     rooms: Annotated[
-        list[int] | None,
+        list[RoomCount] | None,
         Field(
             description=(
                 "Flats only: room counts to include, any of 1..6; 7 = свободная планировка, 9 = студия. "
@@ -780,21 +796,9 @@ async def cian_search(
     comparable — a daily offer is priced per night. ``price_unit`` on every
     item says which it is.
 
-    ## Return Format
+    price_rub is None when Cian states no price — never 0; price_unit says what the amount means ('total', 'month', 'day'), so compare only equal units.
 
-    CianSearchResponse: {status, deal, offer_type, region, page, tier_used,
-    count, total_count, items[], _meta}. Each item carries offer_id, title,
-    price_rub (None when Cian shows no price — never 0), price_unit
-    ('total' / 'month' / 'day'), rooms, areas, floor, address, nearest metro,
-    url, agency and publication data.
-
-    ## Error Format
-
-    ToolError: BadRequestError on malformed arguments (region not digits, room
-    code outside 1-6/7/9, min above max, deal='daily' with
-    offer_type='commercial'); TransportDownError when Cian's WAF blocks the
-    browser session or CDP is down (with the fix inline); ParserDriftError when
-    a 200 body is not the expected envelope.
+    Full field list and error codes: `guide://cian/cian_search`.
     """
     log_event("cian_search.start", deal=deal, offer_type=offer_type, page=page)
     try:
@@ -845,6 +849,24 @@ async def cian_search(
         warnings: list[str] = []
         if not rows and total:
             warnings.append("empty_items_with_nonzero_total")
+        else:
+            # A real-estate offer is still an offer: an unparseable price or a
+            # rating off its scale is the same selector drift the goods
+            # connectors guard against. Cian's price_unit (total/month/day)
+            # stays out of scope — validate_offer reads values, not semantics.
+            warnings.extend(R.validate_items(rows, require_title=True, absent_price="no_prices_on_page"))
+        if rows:
+            # The selfcheck compares this payload against the captured family
+            # registry; the tool's own answer now carries the same drift
+            # signal, so an agent does not need a human running doctor to
+            # learn the shape moved. The parsed rows emit every key
+            # unconditionally, so the guard runs on the RAW envelope the
+            # parser binds through; an empty result stays out of the check
+            # because with zero offers every per-item family is vacuously
+            # absent and the warning above already covers it.
+            drift = R.shape_drift_warning(payload, SEARCH_REQUIRED_FAMILIES, source="cian_search")
+            if drift:
+                warnings.append(drift)
         items = [
             CianSearchItemOut(**{**row, "metro": CianMetroOut(**row["metro"][0]) if row["metro"] else None})
             for row in rows
@@ -866,17 +888,17 @@ async def cian_search(
         raise
     except Exception as exc:
         log_event("cian_search.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"cian_search failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"cian_search failed: {exc}"))
 
 
 @mcp.tool(
     name="cian_card",
     annotations=ToolAnnotations(
         title="Cian Offer Card",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def cian_card(
@@ -888,20 +910,9 @@ async def cian_card(
     """Read one Cian offer: price and its history, layout, building, address,
     metro, description, publisher.
 
-    ## Return Format
+    price_rub is None when Cian states no price — never 0; price_unit says what the amount means ('total', 'month', 'day').
 
-    CianCardResponse: {status, offer_id, title, deal_type, category, price_rub,
-    price_unit, price_period, lease_term, deposit_rub, rooms, areas, floor, floors_total,
-    build_year, building_material, ceiling_height_m, address, metro[],
-    description, photos, photo_urls[] (full-size URLs, floor plans flagged
-    is_layout), created_at, updated_at, views, price_history[], agent,
-    url, tier_used, _meta}. price_rub is None when not stated — never 0.
-
-    ## Error Format
-
-    ToolError: BadRequestError when no offer id can be extracted; NotFoundError
-    when Cian says the offer is gone; TransportDownError on a WAF block or CDP
-    failure; ParserDriftError when the page no longer embeds the offer state.
+    Full field list and error codes: `guide://cian/cian_card`.
     """
     log_event("cian_card.start", input=offer_id_or_url[:80])
     try:
@@ -958,6 +969,8 @@ async def cian_card(
             agent=CianAgentOut(**agent) if agent else None,
             tier_used=tier,
         )
+        card = result.model_dump(by_alias=True, exclude={"meta", "price_history", "agent"})
+        warnings.extend(R.validate_offer(card, require_title=True))
         attached = R.attach_meta(result.model_dump(by_alias=True, exclude={"meta"}), warnings, source="cian_card")
         result.meta = MetaOut(**attached["_meta"])
         return result
@@ -965,7 +978,7 @@ async def cian_card(
         raise
     except Exception as exc:
         log_event("cian_card.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"cian_card failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"cian_card failed: {exc}"))
 
 
 # ------------------------------------------------------------ selfcheck ----
@@ -999,7 +1012,7 @@ async def cian_selfcheck(ctx: Context | None = None) -> CianSelfcheckResponse:
         raise
     except Exception as exc:
         log_event("cian_selfcheck.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(f"cian_selfcheck failed: {exc}")))
+        raise_tool_error_from(exc, _redact(f"cian_selfcheck failed: {exc}"))
 
 
 async def _cian_selfcheck_impl(ctx: Context | None) -> CianSelfcheckResponse:
@@ -1062,6 +1075,16 @@ async def _cian_selfcheck_impl(ctx: Context | None) -> CianSelfcheckResponse:
             raise ValueError("offers carry no id")
         if all(row["address"] is None for row in rows):
             raise ValueError("offers carry no address — geo family lost")
+        # The parser binds the raw envelope through alias families, so a
+        # rename WITHIN a family is fine — but the loss of a whole family is
+        # drift the value checks above cannot see (id renamed away while
+        # title survives would serve every offer without an id). Compare
+        # against the captured reference, the same registry cian_search warns
+        # with at runtime.
+        missing = missing_required_families(R.shape_signature(payload))
+        if missing:
+            lost = "; ".join("/".join(family) for family in missing)
+            raise ValueError(f"payload lost parser-critical key families: {lost}")
         return f"{len(rows)} offers parsed, total {total}", priced[0]["offer_id"]
 
     def _card_smoke(envelope: Any) -> tuple[str, None]:
@@ -1117,3 +1140,8 @@ async def _cian_selfcheck_impl(ctx: Context | None) -> CianSelfcheckResponse:
 # Advertised output schemas are the dominant constant cost of an MCP mount:
 # replace the full Pydantic tree with top-level field names.
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)

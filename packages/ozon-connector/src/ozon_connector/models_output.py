@@ -26,7 +26,7 @@ class OzonSellerOut(BaseModel):
 
 
 class OzonCardResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     status: str = Field(default="success", description="Response status: success or error.")
     price: float | None = Field(default=None, description="Regular price in rubles.")
@@ -63,7 +63,7 @@ class OzonReviewItemOut(BaseModel):
 
 
 class OzonReviewsResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     status: str = Field(default="success", description="Response status: success or error.")
     url: str = Field(default="", description="Canonical Ozon reviews URL.")
@@ -103,18 +103,32 @@ class OzonSearchItemOut(BaseModel):
     price: str | None = Field(default=None, description="Display price string.")
     price_original: str | None = Field(default=None, description="Strikethrough original price string.")
     rating: str | None = Field(default=None, description="Rating display string.")
-    rating_count: int | str | None = Field(default=None, description="Review count (int or display string).")
+    rating_count: int | None = Field(
+        default=None,
+        description=(
+            "Review count. None when Ozon's display text does not name exactly one number — "
+            "a magnitude form ('1.2K отзывов'), a range or two numbers are not guessed."
+        ),
+    )
     stock: str | None = Field(default=None, description="Stock label string.")
 
 
 class OzonSearchResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     status: str = Field(default="success", description="Response status: success or error.")
     query: str = Field(default="", description="Search query text.")
     page: int = Field(default=0, description="Search page number.")
     tier_used: str | None = Field(default=None, description="Fetch tier used.")
-    count: int = Field(default=0, description="Number of items returned.")
+    count: int = Field(default=0, description="Number of items returned — always equal to len(items).")
+    parsed_count: int = Field(
+        default=0,
+        description="Number of tiles parsed from the upstream page before the 30-item cap.",
+    )
+    truncated: bool = Field(
+        default=False,
+        description="True when more tiles were parsed than returned; count is still len(items).",
+    )
     items: list[OzonSearchItemOut] = Field(default_factory=list, description="Search result items (max 30).")
     meta: MetaOut = Field(default_factory=MetaOut, alias="_meta", description="Validation metadata.")
 

@@ -3,7 +3,8 @@
 # Taobao, Megamarket, DNS, Citilink, AliExpress and Lamoda's search path.
 #
 # Run this BEFORE using those connectors' tools.
-# All Chrome windows must be closed first (Chrome refuses CDP if already running).
+# Your everyday Chrome can stay open: this starts a separate Chrome with its
+# own --user-data-dir, which Chrome allows next to another profile.
 #
 # === SECURITY THREAT MODEL ===
 # CDP hands full control of the profile it attaches to - every session logged in
@@ -17,12 +18,17 @@
 #     explicit -AllowMainProfile. Log into marketplaces only in it, and banking or
 #     email stay outside the blast radius. To place it yourself:
 #       .\start_chrome_cdp.ps1 -Profile "$env:LOCALAPPDATA\Chrome-Scraping"
+#
+# The window starts on-screen so a human can log in. Pass -Hidden for the old
+# off-screen launch (the connector's own autostart still uses that). -Visible is
+# still accepted for older commands; it changes nothing, visible is the default.
 
 param(
     [int]$Port = 9222,
     [Parameter(Mandatory=$false)][string]$Profile,
     [switch]$AllowMainProfile,
-    [switch]$Visible
+    [switch]$Visible,  # accepted for compatibility: the window is visible by default
+    [switch]$Hidden
 )
 
 if (-not $Profile) {
@@ -42,6 +48,36 @@ if (-not $Profile) {
     }
 }
 
+# A trailing backslash would escape the closing quote of --user-data-dir below.
+if ($Profile.Length -gt 3) { $Profile = $Profile.TrimEnd('\') }
+
+function Get-CdpVersion {
+    # A CDP endpoint answers /json/version with its browser version. Read it
+    # through System.Net with a 3-second timeout, the same way in Windows
+    # PowerShell 5.1 and PowerShell 7.
+    try {
+        $request = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/json/version")
+        $request.Timeout = 3000
+        $response = $request.GetResponse()
+        $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+        $body = $reader.ReadToEnd()
+        $reader.Close()
+        $response.Close()
+        return $body
+    } catch {
+        return $null
+    }
+}
+
+# 1. A CDP endpoint that already answers means the browser is up. Starting a
+#    second Chrome for the same profile would only fail; say so and point at
+#    the command that brings the window back.
+if (Get-CdpVersion) {
+    Write-Host "Chrome with CDP is already running on port $Port - nothing to start."
+    Write-Host "To bring its window on-screen: marketplace-mcp browser show"
+    exit 0
+}
+
 $chrome = "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
 if (-not (Test-Path $chrome)) {
     $chrome = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
@@ -51,11 +87,31 @@ if (-not (Test-Path $chrome)) {
     exit 1
 }
 
-# Check if Chrome is already running
-$existing = Get-Process chrome -ErrorAction SilentlyContinue
-if ($existing) {
-    Write-Warning "Chrome is already running. CDP requires Chrome to start fresh."
-    Write-Warning "Close all Chrome windows, then re-run this script."
+# 2. A Chrome that already holds THIS profile would refuse to start a second
+#    one with the same --user-data-dir. Other Chrome windows are fine.
+$profileInUse = $false
+try {
+    # The whole switch, quoted or bare, anchored at its end: a sibling profile
+    # such as "Chrome-Scraping-2" is not this one.
+    $profilePattern = '--user-data-dir="?' + [regex]::Escape($Profile) + '("|\s|$)'
+    $running = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction Stop
+    foreach ($proc in $running) {
+        if ($proc.CommandLine -and $proc.CommandLine -match $profilePattern) {
+            $profileInUse = $true
+            break
+        }
+    }
+} catch {
+    Write-Warning "[!] Could not check whether the profile is in use; trying to start anyway."
+}
+# With -AllowMainProfile the profile is Chrome's own User Data: an everyday
+# Chrome holds it without naming it on its command line, so any running
+# Chrome counts as holding it.
+if ($AllowMainProfile -and (Get-Process chrome -ErrorAction SilentlyContinue)) {
+    $profileInUse = $true
+}
+if ($profileInUse) {
+    Write-Error "Another Chrome is already using the profile $Profile. Close that window (or pass a different -Profile) and re-run."
     exit 2
 }
 
@@ -68,30 +124,41 @@ Write-Host ""
 $chromeArgs = @(
     "--remote-debugging-port=$Port",
     "--remote-debugging-address=127.0.0.1",
-    "--user-data-dir=$Profile",
+    # Start-Process joins arguments with bare spaces, so a path with a space
+    # ("User Data", a user name) would split in two without these quotes.
+    "--user-data-dir=`"$Profile`"",
     "--no-first-run",
     "--no-default-browser-check"
 )
-if (-not $Visible) {
+if ($Hidden) {
     $chromeArgs += @(
         "--window-position=-32000,-32000",
         "--window-size=1280,720",
-        "--start-minimized",
-        "about:blank"
+        "--start-minimized"
     )
 }
+# Anchor a tab so Chrome survives a connector closing its last page.
+$chromeArgs += "about:blank"
 $startParams = @{
     FilePath = $chrome
     ArgumentList = $chromeArgs
 }
-if (-not $Visible) {
+if ($Hidden) {
     $startParams.WindowStyle = "Hidden"
 }
 Start-Process @startParams
-Start-Sleep -Seconds 2
-$test = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json/version" -UseBasicParsing -ErrorAction SilentlyContinue
-if ($test.StatusCode -eq 200) {
-    Write-Host "CDP ready on 127.0.0.1:$Port"
-} else {
-    Write-Warning "Chrome started but CDP endpoint not responding yet. Wait a few seconds."
+# Wait up to about 12 s for the endpoint, like the shell launcher; a port that
+# never answers is a failure (exit 1), not a success with a warning.
+$ready = $false
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Milliseconds 400
+    if (Get-CdpVersion) { $ready = $true; break }
+}
+if (-not $ready) {
+    Write-Error "Chrome was launched but CDP did not bind within about 12 s. Check for another Chrome using $Profile, or try another -Port."
+    exit 1
+}
+Write-Host "CDP ready on 127.0.0.1:$Port"
+if ($Hidden) {
+    Write-Host "The window is off-screen. To log in or pass a site check: marketplace-mcp browser show"
 }

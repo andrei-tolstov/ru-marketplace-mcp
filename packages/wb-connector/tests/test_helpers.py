@@ -615,6 +615,7 @@ def test_wb_search_v9_refusal_never_calls_legacy_path(monkeypatch, status_code):
         monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
         monkeypatch.setattr(server, "_polite_wait", no_wait)
         monkeypatch.setattr(server, "_search_via_search_goods", forbidden_fallback)
+        monkeypatch.setattr(server._settings, "dom_fallback", False)
         with pytest.raises(ToolError) as excinfo:
             await server.wb_search("x")
         payload = _tool_error_payload(excinfo)
@@ -649,6 +650,7 @@ def test_wb_search_v9_html_wall_never_calls_legacy_path(monkeypatch):
         monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
         monkeypatch.setattr(server, "_polite_wait", no_wait)
         monkeypatch.setattr(server, "_search_via_search_goods", forbidden_fallback)
+        monkeypatch.setattr(server._settings, "dom_fallback", False)
         with pytest.raises(ToolError) as excinfo:
             await server.wb_search("x")
         payload = _tool_error_payload(excinfo)
@@ -848,6 +850,11 @@ def test_wb_search_unrecoverable_fallback_ids_without_positive_empty_are_drift(m
 
 @pytest.mark.parametrize("body, total", [('{"products": [], "total": 0}', 0), ('{"products": []}', None)])
 def test_wb_search_positive_empty_survives_fallback_failure(monkeypatch, body, total):
+    """R-ITEM-HONESTY: v9's own empty list answers no_results, but the legacy
+    fallback's death must leave a trace — the old code swallowed it and returned
+    a bare WbNoResultsResponse with meta=None, indistinguishable from a verified
+    "nothing found" (audit 2026-11-01)."""
+
     async def fake_safe_get_text(client, url):
         return (200, body, None) if "v9/search" in url else (500, "", None)
 
@@ -859,6 +866,41 @@ def test_wb_search_positive_empty_survives_fallback_failure(monkeypatch, body, t
     result = asyncio.run(server.wb_search("x"))
     assert result.status == "no_results"
     assert result.total_ids == total
+    data = result.model_dump(mode="json")
+    assert data["meta"]["healthy"] is False
+    assert any(w.startswith("fallback_failed") for w in data["meta"]["warnings"])
+    assert "HTTP 500" in data["meta"]["warnings"][0]
+
+
+def test_wb_search_positive_empty_survives_a_tool_error_fallback(monkeypatch):
+    """R-EMPTY-NOT-SUCCESS: the legacy path raises a plain ToolError on a
+    refusal (through raise_tool_error), which the old ``except ConnectorError``
+    did not catch — the ToolError escaped and a positively empty v9 answer died
+    instead of returning the warned no_results. The warning names the fallback's
+    own error code and message, not the raw JSON envelope."""
+
+    async def rate_limited_fallback(query, dest, page, ctx):
+        server.raise_tool_error(server.RateLimitedError("wb", retry_after_s=60.0))
+
+    async def fake_safe_get_text(client, url):
+        return 200, '{"products": [], "total": 0}', None
+
+    async def no_wait():
+        return None
+
+    monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
+    monkeypatch.setattr(server, "_polite_wait", no_wait)
+    monkeypatch.setattr(server, "_search_via_search_goods", rate_limited_fallback)
+
+    result = asyncio.run(server.wb_search("x"))
+
+    assert result.status == "no_results"
+    assert result.total_ids == 0
+    data = result.model_dump(mode="json")
+    assert data["meta"]["healthy"] is False
+    warning = next(w for w in data["meta"]["warnings"] if w.startswith("fallback_failed"))
+    assert "rate_limited" in warning
+    assert "wb rate-limited" in warning
 
 
 def test_wb_search_returns_no_results_when_both_paths_are_empty(monkeypatch):
@@ -2302,6 +2344,8 @@ def test_impersonated_refusal_stays_a_transport_error(monkeypatch):
 
         monkeypatch.setattr(server, "get_text_budgeted", fake_budgeted)
         monkeypatch.setattr(server, "_polite_wait", no_wait)
+        # The API verdict itself is under test, not the page fallback.
+        monkeypatch.setattr(server._settings, "dom_fallback", False)
         with pytest.raises(ToolError) as excinfo:
             await server.wb_card([5535522])
         payload = _tool_error_payload(excinfo)
@@ -2447,6 +2491,7 @@ def test_a_refusal_streak_reaches_the_operator(monkeypatch):
         monkeypatch.setattr(server, "_safe_get_text", fake_safe_get_text)
         monkeypatch.setattr(server, "_pacer", pacer)
         monkeypatch.setattr(server, "_polite_wait", no_wait)
+        monkeypatch.setattr(server._settings, "dom_fallback", False)
         with pytest.raises(ToolError) as excinfo:
             await server.wb_card([5535522])
         payload = _tool_error_payload(excinfo)
@@ -2501,7 +2546,18 @@ def _healthy_selfcheck_responder(v9_response):
         ((200, "not json", None), "drift"),
         ((200, json.dumps({"products": []}), None), "drift"),
         ((200, json.dumps({"products": [{"name": "x"}]}), None), "drift"),
-        ((200, json.dumps({"products": [{"id": 1, "salePriceU": 1000}]}), None), "healthy"),
+        # R-SHAPE-DRIFT-WARNING (2026-11-01): a v9 product without its name and
+        # totalQuantity families is structural drift, so this once-healthy
+        # minimal product is now drift; the realistic product below is healthy.
+        ((200, json.dumps({"products": [{"id": 1, "salePriceU": 1000}]}), None), "drift"),
+        (
+            (
+                200,
+                json.dumps({"products": [{"id": 1, "name": "x", "salePriceU": 1000, "totalQuantity": 3}]}),
+                None,
+            ),
+            "healthy",
+        ),
     ],
 )
 def test_the_canary_sees_the_primary_search_path(monkeypatch, v9_response, expected_state):
@@ -2510,6 +2566,8 @@ def test_the_canary_sees_the_primary_search_path(monkeypatch, v9_response, expec
     When v9 was refused, wb_search fell through to the legacy id list and
     returned unrelated products with prices attached, while this canary stayed
     green because its other probe reads search-goods and never touched v9.
+    A product that lost a whole parser-critical key family is drift, not a
+    healthy answer (R-SHAPE-DRIFT-WARNING).
     """
 
     async def no_wait():

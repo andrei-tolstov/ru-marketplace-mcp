@@ -26,6 +26,7 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi
 from fastmcp import Context, FastMCP
 from fastmcp.server.middleware.error_handling import RetryMiddleware
+from fastmcp.tools import ToolResult
 from mcp.types import ImageContent, TextContent, ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
@@ -39,6 +40,7 @@ from mcp_core.errors import (
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.resources import register_reference_resources
 from mcp_core.transport.chrome_cdp import NavBlocked, open_page
 from pydantic import Field
 
@@ -57,7 +59,7 @@ from drom_connector.shape_reference import CARD_REQUIRED_KEYS, SEARCH_REQUIRED_K
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://baza.drom.ru"
@@ -842,10 +844,10 @@ def _build_search_url(
     name="drom_search",
     annotations=ToolAnnotations(
         title="baza.drom.ru Search",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def drom_search(
@@ -877,16 +879,9 @@ async def drom_search(
 ) -> DromSearchResponse:
     """Search auto parts, wheels, oils and listings on baza.drom.ru.
 
-    ## Return Format
+    price_rub is None when absent — never 0. Missing prices are null, never invented zero.
 
-    DromSearchResponse: {status, query, page, city, tier_used, count, total_count, items[], meta}.
-    Items carry bulletin_id, title, price_rub (None when no price — never 0), url, city, seller_name,
-    photo_url, has_photo, is_new, published_at.
-
-    ## Error Format
-
-    ToolError: BadRequestError on invalid query or parameters; TransportDownError on
-    network failure, timeout or non-200 responses.
+    Full field list and error codes: `guide://drom/drom_search`.
     """
     effective_city = city or _settings.default_city or None
     url = _build_search_url(
@@ -929,10 +924,10 @@ async def drom_search(
     name="drom_card",
     annotations=ToolAnnotations(
         title="baza.drom.ru Item Card",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def drom_card(
@@ -950,16 +945,9 @@ async def drom_card(
     side/generation) and assess true physical condition (cracks, broken tabs, rust,
     repair traces, wear).
 
-    ## Return Format
+    price_rub is None if unpriced — never 0.
 
-    DromCardResponse: {status, bulletin_id, url, title, price_rub (None if unpriced — never 0),
-    description, condition, availability, brand, oem_numbers, city, seller, photos,
-    breadcrumbs, tier_used, meta}.
-
-    ## Error Format
-
-    ToolError: BadRequestError on invalid id/URL; NotFoundError on HTTP 404;
-    TransportDownError on network failure or non-200 responses.
+    Full field list and error codes: `guide://drom/drom_card`.
     """
     cleaned = url_or_id.strip()
     item_id = _extract_item_id(cleaned)
@@ -997,10 +985,10 @@ async def drom_card(
     name="drom_card_photos",
     annotations=ToolAnnotations(
         title="baza.drom.ru Item Photos Inspector",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def drom_card_photos(
@@ -1026,7 +1014,7 @@ async def drom_card_photos(
         ),
     ] = True,
     ctx: Context | None = None,
-) -> list[ImageContent | TextContent]:
+) -> ToolResult:
     """Download and transfer item photos from baza.drom.ru for visual inspection.
 
     MANDATORY FOR AUTO PARTS SELECTION:
@@ -1038,18 +1026,7 @@ async def drom_card_photos(
        contact surfaces, and traces of past repair or welding.
     3. Part numbers: OEM stamps, manufacturer markings and serial labels.
 
-    ## Return Format
-
-    List of MCP contents:
-    - TextContent: Structured summary with lot metadata (title, OEM, condition,
-      price, seller, city) and the visual inspection protocol.
-    - ImageContent: One or more binary images with base64 data and mimeType
-      (image/webp, image/jpeg, image/png) for direct multimodal analysis.
-
-    ## Error Format
-
-    ToolError: BadRequestError if ID or URL is invalid; NotFoundError if lot or
-    photos do not exist; TransportDownError on network or CDN failure.
+    Full field list and error codes: `guide://drom/drom_card_photos`.
     """
     cleaned = url_or_id.strip()
 
@@ -1073,10 +1050,18 @@ async def drom_card_photos(
                 "3. Оценка состояния: проверьте отсутствие трещин, заломов, следов правки, ржавчины и кустарного ремонта.\n"
                 "4. Резюме: сделайте вывод о пригодности детали к установке."
             )
-            return [
-                TextContent(type="text", text=intro),
-                ImageContent(type="image", data=b64_str, mimeType=mime),
-            ]
+            return ToolResult(
+                content=[
+                    TextContent(type="text", text=intro),
+                    ImageContent(type="image", data=b64_str, mime_type=mime),
+                ],
+                structured_content={
+                    "bulletin_id": "direct_url",
+                    "title": cleaned,
+                    "photos_count": 1,
+                    "requested_max": max_photos,
+                },
+            )
 
     # Item card bulletin / goods case
     item_id = _extract_item_id(cleaned)
@@ -1099,12 +1084,20 @@ async def drom_card_photos(
     card_data = _parse_card_html(html, target_url, fallback_id=item_id)
     images = card_data.get("images", [])
     if not images:
-        return [
-            TextContent(
-                type="text",
-                text=f"У лота '{card_data.get('title') or item_id}' ({target_url}) отсутствуют прикрепленные фотографии.",
-            )
-        ]
+        return ToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=f"У лота '{card_data.get('title') or item_id}' ({target_url}) отсутствуют прикрепленные фотографии.",
+                )
+            ],
+            structured_content={
+                "bulletin_id": item_id,
+                "title": card_data.get("title") or item_id,
+                "photos_count": 0,
+                "requested_max": max_photos,
+            },
+        )
 
     target_photos = images[:max_photos]
     download_tasks = [_download_photo(p_url, high_res=high_res, ctx=ctx) for p_url in target_photos]
@@ -1157,19 +1150,25 @@ async def drom_card_photos(
 
     for img_bytes, mime_type, _url in downloaded_images:
         b64_str = base64.b64encode(img_bytes).decode("utf-8")
-        output_contents.append(ImageContent(type="image", data=b64_str, mimeType=mime_type))
+        output_contents.append(ImageContent(type="image", data=b64_str, mime_type=mime_type))
 
-    return output_contents
+    structured = {
+        "bulletin_id": item_id,
+        "title": title_str,
+        "photos_count": len(downloaded_images),
+        "requested_max": max_photos,
+    }
+    return ToolResult(content=output_contents, structured_content=structured)
 
 
 @mcp.tool(
     name="drom_seller",
     annotations=ToolAnnotations(
         title="baza.drom.ru Seller Profile",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def drom_seller(
@@ -1181,15 +1180,7 @@ async def drom_seller(
 ) -> DromSellerResponse:
     """Get seller profile, rating, and customer feedbacks on baza.drom.ru.
 
-    ## Return Format
-
-    DromSellerResponse: {status, seller_id, url, tier_used, seller (name, rating,
-    feedbacks_count, registration_year, city, active_bulletins_count), feedbacks[], meta}.
-
-    ## Error Format
-
-    ToolError: BadRequestError on empty seller ID; NotFoundError on HTTP 404;
-    TransportDownError on network failure or non-200 responses.
+    Full field list and error codes: `guide://drom/drom_seller`.
     """
     seller_id = _extract_seller_id(seller_id_or_url)
     if not seller_id:
@@ -1315,3 +1306,4 @@ async def drom_selfcheck(ctx: Context | None = None) -> DromSelfcheckResponse:
 
 
 apply_compact_output_schemas(mcp)
+register_reference_resources(mcp)

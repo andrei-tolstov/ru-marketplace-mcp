@@ -1,0 +1,9 @@
+{
+  "url": "https://baza.drom.ru/bulletin/137849325.html",
+  "captured_at": "2026-10-18",
+  "sha256": "f1db77e656cb131e9fff60cb565936b2e3c1e051d30b6750f4299f99254b0818",
+  "method": "Captured HTML from baza.drom.ru using Chrome CDP and residential proxy",
+  "ground_truth": {
+    "note": "Card of auto part with OEM number, breadcrumbs and seller"
+  }
+}

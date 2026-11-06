@@ -1,8 +1,9 @@
 # START_MODULE_CONTRACT
 # PURPOSE: Encode provider-neutral failures as machine-readable MCP ToolErrors.
-# SCOPE: Error taxonomy, retryability, optional status and challenge metadata.
-# DEPENDS: FastMCP ToolError; stdlib json,enum,typing.
-# LINKS: M-ERRORS; M-CORE; M-HTTP; M-BROWSER-HANDOFF.
+# SCOPE: Error taxonomy, retryability, optional status and user-action/challenge metadata;
+#        message and string fields are redacted on the way out.
+# DEPENDS: M-REDACT; FastMCP ToolError; stdlib json,enum,typing.
+# LINKS: M-ERRORS; M-CORE; M-HTTP; M-BROWSER-HANDOFF; M-REDACT.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
 # ErrorCode: Enumerate stable wire codes and their retryability.
@@ -15,8 +16,9 @@
 # BadRequestError: Represent invalid requests with status 400.
 # NotFoundError: Represent unavailable resources with status 404.
 # PermissionDeniedError: Represent forbidden access with status 403.
-# ChallengeRequiredError: Add user-action, challenge and optional handoff metadata.
-# raise_tool_error: Raise FastMCP ToolError containing serialized connector error.
+# ChallengeRequiredError: Add retry timing, user action, challenge and optional handoff metadata.
+# raise_tool_error: Redact and raise a FastMCP ToolError from a serialized connector error.
+# raise_tool_error_from: Raise the ToolError for any exception, keeping a ConnectorError's fields.
 # END_MODULE_MAP
 from __future__ import annotations
 
@@ -25,6 +27,8 @@ from enum import StrEnum
 from typing import NoReturn
 
 from fastmcp.exceptions import ToolError
+
+from mcp_core.redact import redact_value
 
 
 class ErrorCode(StrEnum):
@@ -131,7 +135,18 @@ class PermissionDeniedError(ConnectorError):
 
 
 class ChallengeRequiredError(ConnectorError):
-    """A marketplace requires a user-mediated browser challenge completion."""
+    """A marketplace requires a user-mediated browser challenge completion.
+
+    R-CHALLENGE-ACTION: the serialized fields alone must tell the agent that a
+    plain retry now cannot pass the challenge (``retryable_now`` is false even
+    though the code stays ``retryable`` as documented), that a human must act,
+    what that action is (``user_action`` names the real CLI command or the tab
+    this error kept open) and when to call again (``retry_when``). The message
+    never promises a tab when retention is off: ``user_action`` is derived from
+    the handoff fields, which appear only when ``CHROME_CHALLENGE_HANDOFF_S``
+    kept the page, and from the explicit override a source passes when its own
+    tier cannot reach the CLI's browser-backed path.
+    """
 
     def __init__(
         self,
@@ -141,16 +156,51 @@ class ChallengeRequiredError(ConnectorError):
         challenge_type: str = "captcha",
         handoff_expires_at: str | None = None,
         handoff_id: str | None = None,
+        user_action: str | None = None,
     ) -> None:
         super().__init__(ErrorCode.CHALLENGE_REQUIRED, message, provider=provider, status_code=403)
         self.challenge_type = challenge_type
         self.handoff_expires_at = handoff_expires_at
         self.handoff_id = handoff_id
+        # A source whose tier is not the CLI's browser-backed path passes the
+        # exact manual step; the derived action below is right for the rest.
+        self.user_action = user_action
+
+    def _derived_user_action(self) -> str:
+        """The one action that actually unblocks this configuration.
+
+        Retention is the switch: a retained page is completed in place, while
+        with retention off the operator opens one through the CLI. Never claim
+        a kept-open tab when there is none.
+        """
+        if self.user_action:
+            return self.user_action
+        if self.handoff_id or self.handoff_expires_at:
+            handle = self.handoff_id or self.handoff_expires_at
+            return (
+                f"Complete the challenge in the browser tab this tool kept open ({handle}); "
+                "run `marketplace-mcp browser show` if the window is off-screen. Then call this "
+                "tool again after the user confirms it is done."
+            )
+        if self.provider:
+            return (
+                f"Run `marketplace-mcp unblock {self.provider}` to open the challenge page in the "
+                "scraping-profile Chrome and have the user complete it there. Then call this tool "
+                "again after the user confirms it is done."
+            )
+        return (
+            "Open the source page in the scraping-profile Chrome (run `marketplace-mcp browser show` "
+            "if the window is off-screen) and have the user complete the challenge. Then call this "
+            "tool again after the user confirms it is done."
+        )
 
     def to_dict(self) -> dict:
         return {
             **super().to_dict(),
             "requires_user_action": True,
+            "retryable_now": False,
+            "retry_when": "after_user_confirmation",
+            "user_action": self._derived_user_action(),
             "challenge_type": self.challenge_type,
             **({"handoff_expires_at": self.handoff_expires_at} if self.handoff_expires_at else {}),
             **({"handoff_id": self.handoff_id} if self.handoff_id else {}),
@@ -158,4 +208,25 @@ class ChallengeRequiredError(ConnectorError):
 
 
 def raise_tool_error(err: ConnectorError) -> NoReturn:
-    raise ToolError(json.dumps(err.to_dict(), ensure_ascii=False))
+    raise ToolError(json.dumps(redact_value(err.to_dict()), ensure_ascii=False))
+
+
+def raise_tool_error_from(exc: Exception, message: str | None = None, *, provider: str | None = None) -> NoReturn:
+    """Raise the ToolError for any exception, keeping a ConnectorError's fields.
+
+    A generic handler that wraps every exception in a fresh TransportDownError
+    throws away what the error already knew: a busy browser handoff carries
+    409 and retry_after_s, a registry that is full carries its own reason, a
+    deadline carries the timeout code, and the provider names the source.
+    Those machine fields are what a caller acts on, so a ConnectorError is
+    passed through unchanged. Anything else becomes the redacted transport_down
+    it always was — an unexpected failure must not invent a taxonomy.
+
+    The handler's provider fills in a missing one, so a connector's own name
+    still reaches the answer.
+    """
+    if isinstance(exc, ConnectorError):
+        if provider and not exc.provider:
+            exc.provider = provider
+        raise_tool_error(exc)
+    raise_tool_error(TransportDownError(message or f"{type(exc).__name__}: {exc}", provider=provider))

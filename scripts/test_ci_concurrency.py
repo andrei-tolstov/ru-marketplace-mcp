@@ -8,8 +8,8 @@ slot: with `cancel-in-progress: true` whichever starts second silently kills the
 first. A cancelled canary reports nothing at all — it does not go red, it just stops
 existing — so the loss is invisible in the run history.
 
-These tests read ci.yml as text rather than through a YAML parser: the file is
-checked into the repository, the two facts under test are two scalars in a block we
+These tests read the workflow files as text rather than through a YAML parser: they are
+checked into the repository, the facts under test are two scalars in a block we
 control, and the project does not declare a YAML dependency for its own tests.
 """
 
@@ -21,11 +21,12 @@ from pathlib import Path
 import pytest
 
 CI = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+IMAGE_CHECK = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "image-check.yml"
 
 
-def _section(header: str) -> str:
-    """Return the indented body of the `header:` line in ci.yml."""
-    text = CI.read_text(encoding="utf-8")
+def _section(header: str, workflow: Path = CI) -> str:
+    """Return the indented body of the `header:` line in the workflow."""
+    text = workflow.read_text(encoding="utf-8")
     indent = len(header) - len(header.lstrip())
     lines = text.splitlines()
     for index, line in enumerate(lines):
@@ -37,17 +38,17 @@ def _section(header: str) -> str:
                     break
                 body.append(line)
             return "\n".join(body)
-    raise AssertionError(f"ci.yml no longer contains a {header!r} line")
+    raise AssertionError(f"{workflow.name} no longer contains a {header!r} line")
 
 
-def _child_scalar(header: str, key: str) -> str:
+def _child_scalar(header: str, key: str, workflow: Path = CI) -> str:
     """Read one scalar that sits directly under the `header:` line.
 
     Only the immediate children count: a job body contains steps, and a step also
     has an `if:`, so matching at any depth would read the wrong line.
     """
     indent = len(header) - len(header.lstrip()) + 2
-    matches = re.findall(rf"^ {{{indent}}}{re.escape(key)}:\s*(?P<value>\S.*?)\s*$", _section(header), re.M)
+    matches = re.findall(rf"^ {{{indent}}}{re.escape(key)}:\s*(?P<value>\S.*?)\s*$", _section(header, workflow), re.M)
     assert len(matches) == 1, f"expected exactly one {key!r} directly under {header!r}, found {len(matches)}"
     return matches[0]
 
@@ -197,6 +198,74 @@ def test_the_live_job_stays_schedule_and_dispatch_only() -> None:
         "the live job must stay off ordinary pushes; a per-push live run would "
         "hammer the marketplaces and is not what the canary is for"
     )
+
+
+def test_the_live_job_runs_the_doctor_drift_alarm() -> None:
+    """The nightly job must run the doctor status check and fail on its alarm.
+
+    The canary's live tests counted drift_detected as a pass, so real parser
+    drift never failed anything. Doctor separates the outcomes by exit code:
+    1 means a parser drifted — the alarm this job exists to raise — while 2
+    means sources could not be judged (blocked, no CDP, wrong country), the
+    expected nightly result from GitHub's datacenter runners that must not
+    fail the job. The doctor round runs through scripts/live_check.py so it
+    stays inside the shared live request budget.
+    """
+    step = _section("      - name: Doctor drift alarm")
+    assert "live_check.py doctor" in step, "the nightly job must run the doctor status check under the live budget"
+    assert "--status-file" in step, "the doctor round must leave its machine-readable status snapshot"
+    assert "0|2)" in step, "healthy and blocked/inconclusive outcomes must keep the job green"
+    assert re.search(r"^\s*1\).*exit 1", step, re.M), "the doctor alarm (parser drift, exit 1) must fail the job"
+
+
+def test_the_doctor_alarm_runs_before_the_canary_on_one_ledger() -> None:
+    """The alarm must get its live requests before the canary spends them.
+
+    Both steps book into one ledger: the repo-root conftest.py gives
+    `pytest -m live` the default `.live-budget.json`, live_check.py defaults to
+    the same file, and neither step resets it. The cap is 8 requests per source
+    per run, and the canary's WB tests spend most of WB's 8 — so with the
+    canary first, the doctor's wb_selfcheck is refused, reads inconclusive
+    (exit 2) and the job stays green while WB actually drifted (2026-11-01
+    audit). The alarm has priority, so its step must come first.
+    """
+    text = CI.read_text(encoding="utf-8")
+    doctor = text.index("- name: Doctor drift alarm")
+    canary = text.index("- name: Run live canaries")
+
+    assert doctor < canary, "the doctor alarm must run before the canary, or the canary starves it of WB's budget"
+    live_job = _section("  live:")
+    assert "LIVE_BUDGET_LEDGER" not in live_job, "a per-step ledger would split the one budget both steps share"
+    assert "live_check.py reset" not in live_job, "a reset between the steps would hand the alarm a fresh cap"
+
+
+def test_a_broken_live_check_fails_the_alarm() -> None:
+    """R-DOCTOR-EXIT-CODES: exit 4 alarms on checker/doctor/setup/usage failure.
+
+    The step keeps 2 non-alarm because a blocked marketplace must not page
+    anyone. A failed checker or doctor invocation is a broken alarm instead.
+    This inspects workflow text only; it does not execute the nightly job.
+    """
+    step = _section("      - name: Doctor drift alarm")
+
+    assert re.search(r"^\s*4\).*exit 1", step, re.M), "exit 4 (checker/doctor/setup/usage failure) must fail the job"
+    assert "exit 4" in step, "the step summary must name what exit 4 means"
+    assert "checker/doctor/setup/usage failure (alarm)" in step
+    assert "doctor never ran" not in step, "exit 4 also covers a checker that ran and failed"
+
+
+def test_the_image_check_workflow_uses_an_event_aware_concurrency_group() -> None:
+    """A manual image build must not cancel a pull-request build (audit S4-F16).
+
+    The image check runs on a pull request and on a manual dispatch. Without
+    the event name in the group both share one slot, and with
+    `cancel-in-progress: true` whichever starts second kills the first - the
+    failure `test_ci_concurrency.py` exists to prevent for ci.yml.
+    """
+    group = _child_scalar("concurrency:", "group", workflow=IMAGE_CHECK)
+
+    assert "github.event_name" in group
+    assert _render_group(group, event="push") != _render_group(group, event="workflow_dispatch")
 
 
 @pytest.mark.parametrize(

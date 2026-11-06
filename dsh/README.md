@@ -7,15 +7,19 @@ three mutually exclusive MCP server rows that are **off by default**.
 ## Why off by default
 
 An MCP row that is always mounted is paid on **every request**, because the
-harness registers the schema of every tool in the session context. Measured
-over the stdio MCP wire with `scripts/mcp_wire.py`:
+harness registers the schema of every tool in the session context. Estimated
+from each server's `tools/list` by `scripts/gen_tools_doc.py` (the estimate
+`scripts/mcp_wire.py` uses; CI fails when this table is stale, details in
+[docs/TOOLS.md](../docs/TOOLS.md)):
 
+<!-- tools-cost-dsh:start -->
 | Mode | Cost while mounted | Model-facing tools |
 |---|---|---|
 | Skills only (default) | 15 skill catalog entries; no MCP schemas | 0 |
-| `compare-mcp` (recommended) | ~1.8k tokens per request | 4 |
-| `decision-mcp` (shortlist inspection) | ~2.1k tokens per request | 5 |
-| `marketplace-mcp` (full) | ~16.3k tokens per request | 40 |
+| `compare-mcp` (recommended) | ~1.7k tokens per request | 4 |
+| `decision-mcp` (shortlist inspection) | ~2.0k tokens per request | 5 |
+| `marketplace-mcp` (full) | ~14.5k tokens per request | 43 |
+<!-- tools-cost-dsh:end -->
 
 The 11 `*_selfcheck` tools that previously inflated the full server to 45 tools
 are now CLI-only (`marketplace-mcp doctor`); only model-facing tools are
@@ -92,7 +96,7 @@ export RU_MARKETPLACE_MCP_FULL=1     # POSIX shell
 ```
 
 The enabled row then changes from `compare-mcp` (4 tools) to `marketplace-mcp`
-(40 tools). All three rows share `serverName: rumarket`, and their `disabled`
+(39 tools). All three rows share `serverName: rumarket`, and their `disabled`
 conditions are mutually exclusive, so exactly one server instance runs at a
 time.
 
@@ -125,7 +129,7 @@ published GHCR image instead of a local clone:
       - run
       - --rm
       - -i
-      - ghcr.io/vladimir-human/ru-marketplace-mcp:2.5.3
+      - ghcr.io/vladimir-human/ru-marketplace-mcp:2.8.2
     failOnStartupError: false
 ```
 

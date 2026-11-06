@@ -26,6 +26,9 @@ SEARCH_EXTRACTED = {
     "anchors_total": 133,
     "login_anchors": 2,
     "body_snippet": "亲，请登录 免费注册 手机-淘宝搜索 Apple iPhone 16 Pro Max 全网通",
+    # The extractor always transports the loading marker; a healthy page that
+    # finished rendering reports it as false.
+    "grid_loading": False,
     "items": [
         {
             "item_id": "123456789012",
@@ -125,6 +128,35 @@ async def test_search_warns_when_no_item_has_a_price(monkeypatch):
     result = await server.taobao_search("手机")
 
     assert "no_prices_on_page" in result.meta.warnings
+
+
+async def test_search_warns_when_a_required_key_family_vanishes(monkeypatch):
+    """A rendered payload that still parses but lost a whole alias family is
+    drift the agent must see in the tool's own response, not only via doctor."""
+    payload = {
+        **{key: value for key, value in SEARCH_EXTRACTED.items() if key != "items"},
+        "items": [
+            {key: value for key, value in item.items() if key != "price_cny"} for item in SEARCH_EXTRACTED["items"]
+        ],
+    }
+    _patch_render(monkeypatch, payload)
+
+    result = await server.taobao_search("手机")
+
+    assert result.count == 2
+    assert result.meta.healthy is False
+    assert any(
+        w.startswith("shape_drift: taobao_search: missing items[].price_texts.attached/") for w in result.meta.warnings
+    )
+
+
+async def test_search_a_complete_payload_carries_no_shape_drift_warning(monkeypatch):
+    _patch_render(monkeypatch, SEARCH_EXTRACTED)
+
+    result = await server.taobao_search("手机")
+
+    assert result.meta.healthy is True
+    assert not [w for w in result.meta.warnings if w.startswith("shape_drift:")]
 
 
 async def test_search_maps_a_login_wall_to_transport_down(monkeypatch):
@@ -390,6 +422,20 @@ async def test_search_maps_the_title_less_wall_to_transport_down(monkeypatch):
     assert error["requires_user_action"] is True
     assert "user action" in error["message"].lower()
     assert "chrome scraping profile" in error["message"].lower()
+
+
+async def test_search_challenge_message_does_not_promise_a_visible_tab(monkeypatch):
+    """R-CHALLENGE-ACTION: retention is off, so no message may claim a visible page."""
+    _patch_render(monkeypatch, TITLE_LESS_WALL)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.taobao_search("手机")
+
+    error = _error_payload(excinfo)
+    assert error["error"] == "challenge_required"
+    assert "visible" not in error["message"].lower()
+    assert error["retryable_now"] is False
+    assert "marketplace-mcp unblock taobao" in error["user_action"]
 
 
 async def test_card_maps_the_title_less_wall_to_transport_down(monkeypatch):
@@ -672,6 +718,7 @@ async def test_selfcheck_runs_the_shape_canary_past_hidden_challenge_text(monkey
             "anchors_total": 133,
             "login_anchors": 2,
             "body_snippet": "亲，请登录 免费注册 人机验证 captcha baxia Apple iPhone 16 Pro Max 全网通",
+            "grid_loading": False,
             "items": [
                 {
                     "item_id": "123456789012",
@@ -707,6 +754,7 @@ async def test_selfcheck_cries_shape_drift_when_the_price_family_vanishes(monkey
             "anchors_total": 133,
             "login_anchors": 0,
             "body_snippet": "手机-淘宝搜索 Apple iPhone 16 Pro Max 全网通",
+            "grid_loading": False,
             "items": [
                 {
                     "item_id": "123456789012",

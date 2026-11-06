@@ -20,14 +20,18 @@ from __future__ import annotations
 import pytest
 from mcp_core.resilience import (
     REVIEW_TEXT_DRIFT_MIN_SAMPLE,
+    attach_meta,
     coerce_int,
     coerce_price,
     coerce_rating,
     first_present,
     flatten_text,
+    health_warnings,
     price_from_texts,
     selfcheck_entry,
     selfcheck_result,
+    validate_items,
+    validate_offer,
     validate_review_block,
 )
 
@@ -62,6 +66,54 @@ def test_coerce_rating_survives_an_int_past_the_float_ceiling():
     degrades such values to None; coerce_rating must match — a poisoned cell
     strips the field to no-data, never aborts the tool."""
     assert coerce_rating(10**400) is None
+
+
+@pytest.mark.parametrize("value", ["4.5 из 10", "4,5 из 10"])
+def test_coerce_rating_rejects_a_non_five_denominator_in_words(value):
+    """A 10-point rating is not the 0..5 scale. The denominator guard knew only
+    '/', so '4.5 из 10' passed as 4.5 (audit 2026-11-01)."""
+    assert coerce_rating(value) is None
+
+
+def test_coerce_rating_keeps_a_five_denominator_written_in_words():
+    assert coerce_rating("4.5 из 5") == pytest.approx(4.5)
+    assert coerce_rating("4,5 из 5") == pytest.approx(4.5)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1 299",  # plain space
+        "1\u00a0299",  # no-break space
+        "1\u202f299",  # narrow no-break space
+        "1\u2009299",  # thin space
+        "5 000",  # the count that would fabricate the maximum rating
+        "12 345",  # already out of range on its own; pinned for the rule
+    ],
+)
+def test_coerce_rating_rejects_a_thousands_grouped_count(value):
+    """A rating selector that lands on the review counter reads a grouped
+    count, not a rating. The old count rule needed letters, so the bare
+    '1 299' came back as a fabricated in-range 1.0 (audit 2026-11-01); the
+    space, not the letters, is what betrays the count."""
+    assert coerce_rating(value) is None
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("4,9", 4.9),
+        ("4.9", 4.9),
+        ("4.9/5", 4.9),
+        ("4,9 из 5", 4.9),
+        ("5", 5.0),
+        (" 4.7 ", 4.7),
+        (4.9, 4.9),
+    ],
+)
+def test_coerce_rating_keeps_ordinary_ratings(value, expected):
+    """The count guard must not eat the shapes a real rating arrives in."""
+    assert coerce_rating(value) == pytest.approx(expected)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +156,175 @@ def test_a_leading_minus_means_a_discount_not_a_price(value):
 @pytest.mark.parametrize("value", [None, "", "   ", "цена по запросу", "нет в наличии", [], {}, True])
 def test_non_prices_are_none(value):
     assert coerce_price(value) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1 999 2 999",  # two prices glued by the thousands-separator space
+        "1 999 2 999 ₽",  # same, with the currency glyph
+        "от 5 751 ₽/ мес.",  # a monthly instalment, not the price
+        "выгода 5 000 ₽",  # a saving
+        "скидка 30%",  # a discount
+        "3 983.999",  # a three-digit fraction is not a price display
+        "1,999,2,999",  # short non-final groups glue two numbers
+    ],
+)
+def test_ambiguous_or_non_price_blobs_are_none(value):
+    """The space is both the Russian thousands separator and the gap between two
+    numbers, so the old token regex read '1 999 2 999' as one number and the
+    "more than one number" guard never fired. A saving, a discount and a monthly
+    instalment sit beside the real price and are smaller, so a guess would win a
+    "cheapest" ranking. All of them are None (audit 2026-11-01)."""
+    assert coerce_price(value) is None
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("1 999 ₽", 1999.0),
+        ("1\u00a0999 ₽", 1999.0),  # no-break space
+        ("1\u2009999,50 ₽", 1999.50),  # thin space + decimal comma
+        ("1999.00", 1999.0),
+        ("от 1 999 ₽", 1999.0),  # a listing's "from" price is a real price
+    ],
+)
+def test_price_shapes_the_stricter_parse_must_keep(value, expected):
+    """The grouping/qualifier checks must not eat the ordinary display shapes."""
+    assert coerce_price(value) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Рассрочка 5 751 ₽",  # an instalment plan, not the price
+        "в 1356 пунктов",  # a delivery-point count
+        "+ 1 655 бонусов",  # loyalty points
+        "кэшбэк 500 ₽",  # cashback
+    ],
+)
+def test_coerce_price_refuses_the_shared_decoy_markers(value):
+    """R-NO-FABRICATION: the non-price word guard was a second hand-written list,
+    so 'Рассрочка 5 751 ₽' parsed as 5751.0 and a delivery-point count as its
+    number. coerce_price now uses DECOY_MARKERS, the one list the DOM decoy
+    regex is generated from; every value here returns None on the new code and
+    a number on the old one."""
+    assert coerce_price(value) is None
+
+
+def test_price_from_texts_skips_a_decoy_and_takes_the_real_price():
+    """The DOM extractors feed candidates in order: a decoy marker must not win
+    just because it came first (it used to answer 1356.0 here)."""
+    assert price_from_texts("в 1356 пунктов", "58 999 ₽") == pytest.approx(58999.0)
+
+
+@pytest.mark.parametrize("value", ["12万", "1.2万", "1.2K", "15 тыс. ₽", "15 ТЫС. ₽", "2 Млн ₽"])
+def test_a_magnitude_suffix_is_not_a_price(value):
+    """R-NO-FABRICATION: coerce_int refuses a magnitude suffix, the price path
+    ignored it — '12万' read as 12.0, '1.2K' as 1.2. The digits alone understate
+    the price, so a marker right after the number is None like the count case."""
+    assert coerce_price(value) is None
+
+
+@pytest.mark.parametrize("value", ["1 2999", "1\u00a02999"])
+def test_coerce_rating_rejects_a_grouped_count_without_its_own_separator(value):
+    """The count guard ended on a word boundary, so a run longer than three
+    digits ('1 2999', a counter missing its second separator) slipped past it
+    and came back as a fabricated in-range 1.0."""
+    assert coerce_rating(value) is None
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("1 999 ₽", 1999.0),
+        ("1 999,50 ₽", 1999.5),
+        ("от 1 999 ₽", 1999.0),
+        ("¥129", 129.0),
+        ("129.00", 129.0),
+        ("129 990 Купить", 129990.0),
+        ("5 990 KZT", 5990.0),
+    ],
+)
+def test_price_shapes_the_decoy_and_magnitude_guards_must_keep(value, expected):
+    """The stricter guards must not eat the ordinary shapes: a currency glyph,
+    a decimal comma and the "от" ("from") qualifier stay real prices, and a
+    word that only starts with a magnitude letter is not a magnitude."""
+    assert coerce_price(value) == pytest.approx(expected)
+
+
+def test_validate_offer_flags_an_ambiguous_price():
+    """The audit case: an in-stock offer whose price is '1 999 2 999' used to
+    report only the missing title. Once coerce_price refuses the blob, the
+    validator must surface it as an unparseable price, not stay silent."""
+    warnings = validate_offer({"in_stock": True, "price": "1 999 2 999"})
+    assert any("title" in warning for warning in warnings)
+    assert any("price" in warning for warning in warnings)
+
+
+def test_validate_offer_flags_a_blank_or_unparseable_price_string():
+    """R-ITEM-HONESTY: a price field that is present but useless is drift.
+
+    Audit 2026-11-01: a whitespace-only price passed with NO warning at all
+    (`price.strip()` was empty, so the unparseable branch stayed silent), and
+    after coerce_price was hardened the remaining fabricated blobs — a
+    discount, an instalment line, two glued prices — still passed with
+    healthy=true because validate_offer only range-checked them.
+    """
+    for value, code in [
+        ("   ", "price_blank"),
+        ("", "price_blank"),
+        ("скидка 30%", "price_unparseable"),
+        ("1 999 2 999", "price_unparseable"),
+        ("от 5 751 ₽/ мес.", "price_unparseable"),
+        ("30%", "price_unparseable"),
+    ]:
+        warnings = validate_offer({"title": "X", "price": value})
+        assert any(warning.startswith(code) for warning in warnings), (value, warnings)
+
+
+def test_validate_offer_reads_a_connector_specific_price_key():
+    """R-ITEM-HONESTY: Taobao prices live in price_cny; a validator that only
+    knows price_rub/price would see no price at all and stay silent."""
+    warnings = validate_offer({"title": "X", "price_cny": "1 999 2 999"}, price_key="price_cny")
+    assert any(warning.startswith("price_unparseable") for warning in warnings)
+
+
+def test_validate_items_reports_a_systemic_invariant_break():
+    """R-ITEM-HONESTY: one bad tile is a listing, every bad tile is drift."""
+    items = [{"title": f"t{i}", "price_rub": "1 999 2 999"} for i in range(4)]
+    warnings = validate_items(items)
+    assert any(warning.startswith("price_unparseable: 4/4") for warning in warnings)
+
+
+def test_validate_items_does_not_call_one_bad_tile_in_five_drift():
+    items = [{"title": f"t{i}", "price_rub": 100.0 + i} for i in range(5)]
+    items[0]["price_rub"] = "1 999 2 999"
+    assert validate_items(items) == []
+
+
+def test_validate_items_names_the_absent_price_case_in_the_connectors_wording():
+    """R-ITEM-HONESTY: the per-code tally cannot express "no tile has a price",
+    so the caller supplies its established code and the wire stays stable."""
+    warnings = validate_items(
+        [{"title": "t", "price_cny": None}], price_key="price_cny", absent_price="no_prices_on_page"
+    )
+    assert warnings == ["no_prices_on_page"]
+
+
+def test_validate_items_is_silent_on_an_empty_page():
+    """Zero offers is not a per-item finding: the caller owns that verdict."""
+    assert validate_items([]) == []
+
+
+def test_attach_meta_keeps_an_informational_note_out_of_health():
+    """R-ITEM-HONESTY: healthy is False for any doubt about the data, and an
+    `info:` note is context, not a doubt (audit 2026-11-01: WB hardcoded
+    healthy=True next to a warning, so the flag meant nothing)."""
+    assert attach_meta({}, ["info: the region follows the scraping Chrome"], source="s")["_meta"]["healthy"] is True
+    assert attach_meta({}, ["no_prices_on_page"], source="s")["_meta"]["healthy"] is False
+    # A connector that builds MetaOut by hand uses the same split.
+    assert health_warnings(["info: region", "no_prices_on_page"]) == ["no_prices_on_page"]
 
 
 # --------------------------------------------------------------------------- #
@@ -151,6 +372,20 @@ def test_counts_with_signs_or_ranges_are_ambiguous_and_none(value):
     fabricate a plausible-but-wrong count ('1 000–2 000' -> 10002000, '−5' -> 5),
     exactly the bug coerce_price rejects for prices — counters inherit it. The
     guard must cover the unicode minus/en-dash/em-dash, not only ASCII -/+."""
+    assert coerce_int(value) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "12万",  # CJK magnitude suffix: 120000, not 12
+        "24 088₽",  # a price, not a count
+    ],
+)
+def test_counts_with_any_script_suffix_or_currency_are_none(value):
+    """The old letter guard knew only Latin and Cyrillic, so '12万' read as 12;
+    a currency glyph is not a letter at all, so '24 088₽' read as a count. Both
+    are a fabricated number where the honest answer is None (audit 2026-11-01)."""
     assert coerce_int(value) is None
 
 

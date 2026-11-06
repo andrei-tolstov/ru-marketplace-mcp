@@ -41,7 +41,11 @@ as one namespaced toolset and carries the operator CLI (`install`/`doctor`).
 **Why a workspace rather than one package:** the connectors have genuinely
 different dependency needs (Ozon alone needs `curl_cffi` + Playwright), and users
 install subsets. A single package would force the heaviest dependency set on
-everyone.
+everyone. The additional `ru-marketplace-mcp` PyPI bundle deliberately includes
+all imports for a single full installation; it does not replace the workspace or
+its subset wheels. Its metadata is derived from member manifests, not maintained
+as a second package list. Publishing is owner-gated; see
+[DEPLOYMENT.md — PyPI](DEPLOYMENT.md#pypi-maintainer).
 
 ## The shared runtime
 
@@ -52,10 +56,15 @@ and nothing else.
 
 Every failure maps to `auth_missing`, `rate_limited`, `timeout`, `transport_down`,
 `parser_drift`, `bad_request`, `permission_denied`, `challenge_required`, or
-`not_found`, each carrying a `retryable` flag. `challenge_required` is the one a
-CDP caller meets most often: the page loaded but a wall stands in front of the data,
-and it is retryable once the wall is cleared. Tools raise `ToolError` with a JSON body, so an agent can decide
-whether to retry without parsing prose.
+`not_found`, each carrying a `retryable` flag. The flag is deliberate:
+`challenge_required` is the one a CDP caller meets most often — the page loaded but
+a wall stands in front of the data — and it stays `retryable` because a later call
+can succeed once the wall is cleared. Its body also says a plain retry now cannot
+pass it: `retryable_now=false`, `requires_user_action=true`, a concrete
+`user_action` (the `marketplace-mcp unblock <source>` command when no page is
+retained, or the tab this error kept open when `CHROME_CHALLENGE_HANDOFF_S` is on)
+and `retry_when=after_user_confirmation`. Tools raise `ToolError` with a JSON body,
+so an agent can decide whether to retry without parsing prose.
 
 The distinction that matters most: **`transport_down` means "we were refused",
 `parser_drift` means "the data changed shape".** Conflating them sends the reader
@@ -198,7 +207,11 @@ Every connector exposes `*_selfcheck`:
   nothing about the parsers.
 
 A two-state check would report a geo block as failure and send the reader looking
-for a parsing bug that does not exist.
+for a parsing bug that does not exist. With `WB_TRANSPORT=dom`, WB's `card` and
+`search_v9` probes use the tools' rendered-page parsers, opening the baseline card
+and search grid in the operator's Chrome instead of probing unused API hosts.
+A captcha stays inconclusive and is never solved or retried. The other WB probes
+keep HTTP; `search_goods` notes that DOM search does not use the legacy path.
 
 ### Untrusted output
 
@@ -216,7 +229,7 @@ session, so a crafted path must never become a request for a personal endpoint.
 
 ## Testing
 
-2302 offline tests, no network required. Three flavours:
+3280 offline tests, no network required. Three flavours:
 
 **Unit tests** for pure logic — coercion, merging, ranking, cross-platform process
 handling.

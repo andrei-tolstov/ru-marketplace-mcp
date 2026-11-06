@@ -253,17 +253,19 @@ async def test_drom_card_photos_tool(monkeypatch, card_part_html):
     monkeypatch.setattr(server, "_fetch", fake_fetch)
     monkeypatch.setattr(server, "_download_photo", fake_download)
 
-    contents = await server.drom_card_photos("g12841036510", max_photos=2)
-    assert len(contents) >= 2
-    assert isinstance(contents[0], TextContent)
-    assert "Колодки тормозные" in contents[0].text
-    assert "Обязательный регламент визуального анализа" in contents[0].text
-    assert "0446533470" in contents[0].text
+    result = await server.drom_card_photos("g12841036510", max_photos=2)
+    assert len(result.content) >= 2
+    assert isinstance(result.content[0], TextContent)
+    assert "Колодки тормозные" in result.content[0].text
+    assert "Обязательный регламент визуального анализа" in result.content[0].text
+    assert "0446533470" in result.content[0].text
+    assert result.structured_content is not None
+    assert result.structured_content["photos_count"] >= 1
 
-    for item in contents[1:]:
+    for item in result.content[1:]:
         assert isinstance(item, ImageContent)
         assert item.type == "image"
-        assert item.mimeType == "image/jpeg"
+        assert item.mime_type == "image/jpeg"
         assert len(item.data) > 0
 
 
@@ -275,12 +277,14 @@ async def test_drom_card_photos_direct_url(monkeypatch):
     monkeypatch.setattr(server, "_download_photo", fake_download)
 
     direct_url = "https://static.baza.drom.ru/drom/1786204363632_bulletin.jpg"
-    contents = await server.drom_card_photos(direct_url)
-    assert len(contents) == 2
-    assert isinstance(contents[0], TextContent)
-    assert "Прямое фото автозапчасти Drom" in contents[0].text
-    assert isinstance(contents[1], ImageContent)
-    assert contents[1].mimeType == "image/png"
+    result = await server.drom_card_photos(direct_url)
+    assert len(result.content) == 2
+    assert isinstance(result.content[0], TextContent)
+    assert "Прямое фото автозапчасти Drom" in result.content[0].text
+    assert isinstance(result.content[1], ImageContent)
+    assert result.content[1].mime_type == "image/png"
+    assert result.structured_content is not None
+    assert result.structured_content["photos_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -292,10 +296,12 @@ async def test_drom_card_photos_no_images(monkeypatch):
 
     monkeypatch.setattr(server, "_fetch", fake_fetch)
 
-    contents = await server.drom_card_photos("123456")
-    assert len(contents) == 1
-    assert isinstance(contents[0], TextContent)
-    assert "отсутствуют прикрепленные фотографии" in contents[0].text
+    result = await server.drom_card_photos("123456")
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], TextContent)
+    assert "отсутствуют прикрепленные фотографии" in result.content[0].text
+    assert result.structured_content is not None
+    assert result.structured_content["photos_count"] == 0
 
 
 @pytest.mark.asyncio

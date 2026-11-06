@@ -32,7 +32,7 @@ class DromSearchItemOut(BaseModel):
 
 
 class DromSearchResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     status: str = Field(default="success", description="Response status: success or error.")
     query: str = Field(default="", description="Search query text.")
@@ -66,7 +66,7 @@ class DromFeedbackOut(BaseModel):
 
 
 class DromCardResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     status: str = Field(default="success", description="Response status: success or error.")
     item_id: str | None = Field(default=None, description="Item ID.")
@@ -92,7 +92,7 @@ class DromCardResponse(BaseModel):
 
 
 class DromSellerResponse(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     status: str = Field(default="success", description="Response status: success or error.")
     seller: DromSellerOut | None = Field(default=None, description="Seller profile info.")

@@ -37,6 +37,28 @@ same id defaults to another (REDMOND: snippet KM243 sku 4668084807, card
 default KM245). The connector reports the SERP faithfully; search rows and
 cards reconcile by ``sku_id``, never by product URL alone.
 
+**The price role travels with the price.** On a card, ``mainPrice`` is the
+SUBSCRIBER amount (the live capture shows it with subtype ``ya-card``) and the
+everyday price is the explicit ``oldPrices`` entry of type ``regular``. The
+everyday price is therefore read from that entry alone; a card without one has
+an UNKNOWN everyday price and says so instead of borrowing the subscriber
+amount — a comparison would then certify a price most buyers cannot get.
+
+**One money parser.** Every price is read with the shared safe parser, so an
+ambiguous display string ('1 999 2 999' — two numbers glued by the grouping
+space) is refused instead of being concatenated into a fabricated price. The
+refused text travels with the parsed row and is reported as
+``price_unparseable``; counts and ratings keep their own, looser parsing.
+
+**Only verified content is cached.** A challenge page and a page the parser
+could not understand are dropped from the response cache, so the first call
+after the block is gone reaches upstream again instead of replaying the same
+wall for the whole TTL.
+
+**An explicit "nothing found" banner is an honest answer.** It is reported as
+an informational note and the empty result stays healthy; a page that is
+neither products nor a banner is a different case and raises parser_drift.
+
 **Reviews come from the card, not /reviews.** The dedicated reviews URL renders
 zero reviews server-side (they load over XHR), while the product page ships the
 first ~13 complete with pros/cons/dates/votes.
@@ -59,8 +81,10 @@ NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC. Use
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
 # _fetch_html: Retry bounded page reads and classify HTTP/transport refusals.
+# _fetch_parsed: Fetch, parse and keep unusable pages out of the response cache.
 # _guard_parse_status: Distinguish captcha, empty product shell and parser drift.
 # _guard_values_drift: Reject implausible parsed field values.
+# _refused_price_warnings: Report money the parser refused, in the shared vocabulary.
 # _to_product: Adapt SSR fields to the public product model.
 # yandex_search: Return SSR/zone/fallback offers with explicit price and SKU identity.
 # yandex_card: Read product details and the card's embedded review sample.
@@ -72,12 +96,13 @@ from __future__ import annotations
 import datetime
 import os
 import urllib.parse
+from collections.abc import Callable
 from typing import Annotated, Any
 
 import httpx
 from fastmcp import Context, FastMCP
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
+from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
 from mcp_core.errors import (
     BadRequestError,
@@ -90,6 +115,7 @@ from mcp_core.errors import (
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.resources import register_reference_resources
 from mcp_core.transport import RateLimiter, build_client, get_text_with_retries, proxy_from_env
 from pydantic import Field
 
@@ -107,7 +133,7 @@ from yandex_connector.settings import get_settings
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 SITE_BASE = "https://market.yandex.ru"
@@ -129,8 +155,13 @@ HEADERS = {
 # following — retried alongside the usual gateway statuses.
 _RETRY_STATUSES = frozenset({302, 502, 503, 504})
 
-mcp = FastMCP(name="yandex-connector", version=SERVER_VERSION)
-mcp.add_middleware(RetryMiddleware(max_retries=2, base_delay=1.0))
+mcp = FastMCP(
+    name="yandex-connector",
+    version=SERVER_VERSION,
+    instructions=(
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
+    ),
+)
 
 _limiter = RateLimiter(min_gap_s=_settings.min_gap)
 _cache: TTLCache[str] = TTLCache(ttl_s=_settings.cache_ttl, max_entries=64)
@@ -186,6 +217,48 @@ async def _fetch_html(url: str, label: str, ctx: Context | None) -> str:
     return await _cache.get_or_fetch(url, fetch)
 
 
+def _is_usable_page(status: str) -> bool:
+    """True when a parsed page is content the cache may keep.
+
+    A challenge page and a page the parser could not understand are not
+    content: caching them replays the same wall for the whole TTL, so the
+    first tool call after the block is gone still answers with it. A page that
+    parsed — including an explicit "nothing found" banner — is content and
+    stays cached.
+    """
+    return status not in (
+        ssr.ParseStatus.CAPTCHA,
+        ssr.ParseStatus.NO_PRODUCTS_FOUND,
+        ssr.ParseStatus.EMPTY_PRODUCT_SHELL,
+    )
+
+
+async def _fetch_parsed(
+    url: str,
+    label: str,
+    ctx: Context | None,
+    parse: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Fetch a page, parse it, and keep unusable pages out of the cache.
+
+    Only verified content is cached: a captcha page and a page the parser
+    could not understand are dropped from the cache, so the next tool call
+    reaches upstream again instead of replaying the same wall for the whole
+    TTL. Fatal value-validation and parser exceptions also evict the page.
+    A normal page stays cached, so repeated reads still cost one fetch.
+    """
+    html = await _fetch_html(url, label, ctx)
+    try:
+        parsed = parse(html)
+        _guard_values_drift(parsed, label)
+    except Exception:
+        _cache.invalidate(url)
+        raise
+    if not _is_usable_page(str(parsed.get("status") or "")):
+        _cache.invalidate(url)
+    return parsed
+
+
 def _guard_parse_status(status: str, label: str) -> None:
     """Turn a parse status into the right error, or return for usable results."""
     if status == ssr.ParseStatus.CAPTCHA:
@@ -228,6 +301,31 @@ def _guard_values_drift(parsed: dict[str, Any], label: str) -> None:
         )
 
 
+def _refused_price_warnings(offers: list[dict[str, Any]]) -> list[str]:
+    """Report the money the SSR parser refused, in the shared warning vocabulary.
+
+    ``price_unparseable`` is the code the shared validator emits for a price
+    text it cannot read (``mcp_core.resilience.validate_offer``); the SSR
+    parser keeps the raw text of the money it refused, so an ambiguous blob
+    ('1 999 2 999') is reported here instead of quietly becoming ``None``.
+    The role is named, because an everyday price and a subscriber price are
+    different promises to the caller.
+    """
+    out: list[str] = []
+    for role, key in (
+        ("everyday price", "price_text"),
+        ("Plus price", "price_with_plus_text"),
+        ("struck-through reference price", "price_old_text"),
+    ):
+        refused = [str(offer[key]) for offer in offers if offer.get(key)]
+        if refused:
+            out.append(
+                f"price_unparseable: {len(refused)}/{len(offers)} items affected "
+                f"(the {role} did not parse to a number, e.g. {refused[0]!r})"
+            )
+    return out
+
+
 def _to_product(raw: dict[str, Any]) -> YandexProduct:
     return YandexProduct(
         product_id=str(raw.get("product_id") or ""),
@@ -252,10 +350,10 @@ def _to_product(raw: dict[str, Any]) -> YandexProduct:
     name="yandex_search",
     annotations=ToolAnnotations(
         title="Yandex Market Search",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def yandex_search(
@@ -294,21 +392,9 @@ async def yandex_search(
     Note `rating_count` counts star ratings, not written reviews; the written
     count is available per product via `yandex_card`.
 
-    ## Return Format
+    price_rub is None when absent — never 0; zero results is NOT an error: the page's own "nothing found" banner makes the empty answer healthy, and meta.warnings says so.
 
-    YandexSearchResponse: {query, page, page_count, total_available,
-    has_next_page, returned, items, meta}. Items carry product_id, sku_id,
-    title, brand, seller, price_rub (everyday — None when absent, never 0),
-    price_with_plus, price_old_rub (struck-through reference), currency,
-    rating, rating_count, in_stock, is_express, url, image. Zero results is
-    NOT an error — it is reported via meta.warnings. meta.extraction names the
-    path: 'ssr' (full widget state), 'zone' (first-screen snippet payloads —
-    both prices, no brand) or 'ld+json' (degraded, Plus price only).
-
-    ## Error Format
-
-    On validation or transport/parse failure, raises ToolError with a JSON
-    message describing the error code and whether it is retryable.
+    Full field list and error codes: `guide://yandex/yandex_search`.
     """
     text = (query or "").strip()
     if len(text) < 2:
@@ -323,10 +409,8 @@ async def yandex_search(
         params["page"] = str(page)
     url = f"{SITE_BASE}/search?{urllib.parse.urlencode(params)}"
 
-    html = await _fetch_html(url, "yandex_search", ctx)
-    parsed = ssr.parse_search(html)
+    parsed = await _fetch_parsed(url, "yandex_search", ctx, ssr.parse_search)
     _guard_parse_status(parsed["status"], "yandex_search")
-    _guard_values_drift(parsed, "yandex_search")
 
     # Dedupe repeated sellable variants BEFORE applying the limit. A product
     # family can legitimately appear with different sku_id values and prices;
@@ -337,6 +421,7 @@ async def yandex_search(
     # Order is preserved: Yandex's ranking is the product of the search, and
     # re-sorting it would discard information the caller asked for.
     items: list[YandexProduct] = []
+    raw_items: list[dict[str, Any]] = []
     duplicates_dropped = 0
     seen_variants: set[tuple[str, str]] = set()
     for raw in parsed["items"]:
@@ -353,9 +438,17 @@ async def yandex_search(
                 continue
             seen_variants.add(key)
         items.append(product)
+        raw_items.append(raw)
 
     warnings: list[str] = []
     extraction = "ssr"
+    # Per-offer invariants (an unparseable price, a rating off its scale) are the
+    # shared drift alarm; without this the connector's own all-None guards below
+    # were the only value check, and a fabricated price passed as a plain field.
+    warnings.extend(R.validate_items([p.model_dump() for p in items], require_title=True))
+    # Money the parser refused: the price is null, and the reason is named
+    # instead of the null travelling alone.
+    warnings.extend(_refused_price_warnings(raw_items))
 
     # Drift guard: a page where every product lost both its price and its title
     # is the SSR shape quietly moving under the parser, not a catalog full of
@@ -385,7 +478,12 @@ async def yandex_search(
             "(no seller/brand, price is the subscription price)"
         )
     if parsed["status"] == ssr.ParseStatus.EMPTY:
-        warnings.append(f"no_results: Yandex Market found nothing for {text!r}")
+        # An explicit "nothing found" banner is the marketplace's own answer,
+        # not a doubt about the data: the note is informational and the empty
+        # result stays healthy. A page that is NEITHER products nor a banner is
+        # a different case — it raises parser_drift above and never reaches
+        # this line.
+        warnings.append(f"info:no_results: Yandex Market found nothing for {text!r}")
 
     log_event(
         "yandex_search.done",
@@ -403,7 +501,9 @@ async def yandex_search(
         has_next_page=bool(parsed.get("has_next_page")),
         returned=len(items),
         items=items,
-        meta=MetaOut(source="yandex_search", healthy=not warnings, warnings=warnings, extraction=extraction),
+        meta=MetaOut(
+            source="yandex_search", healthy=not R.health_warnings(warnings), warnings=warnings, extraction=extraction
+        ),
     )
 
 
@@ -411,10 +511,10 @@ async def yandex_search(
     name="yandex_card",
     annotations=ToolAnnotations(
         title="Yandex Market Product Card",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def yandex_card(
@@ -441,19 +541,9 @@ async def yandex_card(
     Reviews are capped at the ~13 Yandex renders server-side; the remainder load
     through an API this connector deliberately does not touch.
 
-    ## Return Format
+    price_rub is the explicit everyday price (null when the card carries only a Plus price) — never 0; price_with_plus requires a subscription and never ranks.
 
-    YandexCardResponse: {product_id, sku_id, title, brand, seller,
-    description, image, price_rub, price_with_plus, price_before_discount_rub,
-    discount_percent, currency, offers_count, rating, rating_count,
-    review_count, rating_stars, reviews, url, meta}. price_rub is None when
-    the page has no usable price — never 0. Review items carry author,
-    rating, date, pros, cons, comment, votes_up, votes_down, photos.
-
-    ## Error Format
-
-    On validation or transport/parse failure, raises ToolError with a JSON
-    message describing the error code and whether it is retryable.
+    Full field list and error codes: `guide://yandex/yandex_card`.
     """
     pid = (product_id or "").strip()
     if not pid.isdigit():
@@ -470,8 +560,7 @@ async def yandex_card(
         await ctx.info(f"yandex_card: product_id={pid}")
 
     url = ssr.card_url(pid)
-    html = await _fetch_html(url, "yandex_card", ctx)
-    parsed = ssr.parse_card(html)
+    parsed = await _fetch_parsed(url, "yandex_card", ctx, ssr.parse_card)
     if parsed["status"] == ssr.ParseStatus.EMPTY_PRODUCT_SHELL:
         # Tri-state doctrine (precedent: taobao's login-wall handling): the page
         # arrived but carries no product at all — the known field families did
@@ -511,10 +600,25 @@ async def yandex_card(
             "no_rating: this card's default offer has no ratings "
             "(common for resale/clearance offers) — search results usually carry one"
         )
-    if parsed.get("price_rub") is None:
-        warnings.append("no_price: no usable price on the page (item may be unavailable)")
+    # A refused everyday price is explained by price_unparseable below; the card
+    # did carry one, so "only a Plus price" or "no price" would be wrong.
+    if parsed.get("price_rub") is None and not parsed.get("price_text"):
+        if parsed.get("price_with_plus") is not None:
+            # The card carried only the subscriber price. The everyday price is
+            # unknown, and saying so is the point: a comparison must not certify
+            # the Plus amount as the price anyone pays.
+            warnings.append(
+                "no_everyday_price: this card carries only a Yandex Plus price — the everyday "
+                "price is unknown (price_rub is null, not the subscriber amount)"
+            )
+        else:
+            warnings.append("no_price: no usable price on the page (item may be unavailable)")
+    # Money the parser refused: the price is null, and the reason is named.
+    warnings.extend(_refused_price_warnings([parsed]))
 
     reviews = [YandexReview(**review) for review in parsed.get("reviews", [])] if include_reviews else []
+
+    warnings.extend(R.validate_offer(parsed))
 
     log_event(
         "yandex_card.done",
@@ -543,7 +647,9 @@ async def yandex_card(
         rating_stars=parsed.get("rating_stars", {}),
         reviews=reviews,
         url=url,
-        meta=MetaOut(source="yandex_card", healthy=not warnings, warnings=warnings, extraction="ssr"),
+        meta=MetaOut(
+            source="yandex_card", healthy=not R.health_warnings(warnings), warnings=warnings, extraction="ssr"
+        ),
     )
 
 
@@ -708,6 +814,11 @@ async def yandex_selfcheck(ctx: Context | None = None) -> YandexSelfcheckRespons
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,8 @@
 
 Для проверок в браузере добавлен опциональный режим сохранения вкладки:
 `CHROME_CHALLENGE_HANDOFF_S=120`. После завершения проверки повтор того же
-запроса в той же MCP-сессии продолжает чтение этой вкладки. Поддержка и ограничения
+запроса от того же клиента (в той же MCP-сессии или, по stdio, к тому же процессу
+сервера) продолжает чтение этой вкладки. Поддержка и ограничения
 описаны в [настройке Chrome](docs/CDP_SETUP.md#optional-challenge-handoff).
 
 ---
@@ -58,30 +59,44 @@
 покажет `marketplace-mcp doctor`.
 
 MPStats стоит особняком: это единственный **платный** источник. Без
-`MPSTATS_MP_AUTH` сервер запускается, но инструменты отвечают `auth_missing` —
-поэтому он опционален и подключается по желанию, на остальные четырнадцать
-серверов он не влияет никак.
+`MPSTATS_MP_AUTH` объединённый `marketplace-mcp` вообще не монтирует его
+инструменты — они всё равно отвечали бы `auth_missing` — поэтому он опционален
+и подключается по желанию, на остальные четырнадцать серверов он не влияет никак.
+Отдельный `mpstats-mcp` запускается и без токена и на вызовы отвечает
+`auth_missing`.
 
 Всего 43 инструмента в 15 серверах на общем рантайме `mcp-core`. Плюс объединённый
 `marketplace-mcp`, который монтирует всё разом — одна запись в конфиге клиента
-вместо пятнадцати. Он добавляет свой инструмент `marketplace_sources` (какие коннекторы
-поднялись, а какие отвалились и почему), так что в нём 44 инструмента: 43
-смонтированных плюс этот.
+вместо пятнадцати. У него два своих инструмента: `marketplace_sources` (какие
+коннекторы поднялись, а какие отвалились и почему) и `marketplace_health` (жив ли
+Chrome, какие хосты остывают, какую страницу открыть человеку). С токеном MPStats
+в нём 45 инструментов, без токена — 43: те же смонтированные источники минус два
+`mpstats_*`, плюс эти два.
 
-**Проверка 2.5.3:** 13 октября с одного адреса selfcheck прошли Ozon, Яндекс Маркет, Детский мир, Авито (поиск, карточка, продавец), Taobao, Ситилинк, AliExpress и Циан; Wildberries отвечает через `WB_TRANSPORT=dom`. Lamoda, DNS и Мегамаркет честно отвечают «заблокировано», пока человек не пройдёт их проверку в Chrome: куки живут минуты (12 октября после проверки они работали). Дрейфа не найдено, визуальная приёмка не выполнена. [Статус источников](docs/releases/RELEASE_NOTES_v2.5.3.md).
+**Проверка 2.7.0:** 30 октября с одного адреса Wildberries при отказе API (HTTP 403) сам прочитал поиск через Chrome: 40 товаров, у всех цена. Код остальных источников с v2.6.0 не менялся; их проверял [прогон v2.6.0](docs/releases/RELEASE_NOTES_v2.6.0.md#статус-живой-проверки) того же дня (12 из 13 источников, MPStats без токена). [Подробности v2.7.0](docs/releases/RELEASE_NOTES_v2.7.0.md#статус-живой-проверки).
 
 ## Быстрый старт
 
 Нужны **Python 3.12+** и [uv](https://docs.astral.sh/uv/).
 
+Без checkout пакет ставится с PyPI и сам подключается к найденному клиенту
+(`--dry-run` покажет план и ничего не запишет):
+
+```bash
+uvx ru-marketplace-mcp setup
+```
+
 Для установки клиента, выбора источников и проверки первого предложения —
 [пошаговый старт](docs/QUICKSTART.md). Node нужен только для тестов разработчика.
+Публикация на PyPI (для владельца): [DEPLOYMENT.md — PyPI](docs/DEPLOYMENT.md#pypi-maintainer).
+
+Из исходников, для разработки:
 
 ```bash
 git clone https://github.com/Vladimir-Human/ru-marketplace-mcp.git
 cd ru-marketplace-mcp
 uv sync --all-packages
-uv run pytest -q -m "not live and not cdp"   # 2302 офлайн-тестов, сеть не нужна
+uv run pytest -q -m "not live and not cdp"   # 3280 офлайн-тестов, сеть не нужна
 ```
 
 Проверка живого эндпоинта:
@@ -104,27 +119,74 @@ print(asyncio.run(wb_selfcheck()).status)   # ждём success
 Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-Проще всего подключить **одну запись** — объединённый сервер монтирует все
-источники разом, а имена инструментов (`wb_search`, `avito_seller`, …) не
-меняются:
+Самый короткий путь — `marketplace-mcp setup`: команда находит Claude Desktop,
+Cursor и Claude Code, пишет им конфиг (по умолчанию профиль `compare`),
+запускает scraping-Chrome, прогоняет `doctor` и предлагает `unblock` для
+источника, закрытого браузером. `--dry-run` только печатает шаги и файлы.
+
+```console
+marketplace-mcp setup
+```
+
+Если клиент нетипичный или нужен один конкретный, тот же конфиг пишет
+`install --write`:
+
+```console
+marketplace-mcp install claude --write
+```
+
+Команда допишет запись `marketplace` в конфиг Claude Desktop
+(`%APPDATA%\Claude\claude_desktop_config.json` на Windows,
+`~/Library/Application Support/Claude/claude_desktop_config.json` на macOS,
+`~/.config/Claude/claude_desktop_config.json` на Linux). Путь к `uv` и к вашему
+checkout подставятся абсолютными (у десктопного клиента часто нет PATH
+терминала), чужие серверы и остальные настройки конфига останутся на месте,
+старый файл сохранится как `claude_desktop_config.json.bak-<метка>`. Остаётся
+перезапустить клиент. `--dry-run` показывает, что именно будет записано, и
+ничего не пишет; `--per-source` возвращает старую раскладку — по записи на
+источник — и с `--profile` не сочетается.
+
+По умолчанию запись запускает `compare-mcp` — профиль `compare`: 4 инструмента
+сравнения цен, самый дешёвый в каждом запросе. `--profile decision` добавляет
+осмотр карточки из шортлиста (5 инструментов), `--profile full` берёт
+`marketplace-mcp` со всеми инструментами источников — в несколько раз дороже
+(замер по профилям — в [docs/TOOLS.md](docs/TOOLS.md)).
+Меняется только консольная команда записи, имя `marketplace` остаётся прежним.
+Подробнее о выборе режима — [dsh/README.md](dsh/README.md) и
+`docs/QUICKSTART.md`.
+
+Если конфиг удобнее править руками, начните с одной записи:
 
 ```jsonc
 {
   "mcpServers": {
     "marketplace": {
       "command": "uv",
-      "args": ["run", "--directory", "C:/путь/к/ru-marketplace-mcp", "marketplace-mcp"],
+      "args": ["run", "--directory", "C:/путь/к/ru-marketplace-mcp", "compare-mcp"],
     },
   },
 }
 ```
 
-Если нужны отдельные серверы, `marketplace-mcp install claude` напечатает
-готовый блок для вставки. Путь к вашему checkout там уже подставлен: заглушку
-`/path/to/ru-marketplace-mcp` править руками не придётся. При установке из wheel
-вместо путей печатаются консольные команды на PATH. Неизвестное имя клиента
+Если нужны отдельные серверы, `marketplace-mcp install claude --per-source`
+напечатает готовый блок для вставки. Путь к вашему checkout там уже подставлен:
+заглушку `/path/to/ru-marketplace-mcp` править руками не придётся. При установке из
+wheel вместо путей печатаются консольные команды на PATH. Неизвестное имя клиента
 (допустимы `claude`, `claude-code`, `cursor`, `dsh`) команда отклоняет с пояснением и
-кодом возврата 2 — молча подставить блок для Claude она не может. Минимальный
+кодом возврата 2 — молча подставить блок для Claude она не может.
+
+У браузерного уровня есть ещё команды: `marketplace-mcp browser start`
+(запустить scraping-Chrome; по умолчанию окно видно, `--hidden` — за экраном),
+`marketplace-mcp browser status` (достижим ли CDP-эндпоинт, какая версия Chrome,
+сколько вкладок и где окно) и `marketplace-mcp browser show` (окно
+scraping-Chrome на экран — на Windows автозапуск коннектора стартует за экраном,
+и без этого нельзя ни войти руками, ни пройти проверку сайта). Когда `doctor`
+показывает стену, `marketplace-mcp unblock <source>` откроет нужную страницу в
+новой вкладке, подождёт, пока вы пройдёте проверку или войдёте, и перепроверит
+только этот источник. Ни одна из этих команд не ходит в сайты сама и не решает
+проверку за человека.
+
+Минимальный
 вариант вручную:
 
 ```jsonc
@@ -234,17 +296,28 @@ dsh plugin --profile web add github:Vladimir-Human/ru-marketplace-mcp#path:/dsh
 
 Сразу после установки появляются 15 навыков и **ни одного** MCP-инструмента: обе
 строки MCP выключены, пока не задана переменная `RU_MARKETPLACE_MCP_DIR` с путём к
-клону. Так сделано потому, что смонтированный сервер платится в каждом запросе:
-рекомендуемый режим сравнения цен стоит ~0,9 тыс. токенов, полный набор — ~13,6 тыс.
+клону.
+<!-- tools-cost:start -->
+Так сделано потому, что смонтированный сервер платится в каждом запросе:
+рекомендуемый режим сравнения цен стоит ≈1.7k токенов, режим с инспекцией
+карточки — ≈2.0k, полный набор — ≈14.5k (оценка по `tools/list`;
+подробности в [docs/TOOLS.md](docs/TOOLS.md)).
+<!-- tools-cost:end -->
 Включение и полный режим описаны в [dsh/README.md](dsh/README.md).
 
 </details>
 
 После подключения перезапустите клиент и прогоните `marketplace-mcp doctor`. Он
-запускает канарейку каждого коннектора и отвечает `success`, `drift_detected` или
-`inconclusive`.
+запускает канарейку каждого коннектора: код `0` — все выбранные проверки здоровы,
+`1` — дрейф парсера, `2` — признанный блок или непроверенный источник, `3` — не
+удалось записать status-файл, `4` — сломалась самопроверка или вызов doctor
+(включая ошибку аргументов). Nightly поднимает тревогу на `1` и `4`, но не на `2`.
+Отказ бюджета получает причину `budget_refused`, а не статус здоровой проверки.
 
 ## Инструменты
+
+Сгенерированный справочник по инструментам с параметрами и ценой контекста:
+[docs/TOOLS.md](docs/TOOLS.md).
 
 Канарейки `*_selfcheck` в этом перечне не значатся намеренно: они не публикуются
 по MCP, потому что диагностика оператора стоила бы модели ~7,5 тыс. токенов в
@@ -280,13 +353,19 @@ dsh plugin --profile web add github:Vladimir-Human/ru-marketplace-mcp#path:/dsh
 пустого списка.
 
 Если с вашего адреса API WB отвечает 403 (так бывает: отказ зависит и от адреса,
-и от клиента), включите `WB_TRANSPORT=dom`. Тогда `wb_search` и `wb_card` читают
-отрисованные страницы WB в вашем Chrome через CDP, как DNS и Ситилинк, без
-обращений к API. В выдаче поиска `price_rub` — цена по WB Кошельку
-(`price_kind: wallet`); карточка отдаёт обычную цену, цену по Кошельку и
+и от клиента), `wb_search` и `wb_card` сами перечитывают тот же запрос через
+отрисованную страницу WB в вашем Chrome через CDP и добавляют в `meta.warnings`
+предупреждение `dom_fallback`. Это включено по умолчанию; `WB_DOM_FALLBACK=0`
+возвращает прежнее поведение, а `WB_TRANSPORT=dom` по-прежнему читает только
+отрисованные страницы, без обращений к API. В выдаче поиска `price_rub` — цена
+по WB Кошельку (`price_kind: wallet`); карточка отдаёт обычную цену, цену по
+Кошельку и
 зачёркнутую раздельно, а также магазин, склад, срок доставки, возврат, гарантию,
-значок «Оригинал» и строку «Все N предложений от X ₽». Подробности —
-[ANTI_BOT.md](docs/ANTI_BOT.md#when-the-api-refuses-rendered-pages-wb_transportdom).
+значок «Оригинал» и строку «Все N предложений от X ₽». В этом режиме
+`marketplace-mcp doctor` тоже открывает две страницы в вашем Chrome — базовую
+карточку и поисковую сетку — для проверок `card` и `search_v9`. Капча даёт
+`inconclusive` без решения и повторов; отзывы, basket и legacy-проба остаются HTTP.
+Подробности — [ANTI_BOT.md](docs/ANTI_BOT.md#when-the-api-refuses-rendered-pages-wb_transportdom).
 
 ### Яндекс Маркет — `yandex_*`
 
@@ -406,7 +485,10 @@ Lamoda (`lamoda_*`) наполовину: поиск идёт через Chrome,
 Chrome через CDP (tier 2); успешный fallback отмечен `tier_used: graphql_cdp`.
 HTTP 200 не вызывает CDP. Причина: 2026-10-12 GraphQL по HTTPS отвечал циклом 307.
 Chrome с CDP (`scripts/start_chrome_cdp.sh`) нужен остальным всегда, а карточкам
-Lamoda — только для запасного уровня.
+Lamoda — только для запасного уровня. Ваш обычный Chrome при этом закрывать не
+нужно: лаунчер поднимает второй Chrome со своим `--user-data-dir` и окно на экране.
+Если окно всё же ушло за экран (автозапуск коннектора на Windows), вернуть его
+(чтобы войти руками или пройти проверку сайта) можно `marketplace-mcp browser show`.
 
 Всего через CDP ходят девять источников — эти плюс Taobao, AliExpress, Циан, Ozon и
 Авито. У Ozon, а также у поиска и продавцов Авито Chrome — запасной уровень,
@@ -475,6 +557,10 @@ compare_prices("кроссовки мужские")
 Маркетплейсы опрашиваются параллельно, и каждый отчитывается сам за себя. Если один
 заблокирован, сравнение не рушится: `complete: false` вместе с `source_outcomes`
 покажет, что именно вы видите. Подписочные цены в ранжировании не участвуют.
+Цена с WB Кошельком и другие явно условные цены тоже не выбираются в `cheapest`
+или `cheapest_comparable`: при наличии обычной цены ранжируется она. `price_kind`
+сохраняет тип цены (`regular`, `wallet`, `subscription`); `null` — источник его не
+сообщил. `conditional_price: …` в `warnings` называет условие и исключённую сумму.
 Повторы по (источник, id товара, id варианта) схлопываются. Разные SKU Яндекса
 сохраняются даже внутри одной товарной семьи. Наличие в сравнении трёхзначное:
 `true` — подтверждено, `false` — подтверждено отсутствие, `null` — неизвестно.
@@ -483,13 +569,18 @@ compare_prices("кроссовки мужские")
 
 У каждого предложения есть `currency` (строчный ISO-код, по умолчанию `rub`) и
 `price_native` — цена в этой валюте, как её показывает маркетплейс. Для российских
-источников она совпадает с `price_rub`; у Taobao в ней лежит цена в юанях, которую
+источников она совпадает с `price_rub`, если известна обычная цена; если известна
+только условная, её сумма остаётся в `price_native`, а `price_rub` — `null`.
+У Taobao в ней лежит цена в юанях, которую
 `price_rub` намеренно оставляет пустой. Раньше юаневую цену забирали и молча
 выбрасывали, и строка Taobao приходила с пустой ценой без намёка, что цена вообще
 есть. Теперь юань виден, но в рублёвом ранжировании по-прежнему не участвует: в
 `warnings` появляется `foreign_currency: …` с числом исключённых предложений и
-причиной. Конвертировать здесь значило бы зашить курс, который молча устареет, —
-пересчёт за вами.
+причиной. В `source_outcomes[].detail` Taobao считает цены из `price_native`:
+например, `20 results, 20 priced in CNY (not ranked)`. Несколько валют с ценами
+перечисляются по алфавиту через `/`; без цен — `N results, 0 priced (not ranked)`.
+Для рублёвых источников остаётся `N results, M priced`. Конвертировать здесь
+значило бы зашить курс, который молча устареет, — пересчёт за вами.
 
 ### MPStats — `mpstats_*`
 
@@ -497,8 +588,9 @@ compare_prices("кроссовки мужские")
 В отличие от всех остальных коннекторов, этот **опционален и требует платный
 аккаунт MPStats**: авторизация — одна cookie `mp_auth` (JWT из залогиненной
 сессии плагина на mpstats.io), задаётся переменной `MPSTATS_MP_AUTH`. Без неё
-инструменты возвращают `auth_missing`, а сервер запускается как обычно — ни на
-что другое это не влияет.
+отдельный `mpstats-mcp` запускается как обычно и отвечает `auth_missing`, а
+объединённый `marketplace-mcp` не монтирует эти два инструмента, чтобы не
+платить за схемы, которые всё равно не сработают.
 
 | Инструмент                               | Что делает                                                                                 |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -550,8 +642,8 @@ compare_prices("кроссовки мужские")
 формат ссылки `/product/<24-hex>/` — тот самый шаблон, который чинили как баг.
 
 Скиллы едут в Docker-образ (`/app/skills/`), но **в колёсах их нет**: `skills/`
-лежит в корне репозитория. Ставите с PyPI — возьмите навыки
-из репозитория отдельно.
+лежит в корне репозитория. При установке release-wheel возьмите навыки
+из репозитория отдельно; пакета `ru-marketplace-mcp` с PyPI это тоже касается.
 
 ## Настройка
 
@@ -601,7 +693,7 @@ TTL.
 
 ```bash
 uv sync --all-packages
-uv run pytest -q -m "not live and not cdp"    # 2302 офлайн-тестов
+uv run pytest -q -m "not live and not cdp"    # 3280 офлайн-тестов
 uv run pytest -q -m "not live"                # то, что гоняет CI
 uv run pytest -q -m "not live" --cov          # покрытие, порог 70% в CI
 uv run ruff check . && uv run ruff format --check .
@@ -667,7 +759,7 @@ CI прогоняет тесты на Ubuntu, Windows и macOS против Pyth
 ## Как это сделано
 
 Код и документацию я писал вместе с ИИ-ассистентами. Они работают быстро и
-ошибаются уверенно, поэтому проект устроен вокруг проверки: 2302 офлайн-тестов,
+ошибаются уверенно, поэтому проект устроен вокруг проверки: 3280 офлайн-тестов,
 аудит перед выпуском, тесты, которые прогоняют настоящий экстрактор по снятой с
 сайта разметке. В заметках к релизу перечислено, какие источники сверены с живыми
 страницами вручную и какие остались непроверенными.
@@ -682,6 +774,7 @@ CI прогоняет тесты на Ubuntu, Windows и macOS против Pyth
 - [@Khalmatov](https://github.com/Khalmatov) — provenance отзывов Ozon, [PR #38](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/38).
 - [@fosteev](https://github.com/fosteev) — macOS CDP stealth и коннектор Циана, [PR #42](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/42), [PR #47](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/47).
 - [@ilodezis](https://github.com/ilodezis) — выбор источников unified-сервера через `MARKETPLACE_SOURCES`, [PR #48](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/48).
+- [@HeckfyCU](https://github.com/HeckfyCU) — замеры навигации AliExpress на российском IP, [issue #190](https://github.com/Vladimir-Human/ru-marketplace-mcp/issues/190): по его замерам найден и исправлен предел ожидания страницы.
 
 ## Лицензия
 
@@ -704,7 +797,7 @@ hard anti-bot are read through your own Chrome. One optional exception: MPStats
 takes a paid account token (`MPSTATS_MP_AUTH`) if you want its analytics; without
 it every other server is unaffected.
 
-**2.5.3 verification:** on 13 October, from one address, Ozon, Yandex Market, Detsky Mir, Avito (search, card, seller), Taobao, Citilink, AliExpress and Cian passed selfcheck; Wildberries answers through `WB_TRANSPORT=dom`. Lamoda, DNS and Megamarket report blocked until a human clears their browser check, whose cookies last minutes (on 12 October they worked right after it). No drift; no visual acceptance. See the [per-source release evidence](docs/releases/RELEASE_NOTES_v2.5.3.md).
+**2.7.0 verification:** on 30 October, from one address, Wildberries fell back to its rendered search page after the API refused (HTTP 403) and returned 40 results, all priced. The other sources' code is unchanged since v2.6.0; they were checked in the [v2.6.0 run](docs/releases/RELEASE_NOTES_v2.6.0.md) the same day (12 of 13 sources; MPStats has no token). [v2.7.0 details](docs/releases/RELEASE_NOTES_v2.7.0.md).
 
 ## What you get
 
@@ -738,13 +831,17 @@ so the connectors hold a gap between calls themselves. Run `marketplace-mcp doct
 from your own session for the current state.
 
 MPStats stands apart as the only **paid** source: without `MPSTATS_MP_AUTH` the
-server boots but its tools answer `auth_missing`. It is therefore optional —
-plug it in if you have an account; the other fourteen servers never notice.
+unified `marketplace-mcp` does not mount its tools at all — they would only
+answer `auth_missing` — so it is optional; the other fourteen servers never
+notice. The standalone `mpstats-mcp` still boots and answers `auth_missing`.
 
 43 tools across 15 stdio MCP servers, sharing one runtime (`mcp-core`), plus the
-unified `marketplace-mcp` that mounts them all under one client entry. It adds its
-own `marketplace_sources` tool — which connectors mounted, and which dropped out and
-why — so it exposes 44 tools: the 43 mounted plus that one. stdio is the default;
+unified `marketplace-mcp` that mounts them all under one client entry. It adds two
+tools of its own — `marketplace_sources` (which connectors mounted, and which dropped
+out and why) and `marketplace_health` (is Chrome up, which hosts are cooling down,
+which page unblocks a source) — so it exposes 45 tools with an MPStats token and 43
+without one: the 41 mounted sources plus those two when the two `mpstats_*` tools are
+left out. stdio is the default;
 HTTP transport is opt-in for remote deployment — see
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
@@ -752,22 +849,89 @@ HTTP transport is opt-in for remote deployment — see
 
 Requires **Python 3.12+** and [uv](https://docs.astral.sh/uv/).
 
+Without a checkout, install from PyPI and wire the detected client in one step
+(`--dry-run` shows the plan and writes nothing):
+
+```console
+uvx ru-marketplace-mcp setup
+```
+
+Publishing to PyPI (maintainer): [DEPLOYMENT.md — PyPI](docs/DEPLOYMENT.md#pypi-maintainer).
+
+From source, for development:
+
 ```bash
 git clone https://github.com/Vladimir-Human/ru-marketplace-mcp.git
 cd ru-marketplace-mcp
 uv sync --all-packages
-uv run pytest -q -m "not live and not cdp"    # 2302 offline tests, no network needed
+uv run pytest -q -m "not live and not cdp"    # 3280 offline tests, no network needed
 ```
 
-Client configuration mirrors the Russian section above. Each server is a console
-script (`wb-mcp`, `ozon-mcp`, `yandex-mcp`, `detmir-mcp`, `aliexpress-mcp`, `cian-mcp`, `compare-mcp`) launched
-through `uv run --directory /path/to/repo <script>`. The optional `mpstats-mcp`
-runs the same way with `MPSTATS_MP_AUTH` in the entry's `env` (paid MPStats
-account; without it the tools return `auth_missing`). `marketplace-mcp install
-[claude|claude-code|cursor|dsh]` prints the block with your checkout's real path filled
-in — no placeholder to hand-edit — or the console-script paths on PATH when installed
-as a wheel; an unknown client name is rejected. The `dsh` target prints a
-`cordis.patch.yml` row instead of `mcpServers` JSON — see [dsh/README.md](dsh/README.md).
+Client configuration mirrors the Russian section above. The shortest path is the
+guided setup:
+
+```console
+marketplace-mcp setup
+```
+
+It detects Claude Desktop, Cursor and Claude Code, writes the config with the
+compare profile by default, starts the scraping Chrome, runs doctor's checks and
+offers `unblock` for a walled source. `--dry-run` prints the steps and files
+without writing, starting or requesting anything.
+
+To write one named client's config instead, let the CLI write the file:
+
+```console
+marketplace-mcp install claude --write
+```
+
+It adds one `marketplace` entry to the client's own config (Claude Desktop:
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows,
+`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
+`~/.config/Claude/claude_desktop_config.json` on Linux; Cursor: `~/.cursor/mcp.json`).
+By default that entry runs `compare-mcp` — the `compare` profile: 4 price-comparison
+tools, the cheapest per request. `--profile decision` adds shortlist card
+inspection (5 tools); `--profile full` runs `marketplace-mcp` with every per-source
+tool, several times the cost (measured per profile in [docs/TOOLS.md](docs/TOOLS.md)).
+The entry name stays `marketplace`. `uv` and your checkout
+path are filled in as absolute paths, other servers and settings in the file stay
+untouched, and the old file is kept as `<file>.bak-<timestamp>`. Restart the client
+afterwards; `--dry-run` shows the result without writing, and `--per-source` writes
+one entry per source instead (it cannot be combined with `--profile`). Each server is
+also a console script (`wb-mcp`, `ozon-mcp`, `yandex-mcp`, `detmir-mcp`, `aliexpress-mcp`,
+`cian-mcp`, `compare-mcp`) launched through `uv run --directory /path/to/repo <script>`.
+The optional `mpstats-mcp` runs the same way with `MPSTATS_MP_AUTH` in the entry's
+`env` (paid MPStats account; without it the tools return `auth_missing`).
+`marketplace-mcp install [claude|claude-code|cursor|dsh]` prints the selected profile's
+`marketplace` entry with your checkout's real path filled in — no placeholder to
+hand-edit — or the console-script path on PATH when installed as a wheel; an unknown
+client name or profile is rejected. The `dsh` target prints a `cordis.patch.yml` row
+instead of `mcpServers` JSON — see [dsh/README.md](dsh/README.md).
+
+If you prefer to paste the config yourself, start with this one entry (replace the
+path with your clone from above):
+
+```json
+{
+  "mcpServers": {
+    "marketplace": {
+      "command": "uv",
+      "args": ["run", "--frozen", "--directory", "C:/projects/ru-marketplace-mcp", "compare-mcp"]
+    }
+  }
+}
+```
+
+The browser tier has more verbs: `marketplace-mcp browser start` (launch the
+scraping Chrome; on-screen by default, `--hidden` for off-screen),
+`marketplace-mcp browser status` (is the CDP endpoint reachable, which Chrome
+answers, how many page targets it holds and where its window is) and
+`marketplace-mcp browser show` (bring the scraping Chrome window on-screen — the
+connector's autostart parks it off-screen on Windows, and without that you can
+neither log in by hand nor pass a site's check). When `doctor` reports a wall,
+`marketplace-mcp unblock <source>` opens that page in a new tab, waits while you
+pass the check or log in, and re-checks only that source. None of these sends a
+request to a website on its own and none solves the check for you.
 
 **DeepSeek Harness (dsh)** installs as a plugin bundle rather than an `mcpServers`
 entry, from the [`dsh/`](dsh/README.md) subdirectory (`pnpm` must be on PATH):
@@ -777,15 +941,25 @@ dsh plugin --profile web add github:Vladimir-Human/ru-marketplace-mcp#path:/dsh
 ```
 
 That gives you 15 skills immediately and **no** MCP tools: both MCP rows stay
-disabled until `RU_MARKETPLACE_MCP_DIR` points at a clone. A mounted server is paid
-on every request — ~0.9k tokens for the recommended price-comparison mode, ~13.6k for
-the full set — so opting in is left to you. [dsh/README.md](dsh/README.md) covers
-enabling it and the full mode.
+disabled until `RU_MARKETPLACE_MCP_DIR` points at a clone.
+<!-- tools-cost:start -->
+A mounted server is paid on every request — ≈1.7k tokens for the
+recommended price-comparison profile, ≈2.0k for the decision profile and
+≈14.5k for the full set (estimated from `tools/list`; details in
+[docs/TOOLS.md](docs/TOOLS.md)) — so opting in is left to you.
+<!-- tools-cost:end -->
+[dsh/README.md](dsh/README.md) covers enabling it and the full mode.
 
-After connecting, run `marketplace-mcp doctor`. It runs every connector's canary and
-reports `success`, `drift_detected`, or `inconclusive` for each.
+After connecting, run `marketplace-mcp doctor`. Its exits are `0` all selected
+checks healthy, `1` parser drift, `2` acknowledged block or unverified source,
+`3` status-file write failure, and `4` checker or doctor setup/usage failure
+(including an unknown source). Nightly alarms on `1` and `4`, not `2`. A budget
+refusal carries `budget_refused` and never counts as a healthy check.
 
 ## The tools
+
+Generated per-tool reference with parameters and context cost:
+[docs/TOOLS.md](docs/TOOLS.md).
 
 The `*_selfcheck` canaries are deliberately absent from these tables: they are not
 published over MCP, because operator diagnostics would cost the model ~7.5k tokens
@@ -820,12 +994,17 @@ comparable. Several of WB's largest sections carry the shard `blackhole` and hav
 feed at all; the tool says so instead of returning an empty list.
 
 If WB's API answers 403 from your address (the refusal depends on both address and
-client), set `WB_TRANSPORT=dom`: `wb_search` and `wb_card` then read WB's rendered
-pages in your Chrome over CDP, like DNS and Citilink, with no API calls. On search
+client), `wb_search` and `wb_card` re-read the same request through WB's rendered
+page in your Chrome over CDP and add a `dom_fallback` warning to `meta.warnings`.
+This is on by default; `WB_DOM_FALLBACK=0` restores the previous behaviour, while
+`WB_TRANSPORT=dom` still reads only rendered pages, with no API calls. On search
 tiles `price_rub` is the WB Wallet price (`price_kind: wallet`); the card reports
 the regular, Wallet and struck prices separately, plus the store, warehouse,
 delivery date, return policy, warranty, the «Оригинал» badge and «Все N
-предложений от X ₽». Details in
+предложений от X ₽». In this mode `marketplace-mcp doctor` also opens two pages
+in your Chrome — the baseline card and search grid — for `card` and `search_v9`.
+A captcha is `inconclusive`, never solved or retried; reviews, basket and the legacy
+probe still use HTTP. Details in
 [ANTI_BOT.md](docs/ANTI_BOT.md#when-the-api-refuses-rendered-pages-wb_transportdom).
 
 ### Yandex Market — `yandex_*`
@@ -980,7 +1159,11 @@ or `httpx.TransportError` triggers exactly one in-page GraphQL POST through your
 Chrome over CDP (tier 2); successful fallback reads report `tier_used: graphql_cdp`.
 HTTP 200 skips CDP. The reason is the 2026-10-12 307 loop from GraphQL over HTTPS.
 All of them need Chrome with CDP (`scripts/start_chrome_cdp.sh`), but Lamoda cards
-only need it for the fallback. Nine sources run through CDP in total: these plus
+only need it for the fallback. Your everyday Chrome can stay open: the launcher
+starts a second Chrome with its own `--user-data-dir`, on-screen. If the window
+did go off-screen (the connector's autostart on Windows), bring it back (to log
+in by hand or pass a site's check) with `marketplace-mcp browser show`. Nine
+sources run through CDP in total: these plus
 Taobao, AliExpress, Cian, Ozon and Avito; for Ozon and Avito, Chrome is also only the
 fallback tier when the anonymous one is challenged.
 
@@ -1005,6 +1188,10 @@ compare_prices("кроссовки мужские")
 Sources are queried concurrently and each reports its own outcome. One marketplace
 being blocked never sinks the comparison: `complete: false` plus `source_outcomes`
 tells you exactly what you are looking at. Subscription prices never win the ranking.
+WB Wallet and other explicitly conditional prices cannot become `cheapest` or
+`cheapest_comparable` either; when a regular price is available, that price ranks.
+`price_kind` retains the kind (`regular`, `wallet`, `subscription`); `null` means
+unreported. A `conditional_price: …` warning names the condition and excluded amount.
 Repeats matching on (source, product id, variant id) are collapsed. Distinct Yandex
 SKUs remain visible within one product family. Comparison stock is tri-state:
 `true` means confirmed, `false` means unavailable, and `null` means unknown.
@@ -1013,20 +1200,27 @@ and ambiguous Ozon labels remain visible at the end of the list.
 
 Every offer carries `currency` (lowercase ISO code, default `rub`) and `price_native`,
 the price in that currency as the marketplace quotes it. For Russian sources it mirrors
-`price_rub`; for Taobao it holds the yuan price that `price_rub` deliberately leaves
+an available everyday `price_rub`; if only a conditional price is known, that amount
+stays in `price_native` while `price_rub` is null. For Taobao it holds the yuan price that `price_rub` deliberately leaves
 null. That yuan price used to be fetched and silently thrown away, so a Taobao row
 showed a blank price with no sign a real one existed. Now the yuan is reported but
 still never ranked against roubles: a `foreign_currency: …` warning lists how many
-offers were excluded and why. Converting here would bake in an exchange rate that goes
-stale silently, so the caller converts if they want to.
+offers were excluded and why. Taobao's `source_outcomes[].detail` counts
+`price_native`, for example `20 results, 20 priced in CNY (not ranked)`. Multiple
+priced currencies are sorted and joined with `/`; no native prices gives
+`N results, 0 priced (not ranked)`. Rouble sources keep `N results, M priced`.
+Converting here would bake in an exchange rate that goes stale silently, so the
+caller converts if they want to.
 
 ### MPStats — `mpstats_*`
 
 Sales and stock analytics per Ozon or Wildberries SKU via the MPStats browser
 plugin. Unlike every other connector, this one is **optional and needs a paid
 MPStats account**: auth is a single `mp_auth` cookie (JWT from a logged-in plugin
-session at mpstats.io), set via the `MPSTATS_MP_AUTH` env var. Without it the tools
-return `auth_missing` while the server boots normally — nothing else is affected.
+session at mpstats.io), set via the `MPSTATS_MP_AUTH` env var. Without it the
+standalone `mpstats-mcp` boots normally and answers `auth_missing`, while the
+unified `marketplace-mcp` does not mount the two tools, so no request pays for
+schemas that could only fail.
 
 | Tool                                     | What it does                                                                            |
 | ---------------------------------------- | --------------------------------------------------------------------------------------- |
@@ -1079,7 +1273,8 @@ already removed.
 
 Skills are copied into the Docker image (`/app/skills/`), but they are **not in
 the wheels**: `skills/` lives at the repository root rather than inside the
-packages. Installing from PyPI means fetching the skills from the repo separately.
+packages. Release-wheel installs need the skills fetched from the repo separately;
+the `ru-marketplace-mcp` package on PyPI does not include them either.
 
 ## Configuration
 
@@ -1141,7 +1336,7 @@ import, and `compare_prices` queries the same subset.
 
 ```bash
 uv sync --all-packages
-uv run pytest -q -m "not live and not cdp"    # 2302 offline tests
+uv run pytest -q -m "not live and not cdp"    # 3280 offline tests
 uv run pytest -q -m "not live"                # what CI runs
 uv run pytest -q -m "not live" --cov          # coverage, CI enforces a 70% floor
 uv run ruff check . && uv run ruff format --check .
@@ -1203,7 +1398,7 @@ harvesting.
 ## How this was built
 
 I wrote the code and the documentation with AI assistants. They are fast and they
-are confidently wrong, so the project is arranged around verification: 2302 offline
+are confidently wrong, so the project is arranged around verification: 3280 offline
 tests, an audit before the release, tests that run the real extractor against
 markup captured from the live site. The release notes say which sources were
 compared against live pages by hand and which were left unverified.
@@ -1219,6 +1414,7 @@ credit too: the full contributor and PR index is in
 - [@Khalmatov](https://github.com/Khalmatov) — Ozon review provenance, [PR #38](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/38).
 - [@fosteev](https://github.com/fosteev) — macOS CDP stealth and the Cian connector, [PR #42](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/42), [PR #47](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/47).
 - [@ilodezis](https://github.com/ilodezis) — unified-server source selection, [PR #48](https://github.com/Vladimir-Human/ru-marketplace-mcp/pull/48).
+- [@HeckfyCU](https://github.com/HeckfyCU) — AliExpress navigation timing measured on a Russian residential IP, [issue #190](https://github.com/Vladimir-Human/ru-marketplace-mcp/issues/190): those measurements located the page-readiness deadline that has been fixed.
 
 ## License
 

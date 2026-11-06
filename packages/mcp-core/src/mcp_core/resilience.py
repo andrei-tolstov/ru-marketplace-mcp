@@ -24,21 +24,27 @@ step, not something already in place.
 # START_MODULE_CONTRACT
 # PURPOSE: Normalize drifting upstream values and report structural health honestly.
 # SCOPE: Offline coercion, validation, shape fingerprints and tri-state canaries.
-# DEPENDS: stdlib math,re,collections.abc,typing; no network or persistence.
+# DEPENDS: stdlib math,re,collections.abc,typing; mcp_core.redact; no network or persistence.
 # LINKS: M-RESILIENCE; M-DOM; M-MODELS.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
+# DECOY_MARKERS: The one list of non-price text markers, shared with the DOM decoy regex.
 # first_present: Bind the first non-null alias while preserving false/empty values.
 # deep_first: Search nested dict/list payloads within a depth bound.
 # coerce_int: Parse unambiguous counts or return None.
+# coerce_count: Parse a labelled display count ("24 086 отзывов") or return None.
 # coerce_price: Accept positive finite prices and reject ambiguous display blobs.
 # coerce_rating: Normalize ratings on the 0..5 scale.
+# health_warnings: Strip informational notes; the rest decide healthy.
 # validate_offer: Report missing or contradictory normalized offer fields.
+# validate_items: Aggregate per-item offer validation into systemic drift warnings.
 # validate_review_block: Check returned counts and sufficiently large text samples.
 # attach_meta: Mutate a result with source, health and warnings.
+# bound_warnings: Deliver a bounded warning list that names what it suppressed.
 # widget_prefixes: Strip volatile numeric widget suffixes.
 # shape_signature: Fingerprint bounded paths/types independently of values.
 # diff_keys: Return sorted missing and added structural keys.
+# shape_drift_warning: One compact runtime warning when a required key family vanished.
 # selfcheck_entry: Build healthy/drift/inconclusive sub-check metadata.
 # selfcheck_result: Aggregate verdicts and inject omitted required checks.
 # flatten_text: Reduce display fields to usable scalar text, never container repr.
@@ -51,6 +57,8 @@ import math
 import re
 from collections.abc import Iterable
 from typing import Any
+
+from mcp_core.redact import redact_error_text
 
 # A non-value sentinel distinct from None, so callers can tell "key absent"
 # from "key present but null". Most callers just want the coalesced value, but
@@ -109,6 +117,11 @@ def coerce_int(value: Any) -> int | None:
     fabricates a plausible-but-wrong count ('1.2K'->12, '-3'->3). Such inputs now
     return None (fail loud) rather than a fabricated integer. Pure grouped digits
     ('24 088', '1 057') still parse, because thousands separators are unambiguous.
+
+    Audit 2026-11-01 (CONFIRMED): the letter guard knew only Latin and Cyrillic,
+    so a CJK magnitude suffix ('12万') slipped through as 12, and a currency
+    glyph ('24 088₽') was stripped and read as a count. Any-script letter and a
+    currency glyph now return None instead of a fabricated count.
     """
     if value is None:
         return None
@@ -125,8 +138,11 @@ def coerce_int(value: Any) -> int | None:
     if isinstance(value, str):
         s = value.strip()
         # Reject ambiguous forms instead of fabricating: a sign, a decimal
-        # separator between digits, or a magnitude letter (K/M/тыс/k/тыс.).
-        if re.search(r"[A-Za-zА-Яа-я]", s):  # any letter → unit/suffix → ambiguous
+        # separator between digits, a magnitude letter in any script
+        # (K/M/тыс/万) or a currency glyph ('24 088₽' is a price, not a count).
+        if any(ch.isalpha() for ch in s):  # any letter → unit/suffix → ambiguous
+            return None
+        if re.search(r"[₽$€¥￥£₸₴₺₹₩]", s):
             return None
         # signed → drop-sign would lie. Must cover the unicode minus (U+2212)
         # and the en/em dashes (U+2013/U+2014) a marketplace renders ranges
@@ -140,6 +156,95 @@ def coerce_int(value: Any) -> int | None:
         digits = re.sub(r"[^\d]", "", s)
         return int(digits) if digits else None
     return None
+
+
+def coerce_count(value: Any) -> int | None:
+    """Coerce a display count that may carry a unit label into an int, or None.
+
+    ``coerce_int`` refuses a bare count that carries letters, because "1.2K"
+    there is ambiguous. A marketplace review counter is different: it arrives
+    as DISPLAY TEXT with a known label — Ozon renders "24 086 отзывов", the
+    older format was "(15 374)". So the label is split off first and the
+    NUMBER is then parsed strictly:
+
+    * "24 086 отзывов", "1 200", "1200", "(15 374)" -> the number;
+    * a sign ("-3", "+5", "−5"), a range ("1 000–2 000"), two numbers
+      ("1 999 2 999"), a magnitude suffix ("1.2K", "2 тыс.") or any other
+      letter -> None.
+
+    Audit 2026-11-02 (CONFIRMED — R05): the Ozon tile parser and compare's
+    count adapter both glued every digit of the display text together, so
+    "1.2K отзывов" became the plausible-but-wrong 12 and the answer stayed
+    healthy. A magnitude suffix is refused here for the same reason
+    ``coerce_int`` refuses it: the mantissa is a guess about the site's
+    rounding, and a wrong count is worse than an absent one. The grouped
+    forms keep parsing, because a thousands separator is unambiguous.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) else None
+    if not isinstance(value, str):
+        return None
+    text = _strip_count_label(value)
+    if not text:
+        return None
+    # Any leftover letter (a magnitude suffix, a currency word, a stray
+    # symbol) means the text does not name exactly one plain number.
+    if any(ch.isalpha() for ch in text):
+        return None
+    if re.search(r"[₽$€¥￥£₸₴₺₹₩]", text):
+        return None
+    # A sign, a range dash or a tilde: dropping the sign would fabricate a
+    # count, and a range is two numbers. The unicode minus (U+2212) and the
+    # en/em dashes (U+2013/U+2014) count as signs.
+    if re.search(r"[-+−–—~]", text):
+        return None
+    return _parse_grouped_count(text)
+
+
+# The unit labels a marketplace puts in front of / behind a counter. Only
+# these are stripped; any other word stays in the text and makes it ambiguous.
+_COUNT_LABEL_RE = re.compile(r"(?i)\b(?:отзыв\w*|review(?:s)?|оценк\w*)\b")
+# Spaces a marketplace uses as a thousands separator: plain, no-break
+# (U+00A0), narrow no-break (U+202F) and thin (U+2009).
+_COUNT_SPACES = " \u00a0\u202f\u2009"
+
+
+def _strip_count_label(text: str) -> str:
+    """Remove a known review/rating label and the brackets around the number."""
+    cleaned = _COUNT_LABEL_RE.sub(" ", text)
+    cleaned = "".join(ch for ch in cleaned if ch not in "()[]{}")
+    return " ".join(cleaned.replace("\t", " ").split())
+
+
+def _parse_grouped_count(text: str) -> int | None:
+    """Parse one grouped integer, or None when the text is not exactly one.
+
+    Grouping is the same rule ``coerce_price`` uses for its integer part: a
+    first group of one to three digits followed by three-digit groups, or a
+    single ungrouped run. Anything else is two numbers glued together
+    ("1 999 2 999") or a run with a foreign separator, and is refused.
+    """
+    normalized = text
+    for space in _COUNT_SPACES:
+        normalized = normalized.replace(space, " ")
+    normalized = normalized.strip()
+    if not normalized:
+        return None
+    groups = normalized.split(" ")
+    groups = [group for group in groups if group]
+    if not groups:
+        return None
+    if len(groups) == 1:
+        if not re.fullmatch(r"\d+", groups[0]):
+            return None
+    elif not re.fullmatch(r"\d{1,3}", groups[0]) or not all(re.fullmatch(r"\d{3}", g) for g in groups[1:]):
+        return None
+    digits = re.sub(r"[^\d]", "", normalized)
+    return int(digits) if digits else None
 
 
 def coerce_price(value: Any) -> float | None:
@@ -156,6 +261,19 @@ def coerce_price(value: Any) -> float | None:
         (was inflated x100 by blind digit-concatenation).
       * A multi-number blob / price-range ('1 999 ₽ 2 999 ₽') is AMBIGUOUS and
         returns None (fail loud) rather than the concatenated nonsense 19992999.0.
+
+    Audit 2026-11-01 (CONFIRMED): the same space that groups thousands also
+    separates two numbers, so '1 999 2 999' and '1 999 2 999 ₽' glued into
+    19992999.0, '3 983.999' (a 3-digit fraction) into 3983999.0, and a
+    neighbour figure ('от 5 751 ₽/ мес.', 'выгода 5 000 ₽', 'скидка 30%')
+    parsed as the price. All are None now: grouping is checked to be
+    consistent and a non-price qualifier is refused, while 'от' ("from") stays
+    a real price. The qualifier list is DECOY_MARKERS, the same one list the DOM
+    extractor's decoy regex is generated from, so the two cannot drift apart.
+
+    Audit 2026-11-01 (CONFIRMED): a magnitude suffix next to the number was
+    ignored — '12万' read as 12.0 and '1.2K' as 1.2, while coerce_int refuses
+    both. The price path now refuses a magnitude marker after the number too.
 
     Audit 2026-08-06 (found by property tests): a digit run past the float
     ceiling (~1.8e308) raised OverflowError, breaking totality — one poisoned
@@ -177,18 +295,77 @@ def coerce_price(value: Any) -> float | None:
     return None
 
 
+# Text markers for a number that is NOT the price: monthly instalments, loyalty
+# bonuses, discount badges, delivery-point counts, ratings, savings, and
+# (Taobao) sales counts like «200+人付款» — the number of buyers, which a naive
+# read promotes into a plausible-looking price.
+#
+# ONE list, and both consumers are generated from it: the display-string guard
+# in _parse_money_string below and the DOM extractor's JavaScript decoy regex
+# (mcp_core.dom). A second hand-written list is how the two quietly stop
+# agreeing — someone adds a marker to the Python side, the other never sees it,
+# and the bug reads as a mysterious wrong price rather than a stale list.
+# Adding a marker anywhere means adding it here.
+DECOY_MARKERS: tuple[str, ...] = (
+    "мес",
+    "рассрочк",
+    "бонус",
+    "балл",
+    "кэшбэк",
+    "кешбэк",
+    "cashback",
+    "трейд-ин",
+    "trade-in",
+    "пункт",
+    "отзыв",
+    "выгод",
+    "скидк",
+    "эконом",
+    "saving",
+    "discount",
+    "month",
+    "%",
+    "付款",
+    "收货",
+    "已售",
+    "约售",
+)
+
+_DECOY_RE = re.compile("|".join(re.escape(marker) for marker in DECOY_MARKERS), re.IGNORECASE)
+
+# Magnitude shorthands make the digits a different number than they read:
+# '12万' is 120 000 CNY, '1.2K' is 1 200 and '15 тыс.' is 15 000. Returning the
+# digits alone understates the price, so a marker right after the number is
+# ambiguous — the price-path half of coerce_int's magnitude-letter rule. A
+# currency word ('руб'), a per-unit slash ('1 999 ₽/м') and a word that only
+# starts with such a letter ('129 990 Купить', 'KZT') are not markers.
+# Case-blind: '15 ТЫС. ₽' is the same 15 000.
+_MAGNITUDE_SUFFIX_RE = re.compile(
+    r"\s*(?:万|千|百|亿|тыс|млн|млрд|трлн|[KkMmBbКкМм](?![A-Za-zА-Яа-яЁё]))", re.IGNORECASE
+)
+
+
 def _parse_money_string(s: str) -> float | None:
     """Parse ONE money number from a display string, or None if absent/ambiguous.
 
     Handles RU/EU grouping (space, thin-space, NBSP, dot-as-grouping) and a
     comma/dot decimal with 1-2 fractional digits. Returns None when the string
-    contains MORE THAN ONE distinct number (a range or discount blob) so the
-    caller fails loud instead of concatenating unrelated digits.
+    names something other than the item's price (a saving, a discount, a
+    monthly instalment) or contains MORE THAN ONE number / an inconsistent
+    grouping, so the caller fails loud instead of concatenating unrelated digits.
     """
     if not s:
         return None
     # Normalize unicode spaces to plain space, drop currency/letters except sep.
     t = s.replace("\u2009", " ").replace("\u00a0", " ").replace("\u202f", " ")
+    # A display blob that names a saving, a discount, an instalment, a bonus or a
+    # delivery-point count is not the item's price: those figures sit beside the
+    # real price and are smaller, so a "cheapest" ranking would pick one of them.
+    # DECOY_MARKERS is the project's ONE list of such words, shared with the DOM
+    # extractor's JavaScript; "от" ("from") is NOT in it — a listing's "from"
+    # price is a real price.
+    if _DECOY_RE.search(t):
+        return None
     # Find number-like tokens: digits with optional grouping and one decimal tail.
     matches = list(re.finditer(r"\d[\d \.\,]*\d|\d", t))
     # A leading minus makes this a delta, not a price. Marketplaces render the
@@ -203,21 +380,44 @@ def _parse_money_string(s: str) -> float | None:
         before = t[: matches[0].start()].rstrip()
         if before.endswith(("-", "\u2212", "\u2013", "\u2014")):
             return None
-    tokens = [m.group(0) for m in matches]
-    cleaned: list[str] = []
-    for tok in tokens:
-        tok = tok.strip()
-        if tok:
-            cleaned.append(tok)
-    if len(cleaned) != 1:
+    tokens = [m.group(0).strip() for m in matches]
+    tokens = [tok for tok in tokens if tok]
+    if len(tokens) != 1:
         return None  # zero or multiple numbers → ambiguous → fail loud
-    tok = cleaned[0]
+    # A magnitude suffix right after the number makes the digits a different
+    # number than they read ('12万' is 120 000, '1.2K' is 1 200, '15 тыс.' is
+    # 15 000); returning the digits alone would understate the price, so it is
+    # refused exactly as coerce_int refuses a magnitude letter.
+    if _MAGNITUDE_SUFFIX_RE.match(t, matches[0].end()):
+        return None
+    return _parse_money_token(tokens[0])
+
+
+def _parse_money_token(tok: str) -> float | None:
+    """Parse one digit run, or None when its grouping is inconsistent.
+
+    The space is both the Russian thousands separator and the gap between two
+    numbers ('1 999 2 999'), so a run is one number only when its groups follow
+    the grouping rule: a 1-3 digit first group and 3-digit later groups, or a
+    single ungrouped run, with an optional 1-2 digit decimal tail. Mixing
+    separators ('3 983.999') or leaving a short non-final group is ambiguous —
+    a second number glued on — and returns None instead of concatenating digits.
+    """
     # Decimal tail: a comma or dot followed by exactly 1-2 digits at the END.
     m = re.search(r"[.,](\d{1,2})$", tok)
     frac = 0.0
     if m:
         frac = int(m.group(1)) / (10 ** len(m.group(1)))
         tok = tok[: m.start()]
+    groups = [g for g in re.split(r"[ .,]+", tok.strip()) if g]
+    separators = set(re.findall(r"[ .,]", tok))
+    if not groups or len(separators) > 1:
+        return None  # mixed separators → cannot tell grouping from decimals
+    if len(groups) == 1:
+        if not re.fullmatch(r"\d+", groups[0]):
+            return None
+    elif not re.fullmatch(r"\d{1,3}", groups[0]) or not all(re.fullmatch(r"\d{3}", g) for g in groups[1:]):
+        return None  # a short non-final group is another number, not a separator
     intpart = re.sub(r"[^\d]", "", tok)
     if not intpart:
         return None
@@ -230,13 +430,24 @@ def _parse_money_string(s: str) -> float | None:
 
 def coerce_rating(value: Any) -> float | None:
     """Coerce a rating like '4,9' / '4.9' / 4.9 to float in 0..5. None if
-    unparseable, out of range, or carrying a non-/5 denominator.
+    unparseable, out of range, or carrying a non-5 denominator ('/10', 'из 10').
 
     Audit 2026-06-01 (CONFIRMED — latent): the old version returned the FIRST
     numeric token of any string, so a review-count ('4,500 reviews' -> 4.5) or a
     wrong-scale rating ('4.9/10' -> 4.9) silently passed as an in-range 0..5
     rating. Now: an explicit denominator other than 5 returns None, a count-like
     blob returns None, and the parsed value must be within 0..5.
+
+    Audit 2026-11-01 (CONFIRMED): the denominator was recognised only through
+    '/', so the Russian '4.5 из 10' passed as 4.5. 'из N' now joins '/N'.
+
+    Audit 2026-11-01 (CONFIRMED): the count rule above needed letters, so a
+    bare thousands-grouped count ('1 299' — plain, no-break U+00A0, narrow
+    no-break U+202F or thin U+2009 space) reached the number extraction and
+    came back as a fabricated in-range rating (1.0). A space-grouped count is
+    now None with or without letters; letter-free comma text keeps its old
+    reading. The guard also carries a run longer than three digits without its
+    own separator ('1 2999'), which a trailing word boundary let through.
 
     Audit 2026-08-07 (wave of cycles 24-30): json.loads admits
     arbitrary-precision ints, and float() raises OverflowError past the ceiling;
@@ -253,12 +464,22 @@ def coerce_rating(value: Any) -> float | None:
         return v if 0 <= v <= 5 else None
     if isinstance(value, str):
         s = value.strip()
-        # Explicit denominator: accept only /5; reject /10, /100, etc.
-        dm = re.search(r"\d[.,]?\d*\s*/\s*(\d+)", s)
+        # Explicit denominator: accept only /5 or 'из 5'; reject /10, из 10, etc.
+        dm = re.search(r"\d[.,]?\d*\s*(?:/|из)\s*(\d+)", s, re.IGNORECASE)
         if dm and dm.group(1) != "5":
             return None
         # A count-like blob ("4,500 reviews", "1 234 отзыва") is not a rating.
         if re.search(r"[A-Za-zА-Яа-я]", s) and re.search(r"\d[ ,]\d{3}\b", s):
+            return None
+        # A thousands-grouped count ("1 299", "12 345") is not a rating even
+        # without letters: a rating selector that lands on the review counter
+        # must not fabricate an in-range rating out of the first group. The
+        # space, not the letters, is what betrays the count — plain, no-break
+        # (U+00A0), narrow no-break (U+202F) and thin (U+2009) alike. A comma
+        # without letters keeps its old reading ('4,9' stays a rating). Three or
+        # more digits after the space: a word boundary let '1 2999' (a longer
+        # counter missing its own separator) through as a fabricated 1.0.
+        if re.search(r"\d[ \u00a0\u202f\u2009]\d{3,}", s):
             return None
         m = re.search(r"\d+[.,]?\d*", s)
         if not m:
@@ -278,15 +499,90 @@ def coerce_rating(value: Any) -> float | None:
 # --------------------------------------------------------------------------
 
 
-def validate_offer(item: dict, *, require_title: bool = True) -> list[str]:
+def health_warnings(warnings: list[str]) -> list[str]:
+    """The warnings that decide ``healthy``, per the contract in ``attach_meta``.
+
+    Any warning is a doubt about the data unless it is an ``info:`` note, so a
+    connector that builds its ``MetaOut`` by hand (WB does, for the tool-level
+    fields it adds) uses this instead of writing ``healthy=not warnings`` and
+    silently disagreeing with the connectors that go through ``attach_meta``.
+    """
+    return [warning for warning in warnings if not warning.startswith("info:")]
+
+
+def bound_warnings(
+    warnings: Iterable[str],
+    *,
+    limit: int = 10,
+    subject: str = "warning",
+    marker_prefix: str = "info: ",
+) -> list[str]:
+    """Deliver a bounded warning list that says what it left out.
+
+    A shortened list of diagnostics reads as a different claim than the truth:
+    ten warnings where the source reported twelve look like ten problems, not
+    like a budget. So the budget stays, but the last entry names how many
+    diagnostics were suppressed.
+
+    * every entry is redacted, single-line and at most 500 characters;
+    * duplicates collapse to their first occurrence;
+    * a diagnostic that explains an unhealthy answer is never dropped behind
+      an ``info:`` note: real warnings fill the budget first, notes take what
+      is left;
+    * the marker is itself an ``info:`` note — truncation is a fact about the
+      delivery, not a doubt about the data, so it must not flip ``healthy``.
+
+    Callers that compute ``healthy`` from the warnings they deliver should
+    compute it from the FULL list: when the real warnings alone exceed the
+    budget, the delivered list can no longer carry all of them.
+
+    Audit 2026-11-02 (CONFIRMED — R18): compare's source adapter cut a
+    twelve-warning reply to ten without a word, and the WB DOM path cut its
+    warnings with ``warnings[:10]``.
+    """
+    cleaned: list[str] = []
+    for warning in warnings:
+        if not isinstance(warning, str):
+            continue
+        text = " ".join(redact_error_text(warning).split())
+        if not text:
+            continue
+        if len(text) > 500:
+            text = text[:497] + "..."
+        if text not in cleaned:
+            cleaned.append(text)
+    if limit <= 0:
+        return []
+    if len(cleaned) <= limit:
+        return cleaned
+    budget = limit - 1
+    real = [warning for warning in cleaned if not warning.startswith("info:")]
+    notes = [warning for warning in cleaned if warning.startswith("info:")]
+    kept = real[:budget]
+    if len(kept) < budget:
+        kept.extend(notes[: budget - len(kept)])
+    suppressed = len(cleaned) - len(kept)
+    kept.append(
+        f"{marker_prefix}{subject}s_truncated: {suppressed} further {subject}(s) suppressed by the "
+        f"{limit}-{subject} budget; {len(cleaned)} in total"
+    )
+    return kept
+
+
+def validate_offer(item: dict, *, require_title: bool = True, price_key: str | None = None) -> list[str]:
     """Invariant checks on one normalized offer (search item or card).
 
     These encode "things that must be true if parsing worked". A violation
     almost always means upstream schema drifted and a selector now points at
     the wrong field — exactly the silent failure mode we want to surface.
+
+    ``price_key`` names the price field when the connector does not call it
+    ``price_rub``/``price`` (Taobao's ``price_cny``). Without it such an item
+    would have no price at all as far as this validator is concerned, so a
+    drifted price would pass unmentioned.
     """
     warnings: list[str] = []
-    price = item.get("price_rub", item.get("price"))
+    price = item.get(price_key) if price_key else item.get("price_rub", item.get("price"))
     in_stock = item.get("in_stock")
     raw_rating = item.get("rating") if item.get("rating") is not None else item.get("rating_score")
     rating = coerce_rating(raw_rating)
@@ -298,15 +594,23 @@ def validate_offer(item: dict, *, require_title: bool = True) -> list[str]:
     # Normalize price for validation so a STRING price ('0', '-10', '3 983 ₽')
     # is range-checked, not just the literal int 0 (audit 2026-06-01: a string
     # '0' slipped through `price == 0` and a negative price ranked as cheapest).
-    price_num = coerce_price(price) if isinstance(price, str) else price
-    if price == 0 or price == 0.0:
-        warnings.append("price_zero: price is 0 — should be None when no offer (price selector drift)")
-    elif isinstance(price_num, (int, float)) and price_num <= 0:
+    # A price string that coerce_price REFUSES must be reported here: the
+    # coercion hardening is only half the promise, because an unparsed price
+    # otherwise reaches the caller as a silent None next to healthy=True.
+    price_num = coerce_price(price)
+    if isinstance(price_num, (int, float)) and not isinstance(price_num, bool) and price_num <= 0:
+        # coerce_price already refuses <= 0, so this is the literal 0/-10 case.
         warnings.append(f"price_non_positive: price={price!r} <= 0 (selector drift / dead listing)")
-    elif isinstance(price, str) and price.strip() and price_num is None:
-        warnings.append(f"price_unparseable: price={price!r} did not parse to a number (selector drift)")
+    elif isinstance(price, str):
+        if not price.strip():
+            warnings.append(f"price_blank: price={price!r} is blank (price selector drift)")
+        elif price_num is None:
+            warnings.append(f"price_unparseable: price={price!r} did not parse to a number (selector drift)")
+    elif price is not None and price_num is None:
+        # A present non-string value coerce_price refuses (a list, an object).
+        warnings.append(f"price_unparseable: price={price!r} is not a number (selector drift)")
 
-    if in_stock is True and (price is None):
+    if in_stock is True and (price is None or price_num is None):
         warnings.append("instock_no_price: in_stock=True but price is None (contradiction)")
 
     # A rating value that is PRESENT but coerce_rating rejected (out of 0..5,
@@ -323,6 +627,61 @@ def validate_offer(item: dict, *, require_title: bool = True) -> list[str]:
         warnings.append(f"count_negative: rating_count={count} < 0")
 
     return warnings
+
+
+def validate_items(
+    items: Iterable[Any],
+    *,
+    require_title: bool = True,
+    price_key: str | None = None,
+    absent_price: str | None = None,
+) -> list[str]:
+    """Aggregate per-item offer validation into connector-level drift warnings.
+
+    One warning per invariant CODE, kept only when at least half the returned
+    items break it (`max(1, n // 2)`, so a single-item result still speaks).
+    That threshold is what separates systemic selector drift — every tile's
+    price field now points at a neighbour — from one unusual listing, and it
+    keeps the response's warning list short enough to read.
+
+    Items may be dicts or Pydantic models (the connectors build both); a model
+    is validated with ``model_dump()``.
+
+    ``absent_price`` is the code used when NOT ONE item carries a price; the
+    per-code tally cannot express that by itself, because it counts items that
+    HAVE a price field holding a bad value. Pass the connector's established
+    wording (``no_prices_on_page``) to keep the wire stable. Any other
+    invariant code is reported as ``<code>: <hits>/<n> items affected
+    (likely schema drift)``, the form WB and Ozon already ship.
+
+    An empty ``items`` returns nothing: there are no offers to validate, and
+    the caller decides on its own whether emptiness is honest.
+    """
+    from collections import Counter
+
+    tally: Counter[str] = Counter()
+    total = 0
+    priced = 0
+    for item in items:
+        if not isinstance(item, dict):
+            item = item.model_dump()
+        total += 1
+        if coerce_price(item.get(price_key) if price_key else item.get("price_rub", item.get("price"))) is not None:
+            priced += 1
+        for warning in validate_offer(item, require_title=require_title, price_key=price_key):
+            tally[warning.split(":")[0]] += 1
+    if not total:
+        return []
+    threshold = max(1, total // 2)
+    out: list[str] = []
+    if absent_price and priced == 0:
+        out.append(absent_price)
+    out.extend(
+        f"{code}: {hits}/{total} items affected (likely schema drift)"
+        for code, hits in tally.items()
+        if hits >= threshold
+    )
+    return out
 
 
 REVIEW_TEXT_DRIFT_MIN_SAMPLE = 10
@@ -367,20 +726,36 @@ def validate_review_block(block: dict) -> list[str]:
 def attach_meta(result: dict, warnings: list[str], *, source: str) -> dict:
     """Attach a _meta block. Always present (even when healthy) so the agent can
     rely on its existence; warnings list is empty when healthy.
+
+    **What ``healthy`` means, everywhere in this workspace** (audit 2026-11-01:
+    it meant three different things, so the one flag the agent is told to read
+    was worth nothing): ``healthy`` is True only when the parser got a complete
+    answer AND every value in it was trustworthy. Any drift, validation or
+    completeness warning makes it False — including a warning the connector
+    adds by hand to a response model instead of going through this helper. A
+    connector must therefore never hardcode ``healthy=True`` next to a
+    non-empty ``warnings`` list.
+
+    Informational notes are not health: a warning whose text starts with
+    ``info:`` is a note about context the caller may want (which region was
+    used), never a doubt about the data, and it does not flip the flag. Every
+    other warning is a doubt about the data or about the parser, and does.
     """
+    data = health_warnings(warnings)
     result["_meta"] = {
         "source": source,
-        "healthy": not warnings,
+        "healthy": not data,
         "warnings": warnings,
     }
     return result
 
 
 # --------------------------------------------------------------------------
-# Structural drift detection for golden-fixture self-checks.
-# Compares the SHAPE (key sets / widget-name prefixes) of a live payload to a
-# frozen baseline, ignoring volatile values. Catches "webPrice widget vanished"
-# or "new required key appeared" before it silently breaks a parser.
+# Structural drift detection for golden-fixture self-checks and for the
+# runtime data path (shape_drift_warning). Compares the SHAPE (key sets /
+# widget-name prefixes) of a live payload to a frozen baseline, ignoring
+# volatile values. Catches "webPrice widget vanished" or "new required key
+# appeared" before it silently breaks a parser.
 # --------------------------------------------------------------------------
 
 
@@ -463,6 +838,72 @@ def diff_keys(expected: Iterable[str], actual: Iterable[str]) -> dict[str, list[
         "missing": sorted(exp - act),
         "added": sorted(act - exp),
     }
+
+
+def _emptied_container(path: str, entries: set[str]) -> bool:
+    """True when the path descends into a NESTED array that is empty everywhere.
+
+    The walker writes an empty list as ``<array path>:empty_array`` at the
+    array's own path (``products[].sizes:empty_array``), so the elements a
+    member below it looks for (``products[].sizes[].price``) do not exist:
+    the container being empty is a data fact — a page of delisted products —
+    not a key that vanished. It stays narrow on purpose:
+    - the top-level envelope (the first ``[]``) never counts: a zero-item
+      payload is the call site's business, and an empty sibling envelope
+      (``items: []`` next to a filled ``goods[]``) must not hide drift there;
+    - the signature merges elements, so ``:empty_array`` next to any
+      ``<container>[]`` entry means some elements are filled: a page mixing
+      delisted products and sizes that lost the key still warns;
+    - an ``:empty_object`` element is not an empty container.
+    """
+    start = path.find("[]", path.find("[]") + 2) if "[]" in path else -1
+    while start != -1:
+        container = path[:start]
+        if f"{container}:empty_array" in entries and not any(e.startswith(f"{container}[]") for e in entries):
+            return True
+        start = path.find("[]", start + 2)
+    return False
+
+
+def shape_drift_warning(
+    payload: Any,
+    required_families: Iterable[Iterable[str]],
+    *,
+    source: str,
+) -> str | None:
+    """One compact warning when a live payload lost a required key family.
+
+    The runtime companion to the selfcheck's structural comparison: the
+    tool's own response carries ``shape_drift: <source>: missing <family>``
+    in its meta warnings when a parser-critical family of keys vanished, so
+    the agent sees drift without a human running ``doctor``.
+    ``required_families`` is the connector's registry of alias families
+    (a flat required-key list is a list of one-member families); a rename
+    WITHIN a family is tolerated, the loss of every member is drift. A
+    family member is PRESENT regardless of its type — ``price:null`` is a
+    page without a price, not a page that lost its price field. A member
+    below an array the payload shows as empty (``sizes: []``) is present
+    too: with no elements there is no key to lose (``_emptied_container``).
+
+    Comparison only, so the normal data path stays cheap: no fetch, no
+    validation, no state. A payload whose families all survive costs one
+    bounded signature walk and returns None; the first missing family is
+    named and the rest of the walk stops there.
+    """
+    entries = set(shape_signature(payload))
+    for family in required_families:
+        paths = tuple(family)
+        # A member counts when a signature entry EXTENDS one of its paths:
+        # entries continue a path with ':type', a '[...] array segment or a
+        # '.nested' key, so an entry like 'items[].id:int' or
+        # 'items[].price_texts.attached[]:str' matches, while 'identifier'
+        # does not extend 'id'.
+        present = any(
+            entry.startswith(f"{path}{sep}") for path in paths for entry in entries for sep in (":", "[", ".")
+        ) or any(_emptied_container(path, entries) for path in paths)
+        if not present:
+            return f"shape_drift: {source}: missing {'/'.join(paths)}"
+    return None
 
 
 # --------------------------------------------------------------------------

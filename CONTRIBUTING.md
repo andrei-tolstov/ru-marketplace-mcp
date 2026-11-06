@@ -30,11 +30,29 @@ uv run mypy --platform win32
 uv run pytest -q -m "not live and not cdp"
 uv run python scripts/check_no_print.py
 uv run python scripts/check_test_count.py
+uv run python scripts/gen_tools_doc.py --check
 uv run python scripts/check_provenance.py
 uv run python scripts/check_versions.py
+uv run python scripts/check_lock_revision.py
 uv run python scripts/mcp_wire.py compare-mcp decision-mcp marketplace-mcp \
   --baseline work/performance/wire-baseline.json --max-token-regression-percent 10
 ```
+
+Гейт следит за двумя величинами: `wire_tokens` — весь `tools/list`, как его
+несёт провод, — и `model_tokens`, то есть то, что запрос к провайдеру реально
+отдаёт модели (`name`, `description`, `input_schema`); `outputSchema` и
+аннотации остаются в клиенте, поэтому рост описания за счёт сжатия схемы
+вывода гейт больше не пропускает.
+
+Перелокить `uv.lock` нужно uv не старше 0.13.6:
+`uvx --from uv==0.13.6 uv lock`. Старый uv (0.11.x) пишет в лок-файл
+`revision = 3`, а образы собираются на uv 0.13.6 — такой лок-файл не тот, из
+которого собираются образы. `scripts/check_lock_revision.py` ловит это в CI.
+
+Версию релиза поднимает `uv run python scripts/bump_version.py NEW`: он меняет
+все объявления из общей таблицы `scripts/version_sites.py` — ровно те, которые
+потом проверяет `check_versions.py`, — и сразу запускает эту проверку.
+`--dry-run` печатает `файл:строка старое -> новое` и ничего не пишет.
 
 CI прогоняет то же самое на Ubuntu, Windows и macOS против Python 3.12 и 3.13.
 
@@ -153,11 +171,30 @@ uv run mypy --platform win32
 uv run pytest -q -m "not live and not cdp"
 uv run python scripts/check_no_print.py
 uv run python scripts/check_test_count.py
+uv run python scripts/gen_tools_doc.py --check
 uv run python scripts/check_provenance.py
 uv run python scripts/check_versions.py
+uv run python scripts/check_lock_revision.py
 uv run python scripts/mcp_wire.py compare-mcp decision-mcp marketplace-mcp \
   --baseline work/performance/wire-baseline.json --max-token-regression-percent 10
 ```
+
+The gate watches two measures: `wire_tokens`, the whole `tools/list` as the wire
+carries it, and `model_tokens`, what a provider request actually sends the model
+(`name`, `description`, `input_schema`); `outputSchema` and annotations stay in
+the client, so a description growing behind a shrinking output schema no longer
+passes.
+
+Relocking `uv.lock` needs uv 0.13.6 or newer:
+`uvx --from uv==0.13.6 uv lock`. An older uv (0.11.x) writes `revision = 3`
+into the lockfile, while the images build with uv 0.13.6 — so the committed
+lockfile would not be the one the images are built from.
+`scripts/check_lock_revision.py` catches that in CI.
+
+Bump a release version with `uv run python scripts/bump_version.py NEW`. It
+rewrites every declaration from the one table in `scripts/version_sites.py` —
+exactly the set `check_versions.py` checks — and then runs that check.
+`--dry-run` prints `file:line old -> new` and writes nothing.
 
 CI runs the tests on Ubuntu, Windows and macOS against Python 3.12 and 3.13; lint,
 types and the no-print and version checks run once, on Ubuntu — mypy covers the other

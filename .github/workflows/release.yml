@@ -3,14 +3,20 @@ name: Release
 # Fires when a version tag is pushed (e.g. v1.1.0). Builds a wheel and sdist for
 # every workspace package and attaches them to the GitHub Release for that tag.
 #
-# Deliberately NOT publishing to PyPI: the distribution names (wb-connector and
-# friends) are too generic and undecided, so the packages are not on PyPI yet
-# (see docs/RELEASE_CHECKLIST.md). This job only builds and attaches artifacts.
+# This workflow only builds and attaches the 16 workspace distributions.
+# The additional single PyPI bundle is handled by pypi-publish.yml, disabled
+# until the owner registers its trusted publisher (docs/DEPLOYMENT.md).
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+
+# One run per tag: a tag push and a manual dispatch for the same ref queue
+# instead of publishing side by side (pre-release audit, 2026-10-30).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write # required to create/update the GitHub Release and upload assets
@@ -20,13 +26,15 @@ jobs:
     name: Build packages and publish GitHub Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
-          enable-cache: true
-          cache-dependency-glob: "**/pyproject.toml"
+          # A publishing job builds from a clean resolver, never a restored cache.
+          enable-cache: false
 
       - name: Set up Python
         run: uv python install 3.12
@@ -71,7 +79,7 @@ jobs:
           PY
 
       - name: Attach artifacts to the GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           # Two explicit globs, not dist/*: uv writes a one-byte ".gitignore"
           # into its output directory, and a bare wildcard uploads it as a

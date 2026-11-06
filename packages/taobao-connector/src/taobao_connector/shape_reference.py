@@ -6,14 +6,20 @@ recorded alongside) by running the real extractor over it and fingerprinting
 the payload with ``mcp_core.resilience.shape_signature``. Re-measured
 2026-09-10 (login-wall triage) after the extractor gained the structural
 wall-marker fields (``anchors_total`` / ``login_anchors`` / ``body_snippet``)
-by re-running the same extractor over the same committed capture. Two
-consumers:
+by re-running the same extractor over the same committed capture. Re-measured
+2026-10-30 after the extractor gained the loading marker (``grid_loading``),
+by the same route. Two consumers:
 
 * ``taobao_selfcheck`` compares a live payload against
   ``SEARCH_REQUIRED_FAMILIES`` and reports drift with paths when a
   parser-critical family of keys vanishes;
 * ``tests/test_shape_reference.py`` asserts the reference still agrees with
   the live fixture, so the registry cannot go stale silently.
+
+The family check runs on the EXTRACTOR's own output, where every key is emitted
+on every tile (2026-11-01 audit): a page that changed shape reaches the agent
+as empty values, which ``validate_items`` reports as ``no_prices_on_page`` /
+``title_missing``, while a vanished key means the extractor stopped emitting it.
 
 Never edit by hand: regenerate by re-running the extractor over a fresh
 captured page and replacing the fingerprint.
@@ -26,6 +32,7 @@ from collections.abc import Iterable
 SEARCH_SHAPE_REFERENCE: tuple[str, ...] = (
     "anchors_total:int",
     "body_snippet:str",
+    "grid_loading:bool",
     "items[].item_id:str",
     "items[].location:str",
     "items[].price_texts.attached[]:str",
@@ -60,6 +67,11 @@ SEARCH_REQUIRED_FAMILIES: tuple[tuple[str, ...], ...] = (
     ("anchors_total",),
     ("login_anchors",),
     ("body_snippet",),
+    # The loading marker (2026-10-30): the browser read and the tool verdict
+    # both branch on it. If the extractor stopped emitting it, a rendering grid
+    # would silently go back to reading as parser_drift — the exact confusion
+    # this field exists to remove. Losing it must be loud.
+    ("grid_loading",),
 )
 
 

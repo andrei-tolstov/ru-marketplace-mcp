@@ -26,16 +26,21 @@ comparison runs with whatever is present.
 NEVER write to stdout in a stdio MCP server — it corrupts JSON-RPC.
 """
 # START_MODULE_CONTRACT
-# PURPOSE: Compare marketplace offers and verify shortlisted source-native cards.
-# SCOPE: Read-only concurrent sources; partial outcomes; RUB ranking and identity evidence.
+# PURPOSE: Compare marketplace offers and verify shortlisted source-native cards (R-COMPARE-FOREIGN-DETAIL).
+# SCOPE: Read-only sources; everyday RUB ranking; Unicode relevance with bounded bundle-prefix modifiers/suffix phrases and direct negation; identity.
+# REQUIREMENTS: R-COMPARE-CONDITIONAL-PRICE; R-COMPARE-VARIANT-IDENTITY; R-COMPARE-RELEVANCE-BOUNDARIES; R-COMPARE-BUNDLE-NOUN-PHRASES; R-NO-FABRICATION.
 # DEPENDS: FastMCP; mcp_core runtime/source_selection; identity; models_output; vision_policy; source servers.
 # LINKS: M-COMPARE; M-WB; M-YANDEX; M-DETMIR; M-OZON; M-AVITO; M-TAOBAO; M-MEGAMARKET; M-LAMODA; M-DNS; M-CITILINK; M-ALIEXPRESS; M-MARKETPLACE.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
 # _available_sources: Import connectors defensively and report missing installations.
 # _dedupe: Merge duplicate offers while preserving source identity.
+# _has_bundle_phrase_prefix: Recognize up to three local modifiers between an explicit bundle cue and this accessory.
+# _has_bundle_phrase_suffix: Recognize bounded lexical noun/modifier tails without crossing accessory clauses.
+# _has_unrequested_marker: Match Unicode words/phrases after occurrence-local bundle/negation checks.
+# _looks_like_an_accessory/_looks_like_another_condition: Share relevance rules for warnings and comparability.
 # OfferBatch: Carry normalized offers plus source warnings and health evidence.
-# _run_source: Bound each source query and preserve structured partial failures.
+# _run_source: Bound each source query; report native price counts and structured partial failures.
 # _call_card_tool: Dispatch validated source-native card arguments.
 # compare_prices: Rank eligible RUB offers with per-source completeness and warnings.
 # compare_verify_offer: Re-read a card and compare price, identity and stock evidence.
@@ -47,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import importlib
 import json
 import math
 import os
@@ -65,11 +71,26 @@ from mcp_core.errors import BadRequestError, ConnectorError, ErrorCode, NotFound
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.redact import redact_error_text as _redact
-from mcp_core.runtime import browser_handoff_lifespan, current_mcp_session_id
+from mcp_core.resources import register_reference_resources
+from mcp_core.runtime import browser_handoff_lifespan, current_client_scope
 from mcp_core.source_selection import selected
+
+# Which sources compare searches, which card tool it verifies them with and
+# which of them quote a foreign currency all come from the source registry.
+# SEARCHABLE below is the one per-source list compare still spells out, because
+# an existing test parses that literal; a parity test keeps it equal to the
+# registry's text-search sources.
+from mcp_core.sources import BY_NAME, CARD_TOOL_NAMES, COMPARE_SOURCES, FOREIGN_CURRENCY_SOURCES
 from pydantic import Field
 
-from compare_connector.identity import ProductIdentity, identity_from_mapping, match_product_identity
+from compare_connector.identity import (
+    ProductIdentity,
+    extract_size_tokens,
+    format_size_tokens,
+    identity_from_mapping,
+    match_product_identity,
+    sizes_conflict,
+)
 from compare_connector.models_output import (
     CompareResponse,
     MarketOffer,
@@ -77,29 +98,31 @@ from compare_connector.models_output import (
 )
 from compare_connector.vision_policy import client_vision_hint, resolve_image_delivery
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 # Per-source ceiling. Yandex pages are ~2 MB and WB search occasionally stalls, so
 # a slow source must not hold the whole comparison hostage.
 SOURCE_TIMEOUT_S = float(os.environ.get("COMPARE_SOURCE_TIMEOUT", "45"))
 
-mcp = FastMCP(name="compare-connector", version=SERVER_VERSION, lifespan=browser_handoff_lifespan)
+# How many native diagnostics one source may contribute to a comparison. The
+# list stays bounded, and a bounded list that had to be cut says how many
+# diagnostics it suppressed (mcp_core.bound_warnings).
+SOURCE_WARNING_LIMIT = 10
 
-_CARD_TOOL_NAMES = {
-    "wildberries": "wb_card",
-    "yandex_market": "yandex_card",
-    "detsky_mir": "detmir_card",
-    "ozon": "ozon_card",
-    "avito": "avito_card",
-    "taobao": "taobao_card",
-    "megamarket": "megamarket_card",
-    "lamoda": "lamoda_card",
-    "dns": "dns_card",
-    "citilink": "citilink_card",
-    "aliexpress": "aliexpress_card",
-    "drom": "drom_card",
-}
+mcp = FastMCP(
+    name="compare-connector",
+    version=SERVER_VERSION,
+    lifespan=browser_handoff_lifespan,
+    instructions=(
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
+    ),
+)
+
+# Source -> card tool, from the source registry: a source takes part in
+# comparison exactly when it exposes a card tool compare can call. The private
+# name stays because the card dispatch and the tests read it.
+_CARD_TOOL_NAMES = CARD_TOOL_NAMES
 
 
 def _available_sources() -> dict[str, Any]:
@@ -107,92 +130,16 @@ def _available_sources() -> dict[str, Any]:
 
     A missing optional dependency (Ozon's curl_cffi/Playwright) or a broken
     install reduces coverage; it must not prevent the server from starting.
+    The list is the registry's comparison sources, so an adapter cannot exist
+    for a source the registry does not know, or the reverse.
     """
     sources: dict[str, Any] = {}
 
-    try:
-        from wb_connector import server as wb_server
-
-        sources["wildberries"] = wb_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="wildberries", error=_redact(str(exc))[:120])
-
-    try:
-        from yandex_connector import server as yandex_server
-
-        sources["yandex_market"] = yandex_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="yandex_market", error=_redact(str(exc))[:120])
-
-    try:
-        from detmir_connector import server as detmir_server
-
-        sources["detsky_mir"] = detmir_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="detsky_mir", error=_redact(str(exc))[:120])
-
-    try:
-        from ozon_connector import server as ozon_server
-
-        sources["ozon"] = ozon_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="ozon", error=_redact(str(exc))[:120])
-
-    try:
-        from avito_connector import server as avito_server
-
-        sources["avito"] = avito_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="avito", error=_redact(str(exc))[:120])
-
-    try:
-        from taobao_connector import server as taobao_server
-
-        sources["taobao"] = taobao_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="taobao", error=_redact(str(exc))[:120])
-
-    try:
-        from megamarket_connector import server as megamarket_server
-
-        sources["megamarket"] = megamarket_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="megamarket", error=_redact(str(exc))[:120])
-
-    try:
-        from lamoda_connector import server as lamoda_server
-
-        sources["lamoda"] = lamoda_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="lamoda", error=_redact(str(exc))[:120])
-
-    try:
-        from dns_connector import server as dns_server
-
-        sources["dns"] = dns_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="dns", error=_redact(str(exc))[:120])
-
-    try:
-        from citilink_connector import server as citilink_server
-
-        sources["citilink"] = citilink_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="citilink", error=_redact(str(exc))[:120])
-
-    try:
-        from aliexpress_connector import server as aliexpress_server
-
-        sources["aliexpress"] = aliexpress_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="aliexpress", error=_redact(str(exc))[:120])
-
-    try:
-        from drom_connector import server as drom_server
-
-        sources["drom"] = drom_server
-    except Exception as exc:
-        log_event("compare.source_unavailable", source="drom", error=_redact(str(exc))[:120])
+    for name in COMPARE_SOURCES:
+        try:
+            sources[name] = importlib.import_module(BY_NAME[name].module)
+        except Exception as exc:
+            log_event("compare.source_unavailable", source=name, error=_redact(str(exc))[:120])
 
     chosen = selected()
     if chosen is not None:
@@ -222,12 +169,6 @@ SEARCHABLE = (
     "drom",
 )
 
-# Yuan sources rank separately from ruble ones: a baked-in CNY→RUB rate would go
-# silently stale, and ranking a stale conversion against live ruble prices
-# fabricates bargains. Taobao offers are reported with currency="cny" and are
-# excluded from the cheapest-rub ranking.
-FOREIGN_CURRENCY_SOURCES = ("taobao",)
-
 
 def _dedupe(offers: Iterable[MarketOffer]) -> list[MarketOffer]:
     """Drop repeats of the same listing, retaining explicitly distinct variants.
@@ -256,6 +197,7 @@ def _dedupe(offers: Iterable[MarketOffer]) -> list[MarketOffer]:
     return out
 
 
+# START_BLOCK_RELEVANCE_POLICY
 # Words that mark a listing as something you buy *for* a product rather than
 # the product itself. A search for "iphone 15" matches a case, a screen
 # protector and a cable, all of them cheaper than the phone, and whichever is
@@ -313,35 +255,159 @@ _CONDITION_MARKERS = (
 )
 
 
-def _looks_like_another_condition(title: str, query: str) -> bool:
-    """Whether a title advertises a used, refurbished or display unit.
+def _marker_pattern(markers: tuple[str, ...]) -> re.Pattern[str]:
+    """Unicode word boundaries and flexible whitespace inside marker phrases."""
+    phrases = [
+        r"\s+".join(re.escape(word) for word in marker.split()) for marker in sorted(markers, key=len, reverse=True)
+    ]
+    return re.compile(r"(?<!\w)(?:" + "|".join(phrases) + r")(?!\w)", re.IGNORECASE)
 
-    A query that asks for one of these is answered correctly by them, so a
-    marker present in the query itself never counts.
+
+_NEGATION_PREFIX = re.compile(r"(?<!\w)(?:не|not)\s+$", re.IGNORECASE)
+_BUNDLE_PREFIX = re.compile(r"(?<!\w)(?:в\s+комплекте|with(?:\s+(?:a|an))?)\s*[:—-]?\s*$", re.IGNORECASE)
+_BUNDLE_SUFFIX = re.compile(r"\s*(?:[:—-]\s*)?в\s+комплекте(?!\w)", re.IGNORECASE)
+
+# Complete an adjective-only accessory head or a known functional noun phrase.
+# These are lexical categories, not product-title or query exceptions.
+_BUNDLE_NOUN_COMPLEMENTS = {
+    "зарядное": ("устройство", "приспособление"),
+    "кабель": ("питания",),
+    "адаптер": ("питания",),
+}
+_BUNDLE_PHRASE_WORD = re.compile(r"[^\S\r\n]+(?P<word>\w+(?:-\w+)*)(?![\w-])")
+_BUNDLE_PHRASE_PREFIX_WORD = re.compile(r"(?<![\w-])(?P<word>\w+(?:-\w+)*)[^\S\r\n]+\Z")
+_BUNDLE_MODIFIER = re.compile(
+    r"(?:(?:силиконов|кожан|пластиков|резинов|металлическ|нейлонов|тканев|"
+    r"прозрачн|защитн|сетев|беспроводн|оригинальн|универсальн|компактн|"
+    r"магнитн|черн|чёрн|бел|красн|син|зелён|зелен|сер)"
+    r"(?:ый|ий|ой|ая|яя|ое|ее|ые|ие)|"
+    r"usb(?:-[abc])?|type-[abc]|micro-usb|hdmi|lightning|displayport|thunderbolt|"
+    r"silicone|leather|plastic|rubber|metal|nylon|transparent|protective|"
+    r"wireless|original|universal|compact|magnetic|black|white|red|blue|green|grey)",
+    re.IGNORECASE,
+)
+
+
+def _has_bundle_phrase_prefix(text: str, match: re.Match[str], pattern: re.Pattern[str]) -> bool:
+    """R-COMPARE-BUNDLE-NOUN-PHRASES: admit at most three preceding modifiers.
+
+    Walk backwards from this accessory only through adjacent recognized words,
+    then require the original explicit bundle cue. Unknown words, punctuation,
+    relation words and another accessory cannot connect it to an earlier cue.
     """
-    low_title = title.lower()
-    low_query = query.lower()
-    return any(m in low_title and m not in low_query for m in _CONDITION_MARKERS)
+    position = match.start()
+    for _ in range(3):
+        word_match = _BUNDLE_PHRASE_PREFIX_WORD.search(text, 0, position)
+        if word_match is None or pattern.match(text, word_match.start("word")):
+            return False
+        if not _BUNDLE_MODIFIER.fullmatch(word_match.group("word")):
+            return False
+        position = word_match.start("word")
+        if _BUNDLE_PREFIX.search(text, 0, position):
+            return True
+    return False
+
+
+def _has_bundle_phrase_suffix(text: str, match: re.Match[str], pattern: re.Pattern[str]) -> bool:
+    """R-COMPARE-BUNDLE-NOUN-PHRASES: admit at most three known phrase words.
+
+    A noun complement belongs to its accessory head and can occur only once.
+    Unknown words, punctuation, relation words and another accessory stop the
+    extension; they must not borrow a later clause's 'в комплекте'.
+    """
+    position = match.end()
+    noun_complements = _BUNDLE_NOUN_COMPLEMENTS.get(match.group().casefold(), ())
+    for _ in range(3):
+        word_match = _BUNDLE_PHRASE_WORD.match(text, position)
+        if word_match is None or pattern.match(text, word_match.start("word")):
+            return False
+        word = word_match.group("word").casefold()
+        if word in noun_complements:
+            noun_complements = ()
+        elif not _BUNDLE_MODIFIER.fullmatch(word):
+            return False
+        position = word_match.end()
+        if _BUNDLE_SUFFIX.match(text, position):
+            return True
+    return False
+
+
+def _positive_marker_text(text: str, pattern: re.Pattern[str], *, bundles: bool) -> str:
+    """Mask only explicitly negated or locally bundled marker occurrences.
+
+    Longer phrases match first, so a bundled 'защитное стекло' also masks its
+    nested 'стекло'. Another positive marker in the same title stays evidence.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        negated = _NEGATION_PREFIX.search(text, 0, match.start())
+        bundled = bundles and (
+            _BUNDLE_PREFIX.search(text, 0, match.start())
+            or _has_bundle_phrase_prefix(text, match, pattern)
+            or _BUNDLE_SUFFIX.match(text, match.end())
+            or _has_bundle_phrase_suffix(text, match, pattern)
+        )
+        return " " * len(match.group()) if negated or bundled else match.group()
+
+    return pattern.sub(replace, text)
+
+
+# START_CONTRACT: _has_unrequested_marker
+# PURPOSE: R-COMPARE-RELEVANCE-BOUNDARIES; R-COMPARE-BUNDLE-NOUN-PHRASES: detect positive unrequested markers.
+# INPUTS: Untrusted title/query, fixed markers; accessory bundles admit up to three known prefix modifiers or suffix noun/modifier words.
+# OUTPUTS: True only when an unmasked title marker is absent from the equally checked query.
+# SIDE_EFFECTS: None; no source I/O, title exceptions or ranking mutations.
+def _has_unrequested_marker(title: str, query: str, markers: tuple[str, ...], *, bundles: bool = False) -> bool:
+    pattern = _marker_pattern(markers)
+    title = _positive_marker_text(title, pattern, bundles=bundles)
+    query = _positive_marker_text(query, pattern, bundles=bundles)
+    for marker in markers:
+        word_pattern = _marker_pattern((marker,))
+        if word_pattern.search(title) and not word_pattern.search(query):
+            return True
+    return False
+
+
+# END_CONTRACT: _has_unrequested_marker
+
+
+def _looks_like_another_condition(title: str, query: str) -> bool:
+    """Detect an unrequested used/refurbished/display condition on word boundaries.
+
+    Direct 'не'/'not' negation is not condition evidence, including in a query:
+    asking for 'не б/у' must not make a genuinely used listing comparable.
+    """
+    return _has_unrequested_marker(title, query, _CONDITION_MARKERS)
 
 
 def _looks_like_an_accessory(title: str, query: str) -> bool:
-    """Whether a title reads as an accessory the query did not ask for.
+    """Detect an unrequested accessory, not a substring or an explicit bundle.
 
-    Asking for a case and getting cases is correct, so a marker present in the
-    query itself never counts.
+    'with [a/an] <accessory>', 'в комплекте: <accessory>' and '<accessory> в
+    комплекте' describe a bundled accessory, not the listing itself. Up to three
+    known modifiers may follow a bundle prefix; up to three known noun complements
+    and modifiers may precede the bundle suffix. The extensions stop at punctuation,
+    unknown words and other accessories; direct cue separators remain allowed.
+    These rules also apply to queries, without exempting whole titles or treating
+    a bundled accessory as a standalone-accessory request.
     """
-    low_title = title.lower()
-    low_query = query.lower()
-    return any(m in low_title and m not in low_query for m in _ACCESSORY_MARKERS)
+    return _has_unrequested_marker(title, query, _ACCESSORY_MARKERS, bundles=True)
+
+
+def _size_mismatch_warning(count: int, stated: Iterable[frozenset[str]], asked: frozenset[str]) -> str:
+    """One warning per call, not per offer: every warning costs the agent tokens."""
+    verb = "offer states" if count == 1 else "offers state"
+    sizes = format_size_tokens({size for group in stated for size in group})
+    return f"identity_mismatch: {count} {verb} {sizes}, query asks {format_size_tokens(asked)}; not comparable"
 
 
 def _relevance_warnings(query: str, priced: list[MarketOffer]) -> list[str]:
     """Flag a cheapest offer that probably answers a different question.
 
-    Deliberately warnings, never filtering. Dropping a row on a heuristic would
-    hide a real bargain, and no threshold tuned without live data deserves that
-    power. Saying "this looks like an accessory, check it" costs the caller
-    nothing and is the difference between a wrong answer and a checked one.
+    Warnings never remove an offer or change raw cheapest. The same bounded
+    accessory/condition checks steer cheapest_comparable; an explicit bundle or
+    negation is not positive evidence. The median check only warns, because an
+    uncalibrated price threshold must never hide a real bargain.
     """
     if not priced:
         return []
@@ -376,15 +442,34 @@ def _relevance_warnings(query: str, priced: list[MarketOffer]) -> list[str]:
     return warnings
 
 
+# END_BLOCK_RELEVANCE_POLICY
+
+
+# START_BLOCK_PRICE_POLICY
 def _ranks_in_rubles(offer: MarketOffer) -> bool:
     """Whether an offer may enter the cheapest-in-rubles ranking.
 
-    Both halves matter. price_rub is None for anything unpriced, and the
-    currency check stops a future adapter from filling price_rub with a figure
-    that is not roubles — the failure mode where a ¥300 listing is announced as
-    the cheapest option against ₽-priced rivals.
+    R-COMPARE-CONDITIONAL-PRICE: an explicitly conditional price never ranks,
+    even if an adapter fills price_rub with it. Unmarked source prices retain
+    their existing treatment; no missing price or foreign currency may rank.
     """
-    return offer.price_rub is not None and offer.currency == "rub"
+    return offer.price_rub is not None and offer.currency == "rub" and offer.price_kind in (None, "", "regular")
+
+
+def _conditional_price_warning(source: str, product_id: str, price: float, kind: str, currency: str = "rub") -> str:
+    """Name the excluded amount, not the offer whose everyday price may still rank."""
+    condition = kind
+    if kind == "wallet":
+        condition = "WB Wallet"
+    elif kind == "subscription":
+        condition = "Yandex Plus subscription" if source == "yandex_market" else "paid subscription"
+    return (
+        f"conditional_price: {source}/{product_id or '?'}: {price:g} {currency.upper()} "
+        f"requires {condition}; not ranked"
+    )
+
+
+# END_BLOCK_PRICE_POLICY
 
 
 def _wb_product_url(nm_id: object) -> str:
@@ -415,27 +500,16 @@ def _as_price(value: object) -> float | None:
 def _as_count(value: object) -> int | None:
     """Coerce a rating/review count, tolerating "24 086 отзывов"-style text.
 
-    Parity with mcp_core.coerce_int where the formats overlap: non-finite
-    floats (json.loads admits NaN/Infinity by default) degrade to None instead
-    of letting int() raise and abort the whole tool, and a signed string is
-    ambiguous — dropping the sign would fabricate a plausible-but-wrong count.
-    The sign guard covers the unicode minus (U+2212) and the en/em dashes
-    (U+2013/U+2014) a marketplace renders ranges with: ASCII-only [-+] let a
-    range like '1 000–2 000' digit-concatenate into 10002000. Letters stay
-    tolerated (they are the 'отзывов' label, not ambiguity).
+    Delegates to the shared ``mcp_core.coerce_count`` — the one place that
+    knows how a marketplace writes a counter. A private duplicate lived here
+    and glued every digit of the display text together, so "1.2K отзывов"
+    became the plausible-but-wrong 12 and the comparison stayed healthy
+    (R05). The shared helper splits the known review label off and then parses
+    the number strictly: a grouped count ("1 200", "24 086 отзывов") parses,
+    while a sign, a range, two numbers or a magnitude form ("1.2K") is None
+    rather than a manufactured count.
     """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value) if math.isfinite(value) else None
-    if not isinstance(value, str):
-        return None
-    if re.search(r"[-+\u2212\u2013\u2014]\s*\d", value):
-        return None
-    digits = re.sub(r"[^\d]", "", value)
-    return int(digits) if digits else None
+    return R.coerce_count(value)
 
 
 def _stock_from_label(value: object) -> bool | None:
@@ -469,25 +543,26 @@ def _stock_from_label(value: object) -> bool | None:
 
 
 class OfferBatch(list[MarketOffer]):
-    """Offers with native diagnostics; no shared state across concurrent sources."""
+    """Offers with native diagnostics; no shared state across concurrent sources.
+
+    ``native_healthy`` keeps the source's own verdict (None when the response
+    carried no meta) so the caller can tell an honest empty answer from one a
+    broken parser produced; ``warnings`` is the normalized diagnostic list.
+    """
 
     def __init__(self, offers: Iterable[MarketOffer], response: object) -> None:
         super().__init__(offers)
         meta = getattr(response, "meta", None)
         raw = meta.get("warnings", []) if isinstance(meta, dict) else getattr(meta, "warnings", [])
         healthy = meta.get("healthy") if isinstance(meta, dict) else getattr(meta, "healthy", None)
+        self.native_healthy: bool | None = healthy if isinstance(healthy, bool) else None
+        # One shared bound for every caller: the list stays inside its budget,
+        # the entries stay redacted and one line long, and a list that had to
+        # be cut says so (R18). A diagnostic that explains an unhealthy
+        # answer is never dropped behind an `info:` note.
         self.warnings: list[str] = []
         if isinstance(raw, list):
-            for warning in raw:
-                if not isinstance(warning, str) or not warning.strip():
-                    continue
-                text = " ".join(_redact(warning).split())
-                if len(text) > 500:
-                    text = text[:497] + "..."
-                if text not in self.warnings:
-                    self.warnings.append(text)
-                if len(self.warnings) == 10:
-                    break
+            self.warnings = R.bound_warnings(raw, limit=SOURCE_WARNING_LIMIT)
         if healthy is False and not self.warnings:
             self.warnings.append("source_unhealthy: native validation did not pass; no diagnostic supplied")
 
@@ -504,6 +579,7 @@ async def _search_wildberries(query: str, limit: int) -> list[MarketOffer]:
     response = await server.wb_search(query=query, page=1)
 
     offers: list[MarketOffer] = []
+    conditional_warnings: list[str] = []
     for item in (getattr(response, "items", None) or [])[:limit]:
         offers.append(
             MarketOffer(
@@ -512,7 +588,10 @@ async def _search_wildberries(query: str, limit: int) -> list[MarketOffer]:
                 title=item.name,
                 brand=item.brand,
                 seller=item.supplier,
-                price_rub=item.price_rub,
+                # A struck price is not an everyday fallback for Wallet-only tiles.
+                price_rub=item.price_rub if item.price_kind in ("", "regular") else None,
+                price_native=item.price_rub,
+                price_kind=item.price_kind or None,
                 rating=item.review_rating,
                 rating_count=item.feedbacks,
                 # WB's legacy bool also uses False for an unreported quantity.
@@ -521,7 +600,13 @@ async def _search_wildberries(query: str, limit: int) -> list[MarketOffer]:
                 url=_wb_product_url(item.nm_id),
             )
         )
-    return OfferBatch(offers, response)
+        if item.wallet_price_rub is not None and item.price_kind != "wallet":
+            conditional_warnings.append(
+                _conditional_price_warning("wildberries", str(item.nm_id or ""), item.wallet_price_rub, "wallet")
+            )
+    batch = OfferBatch(offers, response)
+    batch.warnings.extend(conditional_warnings)
+    return batch
 
 
 async def _search_yandex(query: str, limit: int) -> list[MarketOffer]:
@@ -545,6 +630,10 @@ async def _search_yandex(query: str, limit: int) -> list[MarketOffer]:
                 brand=item.brand,
                 seller=item.seller,
                 price_rub=item.price_rub,
+                price_native=item.price_rub if item.price_rub is not None else item.price_with_plus,
+                price_kind="regular"
+                if item.price_rub is not None
+                else ("subscription" if item.price_with_plus is not None else None),
                 price_with_subscription_rub=item.price_with_plus,
                 rating=item.rating,
                 rating_count=item.rating_count,
@@ -823,6 +912,17 @@ _SEARCH_IMPLS = {
 }
 
 
+def _payload_text(value: Any, limit: int) -> str | None:
+    """Redacted, bounded text from an error payload, or None when absent.
+
+    Payload text may quote upstream content, so it gets the same redaction and
+    bound as the detail line instead of being forwarded verbatim.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    return _redact(value)[:limit]
+
+
 def _source_error(exc: Exception) -> dict[str, Any]:
     """Preserve typed recovery signals before truncating/redacting error detail.
 
@@ -872,11 +972,25 @@ def _source_error(exc: Exception) -> dict[str, Any]:
             if expiry.tzinfo is not None:
                 handoff_expires_at = expiry.astimezone(datetime.UTC).isoformat().replace("+00:00", "Z")
     raw_handoff_id = payload.get("handoff_id")
+    retry_after_s: float | None = None
+    raw_retry_after = payload.get("retry_after_s")
+    if (
+        isinstance(raw_retry_after, (int, float))
+        and not isinstance(raw_retry_after, bool)
+        and math.isfinite(raw_retry_after)
+        and raw_retry_after >= 0
+    ):
+        retry_after_s = float(raw_retry_after)
+    raw_retryable_now = payload.get("retryable_now")
     return {
         "status": status,
         "detail": _redact(str(payload.get("message", str(exc))))[:200],
         "error_code": code.value,
         "retryable": code.retryable,
+        "retry_after_s": retry_after_s,
+        "retryable_now": raw_retryable_now if isinstance(raw_retryable_now, bool) else None,
+        "retry_when": _payload_text(payload.get("retry_when"), 60),
+        "user_action": _payload_text(payload.get("user_action"), 300),
         "requires_user_action": challenge,
         "challenge_type": challenge_type if challenge else None,
         "handoff_expires_at": handoff_expires_at,
@@ -888,9 +1002,12 @@ def _source_error(exc: Exception) -> dict[str, Any]:
     }
 
 
+# START_BLOCK_SOURCE_OUTCOME
 async def _run_source(name: str, query: str, limit: int) -> tuple[SourceOutcome, list[MarketOffer]]:
     """Query one marketplace, converting any failure into a reported outcome.
 
+    R-COMPARE-FOREIGN-DETAIL: foreign-source detail counts native prices and
+    names their currencies with '(not ranked)'; RUB detail and ranking stay unchanged.
     Never raises: a comparison with three of four sources is useful, while an
     exception would discard the three that worked.
     """
@@ -920,12 +1037,45 @@ async def _run_source(name: str, query: str, limit: int) -> tuple[SourceOutcome,
         )
 
     priced = [offer for offer in offers if offer.price_rub is not None]
+    detail = f"{len(offers)} results, {len(priced)} priced"
+    if name in FOREIGN_CURRENCY_SOURCES:
+        native_priced = [offer for offer in offers if offer.price_native is not None]
+        currencies = "/".join(sorted({offer.currency.upper() for offer in native_priced}))
+        unit = f" in {currencies}" if native_priced else ""
+        detail = f"{len(offers)} results, {len(native_priced)} priced{unit} (not ranked)"
+    warnings = offers.warnings if isinstance(offers, OfferBatch) else []
+    native_healthy = offers.native_healthy if isinstance(offers, OfferBatch) else None
+    # A source that contributed NOTHING to a price comparison is only "ok" when
+    # its own answer says the data was fine. A native response that already
+    # reports a drift/validation warning turned a broken parser into an empty
+    # result, and calling that "ok" is what let `complete` claim a comparison
+    # over a source that had silently contributed nothing (audit 2026-11-01).
+    # An honest empty answer (no warnings, healthy) stays ok, as does an
+    # unhealthy answer that still returned usable offers: those offers are
+    # ranked, and the native warning rides along on the outcome.
+    if not offers and native_healthy is False:
+        warnings = [
+            *warnings,
+            "unhealthy_empty: the source answered with zero offers while its own diagnostics "
+            "reported a problem, so this is not an honest no-result",
+        ]
+        return (
+            SourceOutcome(
+                source=name,
+                status="unhealthy",
+                detail=f"{detail} — native validation did not pass",
+                warnings=warnings,
+                offers_returned=0,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            ),
+            offers,
+        )
     return (
         SourceOutcome(
             source=name,
             status="ok",
-            detail=f"{len(offers)} results, {len(priced)} priced",
-            warnings=offers.warnings if isinstance(offers, OfferBatch) else [],
+            detail=detail,
+            warnings=warnings,
             offers_returned=len(offers),
             elapsed_ms=round((time.monotonic() - started) * 1000),
         ),
@@ -933,14 +1083,17 @@ async def _run_source(name: str, query: str, limit: int) -> tuple[SourceOutcome,
     )
 
 
+# END_BLOCK_SOURCE_OUTCOME
+
+
 @mcp.tool(
     name="compare_prices",
     annotations=ToolAnnotations(
         title="Compare Prices Across Russian Marketplaces",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def compare_prices(
@@ -985,21 +1138,12 @@ async def compare_prices(
       there — `complete` tells you which case you are in.
 
     Titles are matched loosely: marketplaces name things differently, so scan the
-    results rather than assuming every row is the identical model.
+    results rather than assuming every row is the identical model. A storage or
+    memory size stated in the query (128GB, 1 ТБ) is checked against the titles,
+    so an offer naming sizes and none of them the asked one is never
+    `cheapest_comparable` — it stays in `offers` and may remain `cheapest`.
 
-    ## Return Format
-
-    CompareResponse: {query, sources_queried, sources_ok, complete,
-    total_offers, cheapest, price_spread_rub, offers, source_outcomes,
-    warnings, server_version}. offers is ranked by everyday price_rub —
-    cheapest first, offers without a rouble price after the ranked ones.
-    warnings carries validation/completeness warnings.
-
-    ## Error Format
-
-    On validation failure, raises ToolError with a JSON message describing the
-    error code and whether it is retryable. Individual source failures do NOT
-    raise — they are reported in `source_outcomes`.
+    Full field list and error codes: `guide://compare/compare_prices`.
     """
     text = (query or "").strip()
     if len(text) < 2:
@@ -1075,11 +1219,21 @@ async def compare_prices(
     failed_sources = [outcome.source for outcome in outcomes if outcome.status != "ok"]
 
     cheapest = priced[0] if priced else None
-    comparable = [
-        offer
-        for offer in priced
-        if not _looks_like_an_accessory(offer.title, text) and not _looks_like_another_condition(offer.title, text)
-    ]
+    # A size the query states and the title contradicts is explicit text, not a
+    # heuristic, so it keeps the offer out of the like-for-like candidate rather
+    # than merely warning about it. The offer keeps its rank and may remain
+    # plain cheapest; only cheapest_comparable skips it.
+    query_sizes = extract_size_tokens(text)
+    comparable: list[MarketOffer] = []
+    size_excluded: list[frozenset[str]] = []
+    for offer in priced:
+        if _looks_like_an_accessory(offer.title, text) or _looks_like_another_condition(offer.title, text):
+            continue
+        title_sizes = extract_size_tokens(offer.title)
+        if sizes_conflict(query_sizes, title_sizes):
+            size_excluded.append(title_sizes)
+            continue
+        comparable.append(offer)
     cheapest_comparable = comparable[0] if comparable else None
     price_spread = None
     if len(priced) >= 2:
@@ -1103,14 +1257,26 @@ async def compare_prices(
             warnings.append("stock_filter: no priced offers were returned")
     for outcome in outcomes:
         warnings.extend(f"source_warning:{outcome.source}: {warning}" for warning in outcome.warnings)
+    # Only an offer left out of the ranking is named here; a Plus amount beside a
+    # ranked everyday price already sits in price_with_subscription_rub, and a
+    # warning per such offer would bill the agent twice for the same number.
+    for offer in offers:
+        kind, native = offer.price_kind, offer.price_native
+        if kind and kind != "regular" and native is not None:
+            warnings.append(_conditional_price_warning(offer.source, offer.product_id, native, kind, offer.currency))
     warnings.extend(_relevance_warnings(text, priced))
+    if size_excluded:
+        warnings.append(_size_mismatch_warning(len(size_excluded), size_excluded, query_sizes))
     if cheapest is not None and cheapest_comparable is not None and cheapest is not cheapest_comparable:
         warnings.append(
-            "comparable_price: the raw cheapest listing is an accessory or different condition; "
-            "cheapest_comparable is the safer like-for-like candidate"
+            "comparable_price: the raw cheapest listing is an accessory, a different condition or a different "
+            "variant; cheapest_comparable is the safer like-for-like candidate"
         )
     elif cheapest is not None and cheapest_comparable is None:
-        warnings.append("comparable_price: every priced listing looks like an accessory or different condition")
+        warnings.append(
+            "comparable_price: every priced listing looks like an accessory, a different condition "
+            "or a different variant"
+        )
     if foreign:
         currencies = ", ".join(sorted({offer.currency for offer in foreign}))
         warnings.append(
@@ -1203,7 +1369,9 @@ async def _call_card_tool(name: str, product_id_or_url: str, *, include_reviews:
             "aliexpress": "item_id_or_url",
         }[name]
         result = await tool(**{argument: product_id_or_url})
-    payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    # by_alias=False keeps the nested card's metadata under "meta", as it has
+    # always been here, now that card models serialize "_meta" by alias.
+    payload = result.model_dump(mode="json", by_alias=False) if hasattr(result, "model_dump") else result
     return payload, requested_numeric_id
 
 
@@ -1211,10 +1379,10 @@ async def _call_card_tool(name: str, product_id_or_url: str, *, include_reviews:
     name="compare_verify_offer",
     annotations=ToolAnnotations(
         title="Verify Compared Offer",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def compare_verify_offer(
@@ -1252,22 +1420,7 @@ async def compare_verify_offer(
     mount. The returned card is source-native and therefore keeps fields the
     comparison intentionally normalises away.
 
-    ## Return Format
-
-    JSON object: `{source, product_id_or_url, card}`. `card` is the native
-    source response, preserving price, availability, seller, and source-specific
-    fields when the marketplace exposes them. `identity_verification`, when
-    requested, carries the observed typed identifiers and a match verdict;
-    absent manufacturer evidence yields unknown, never a title-derived exact match.
-    For Yandex, pass the search row's `variant_id` as `expected_variant_id`:
-    a different or missing card SKU is rejected before computing a price delta.
-    Without it, only the current default card price is checked.
-
-    ## Error Format
-
-    Raises `BadRequestError` when the source is unknown, not installed, or the
-    identifier cannot be validated; native card errors are returned as tool
-    errors with their source-specific taxonomy.
+    Full field list and error codes: `guide://compare/compare_verify_offer`.
     """
     if expected_price_rub is not None and (
         isinstance(expected_price_rub, bool) or not math.isfinite(expected_price_rub) or expected_price_rub < 0
@@ -1302,22 +1455,47 @@ async def compare_verify_offer(
     verification: dict[str, object] | None = None
     if expected_price_rub is not None:
         price_field = "price" if name == "ozon" else "price_rub"
-        observed = R.coerce_price(record.get(price_field))
-        if observed is not None:
-            delta = round(observed - expected_price_rub, 2)
-            verification = {
-                "expected_price_rub": expected_price_rub,
-                "observed_price_rub": observed,
-                "delta_rub": delta,
-                "matches": abs(delta) < 1.0,
-            }
-        else:
+        price_kind = record.get("price_kind")
+        if not isinstance(price_kind, str):
+            price_kind = ""
+        # A Yandex card without an everyday price carries only the subscriber
+        # (Plus) amount: certifying it would confirm a price most buyers cannot
+        # get, so the kind is reported instead of the comparison being made.
+        if (
+            not price_kind
+            and name == "yandex_market"
+            and record.get("price_rub") is None
+            and record.get("price_with_plus") is not None
+        ):
+            price_kind = "subscription"
+        if isinstance(price_kind, str) and price_kind and price_kind != "regular":
+            # A conditional amount (WB Wallet, subscription) is not the everyday
+            # price, so certifying it against expected_price_rub would confirm a
+            # price most buyers cannot get. Report the kind and refuse to compare.
             verification = {
                 "expected_price_rub": expected_price_rub,
                 "observed_price_rub": None,
                 "delta_rub": None,
                 "matches": None,
+                "price_kind": price_kind,
             }
+        else:
+            observed = R.coerce_price(record.get(price_field))
+            if observed is not None:
+                delta = round(observed - expected_price_rub, 2)
+                verification = {
+                    "expected_price_rub": expected_price_rub,
+                    "observed_price_rub": observed,
+                    "delta_rub": delta,
+                    "matches": abs(delta) < 1.0,
+                }
+            else:
+                verification = {
+                    "expected_price_rub": expected_price_rub,
+                    "observed_price_rub": None,
+                    "delta_rub": None,
+                    "matches": None,
+                }
     response = {
         "source": name,
         "product_id_or_url": product_id_or_url,
@@ -1337,10 +1515,10 @@ async def compare_verify_offer(
     name="compare_sources",
     annotations=ToolAnnotations(
         title="List Available Marketplaces",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
 )
 async def compare_sources(ctx: Context | None = None) -> dict[str, Any]:
@@ -1350,17 +1528,7 @@ async def compare_sources(ctx: Context | None = None) -> dict[str, Any]:
     connector isn't installed" from "the marketplace refused us", which need
     completely different fixes.
 
-    ## Return Format
-
-    Plain object: {installed, searchable, not_installed, deselected, notes,
-    source_timeout_s, server_version, server_started_at, process_id}. notes
-    explains per-source access quirks (CDP-only sources, currencies, missing
-    text search).
-
-    ## Error Format
-
-    Never raises ToolError: pure introspection of which connector packages
-    are installed — nothing here touches the network.
+    Full field list and error codes: `guide://compare/compare_sources`.
     """
     log_event("compare_sources.start")
     if ctx is not None:
@@ -1414,8 +1582,12 @@ def _client_capabilities(ctx: Context | None) -> dict[str, Any]:
     if ctx is None:
         return {}
     try:
-        params = getattr(getattr(ctx, "session", None), "client_params", None)
-        capabilities = getattr(params, "capabilities", None)
+        session = getattr(ctx, "session", None)
+        # A 2026-07-28 request declares capabilities without initialize params,
+        # so read the session's own capabilities first.
+        capabilities = getattr(session, "client_capabilities", None)
+        if capabilities is None:
+            capabilities = getattr(getattr(session, "client_params", None), "capabilities", None)
     except Exception:  # pragma: no cover - defensive: transport-specific session objects
         return {}
     if capabilities is None:
@@ -1435,10 +1607,10 @@ def _client_capabilities(ctx: Context | None) -> dict[str, Any]:
     name="compare_browser_snapshot",
     annotations=ToolAnnotations(
         title="View a Retained Marketplace Page",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=False,
+        open_world_hint=True,
     ),
 )
 async def compare_browser_snapshot(
@@ -1473,16 +1645,7 @@ async def compare_browser_snapshot(
     (auto/always/never), and an explicit client vision hint. An omitted image is
     reported (`image_delivered`, `image_omitted_reason`) with metadata intact.
 
-    ## Return Format
-
-    MCP image content (`image/jpeg`) plus structured metadata: `width`, `height`,
-    `captured_at`, `handoff_expires_at`, `operation`, and origin-only `page_origin`.
-
-    ## Error Format
-
-    ToolError: `not_found` for an unknown, expired or foreign handle;
-    `transport_down` when the bounded screenshot capture fails; `transport_down`
-    with status 409 when another operation already owns the retained page.
+    Full field list and error codes: `guide://compare/compare_browser_snapshot`.
     """
     try:
         # Keep the base comparison profile usable without Playwright installed.
@@ -1490,7 +1653,7 @@ async def compare_browser_snapshot(
             from mcp_core.transport.browser_handoff import snapshot_handoff
         except ImportError:
             raise_tool_error(NotFoundError("No retained browser page is available in this session"))
-        snapshot = await snapshot_handoff(scope=current_mcp_session_id(ctx), handoff_id=handoff_id)
+        snapshot = await snapshot_handoff(scope=current_client_scope(ctx), handoff_id=handoff_id)
         image_data = snapshot.pop("image_data")
         delivery = resolve_image_delivery(
             policy=os.environ.get("COMPARE_SNAPSHOT_IMAGES", "auto"),
@@ -1502,7 +1665,7 @@ async def compare_browser_snapshot(
             TextContent(type="text", text=json.dumps(snapshot, ensure_ascii=False))
         ]
         if delivery.deliver:
-            content.append(ImageContent(type="image", data=image_data, mimeType=snapshot["mime_type"]))
+            content.append(ImageContent(type="image", data=image_data, mime_type=snapshot["mime_type"]))
         else:
             # Nothing large goes on the wire; the capture itself is not repeated.
             snapshot.pop("mime_type", None)
@@ -1519,6 +1682,11 @@ async def compare_browser_snapshot(
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)
 
 
 if __name__ == "__main__":

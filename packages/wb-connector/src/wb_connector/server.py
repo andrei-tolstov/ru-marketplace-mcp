@@ -25,25 +25,29 @@ NEVER use print() in stdio MCP — corrupts JSON-RPC. Use ctx.debug/info/error.
 """
 # START_MODULE_CONTRACT
 # PURPOSE: Expose Wildberries catalog, reviews, questions and seller reads.
-# SCOPE: Read-only MCP tools; paced HTTP/CDN access and optional DOM card/search.
-# DEPENDS: FastMCP; httpx; curl_cffi; mcp_core; models_output; settings; dom_transport.
-# LINKS: M-WB; M-COMPARE; M-MARKETPLACE; packages/wb-connector/tests.
+# SCOPE: Read-only MCP tools; paced HTTP/CDN access, optional DOM card/search with API-refusal fallback and transport-aware selfchecks.
+# DEPENDS: FastMCP; httpx; curl_cffi; mcp_core; models_output; settings; dom_transport; shape_reference.
+# LINKS: M-WB; M-KIT; M-COMPARE; M-MARKETPLACE; R-WB-SELFCHECK-DOM; R-WB-DOM-FALLBACK; R-EMPTY-NOT-SUCCESS; packages/wb-connector/tests.
 # END_MODULE_CONTRACT
 # START_MODULE_MAP
 # _safe_get_text: Apply bounded HTTP reads, refusal handling and transport fallback.
+# _dom_fallback_reason: Classify an API refusal worth one rendered-page read.
 # _extract_price_rub: Separate current and basic prices, converting kopecks to rubles.
 # _wb_card_dom: Adapt operator-browser cards into the public response model.
 # _wb_search_dom: Adapt operator-browser search with price semantics and region warnings.
 # _search_via_search_goods: Return legacy products or typed failures, never failed emptiness.
+# _fallback_failure_text: Name a failed fallback by its error code and message, never a raw envelope.
 # wb_card: Read a batch of product cards.
 # wb_root_info: Read root identity, variants and specifications from basket CDN.
 # wb_reviews: Read product review pools with sorting and pagination.
 # wb_questions: Read buyer questions from the questions endpoint.
-# wb_search: Search products with bounded result/page handling.
+# wb_search: Search products with bounded result/page handling,
+#            plus a runtime shape-drift warning when a required key family vanishes.
 # wb_seller: Read seller metadata from static seller endpoints.
 # wb_categories: Read and filter the category menu tree.
 # wb_category_products: Read paginated products for a catalog shard.
-# wb_selfcheck: Probe endpoint/parser health for operators; not an MCP tool.
+# _wb_dom_selfcheck: Classify a one-shot DOM baseline and typed transport errors.
+# wb_selfcheck: Probe configured transport/parser health for operators; not an MCP tool.
 # END_MODULE_MAP
 
 from __future__ import annotations
@@ -55,30 +59,34 @@ import math
 import os
 import re
 import string
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 from urllib.parse import urlsplit
 
 import httpx
 from curl_cffi import requests as curl_requests
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.middleware.error_handling import RetryMiddleware
 from mcp.types import ToolAnnotations
 from mcp_core import resilience as R
 from mcp_core.cache import TTLCache
 from mcp_core.errors import (
     BadRequestError,
     ConnectorError,
+    ErrorCode,
     NotFoundError,
     ParserDriftError,
     RateLimitedError,
     TransportDownError,
     raise_tool_error,
+    raise_tool_error_from,
 )
+from mcp_core.kit import polite_wait
 from mcp_core.logging import log_event
 from mcp_core.output_schema import apply_compact_output_schemas
 from mcp_core.pacing import Pacer
 from mcp_core.redact import redact_error_text as _redact
+from mcp_core.resources import register_reference_resources
+from mcp_core.sources import wb_route
 from mcp_core.transport import get_text_budgeted, proxy_from_env
 from pydantic import Field
 
@@ -101,17 +109,20 @@ from wb_connector.models_output import (
     WbSellerResponse,
 )
 from wb_connector.settings import get_settings
+from wb_connector.shape_reference import SEARCH_REQUIRED_FAMILIES
 
 _settings = get_settings()
 
-SERVER_VERSION = "2.5.3"
+SERVER_VERSION = "2.8.2"
 SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 mcp = FastMCP(
     name="wb-connector",
     version=SERVER_VERSION,
+    instructions=(
+        "Every tool's full field list and error codes are MCP resources (`guide://<source>/<tool>`); all error codes together are `marketplace://errors`."
+    ),
 )
-mcp.add_middleware(RetryMiddleware(max_retries=3, base_delay=1.0))
 
 WB_HEADERS = {
     "User-Agent": (
@@ -127,6 +138,18 @@ WB_TIMEOUT = httpx.Timeout(_settings.timeout, connect=5.0)
 WB_WALL_TIMEOUT = _settings.wall_timeout
 WB_DEFAULT_DEST = _settings.default_dest  # Moscow
 MAX_BODY_BYTES = _settings.max_body_bytes  # 50 MB hard cap (CDN compromise / MITM defense)
+# How many diagnostics one answer may carry. The list stays bounded, and a
+# bounded list that had to be cut says how many diagnostics it suppressed
+# (mcp_core.bound_warnings) instead of looking like the whole truth.
+WARNING_LIMIT = 10
+# The batch ceiling of the WB v4 card endpoint. It is enforced before the
+# request AND advertised in the tool schema, so a client sees the limit
+# instead of learning it from a runtime error.
+MAX_CARD_IDS = 100
+# A WB product id is a positive integer: the schema refuses 0 and negatives
+# before the request, and the server-side check still refuses them (a bool is
+# an int in Python, and only the runtime check can refuse it).
+NmId = Annotated[int, Field(gt=0)]
 _SELFCHECK_NM = 5535522  # DEFENDER filter — golden-fixture baseline SKU
 _SELFCHECK_IMT = 1002173489  # its imt_id (review pool baseline)
 WB_REVIEW_HOSTS = ("feedbacks2.wb.ru", "feedbacks1.wb.ru")
@@ -244,6 +267,19 @@ def _proxy() -> str | None:
     return (_settings.proxy.get_secret_value() or "").strip() or proxy_from_env("WB_PROXY")
 
 
+def effective_route() -> str:
+    """The route wb_search / wb_card take with the loaded settings.
+
+    ``dom`` reads WB through the operator's scraping Chrome, ``api`` uses the
+    public JSON hosts only, and ``api_then_dom`` tries the API first and falls
+    back to the browser when WB refuses this address. The unified server reads
+    this so its source inventory follows the mode the tool will really use
+    (R11) — the settings may come from a .env file, which the environment
+    alone does not show.
+    """
+    return wb_route(_settings.transport, _settings.dom_fallback)
+
+
 def _wb_client() -> httpx.AsyncClient:
     """Build WB's HTTP client.
 
@@ -337,6 +373,58 @@ def _is_edge_wall(text: str | None) -> bool:
     if not text:
         return False
     return "<html" in text[:200].lower()
+
+
+# WB's edge refuses a client outright with these statuses. 498 is WB's own
+# anti-bot code; 429 is deliberately absent because waiting, not a browser,
+# is the fix for a rate limit.
+_WB_API_REFUSAL_STATUSES = frozenset({401, 403, 498})
+
+
+def _dom_fallback_reason(status_code: int, text: str | None) -> str | None:
+    """The refusal worth one DOM read, or None when this is not a fallback case.
+
+    Only an outright refusal counts: a 401/403/498 or the edge's HTML wall page.
+    A 429, a network error, parser drift and a bad request keep their existing
+    error paths. ``WB_DOM_FALLBACK=0`` disables the fallback entirely.
+    """
+    if not _settings.dom_fallback:
+        return None
+    if status_code in _WB_API_REFUSAL_STATUSES:
+        return f"HTTP {status_code}"
+    if status_code != 429 and _is_edge_wall(text):
+        return f"HTML wall, HTTP {status_code}"
+    return None
+
+
+def _dom_fallback_warning(reason: str) -> str:
+    # The page carries no dest: prices and delivery follow the Chrome profile's
+    # WB region, even for the default dest (audit S2-F3).
+    return (
+        f"dom_fallback: WB API refused this address ({reason}); read through the scraping Chrome, "
+        "in the WB region set in that browser rather than dest"
+    )
+
+
+def _raise_dom_failure_after_refusal(exc: Exception, reason: str) -> NoReturn:
+    """Re-raise the DOM path's own error, naming the API refusal that preceded it.
+
+    A browser or driver failure (Playwright raises its own errors, not
+    ToolError) becomes the same transport_down the tool's outer handler would
+    report, so the operator still learns why Chrome was involved at all.
+    """
+    if not isinstance(exc, ToolError):
+        driver_error = TransportDownError(_redact(str(exc)), provider="wb").to_dict()
+        driver_error["message"] += f" (WB API refused this address ({reason}) first)"
+        raise ToolError(json.dumps(driver_error, ensure_ascii=False)) from exc
+    try:
+        payload = json.loads(str(exc))
+    except json.JSONDecodeError:
+        raise exc from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("message"), str):
+        raise exc from None
+    payload["message"] += f" (WB API refused this address ({reason}) first)"
+    raise ToolError(json.dumps(payload, ensure_ascii=False)) from exc
 
 
 def _needs_impersonation(url: str) -> bool:
@@ -497,9 +585,11 @@ async def _polite_wait() -> None:
     """Space this source's requests out, and back off if it refused us.
 
     Reads ``_min_gap`` at call time so an operator or a test can retune the
-    pace without rebuilding the pacer.
+    pace without rebuilding the pacer. The pacing itself is shared
+    (mcp_core.kit.polite_wait); this module-level name stays because the tools
+    call it and the tests patch it.
     """
-    await _pacer.wait(min_gap=_min_gap)
+    await polite_wait(_pacer, _min_gap)
 
 
 def _basket_for_sku(nm_id: int) -> str:
@@ -728,14 +818,30 @@ def _card_products(data: dict[str, Any]) -> list[Any]:
 
 
 def _dom_dest_warning(dest: str) -> list[str]:
+    # ``info:`` because this is context, not a doubt about the parsed data: the
+    # DOM page reads whatever region the scraping Chrome is set to, so a caller
+    # who passed a non-default dest is told its value was not used. Per the
+    # health contract in resilience.attach_meta an informational note keeps
+    # meta.healthy true, while a parser-drift or validation warning would not
+    # (audit 2026-11-01: WB set healthy=True next to every warning regardless).
     if dest and dest != WB_DEFAULT_DEST:
-        return [f"wb_dom: dest={dest} ignored — the region follows the scraping-profile Chrome (set it on the site)"]
+        return [
+            f"info: wb_dom: dest={dest} ignored — the region follows the scraping-profile Chrome (set it on the site)"
+        ]
     return []
 
 
-async def _wb_card_dom(nm_ids: list[int], dest: str, ctx: Context | None) -> WbCardResponse:
+async def _wb_card_dom(
+    nm_ids: list[int],
+    dest: str,
+    ctx: Context | None,
+    *,
+    fallback_reason: str | None = None,
+) -> WbCardResponse:
     """wb_card over rendered product pages (WB_TRANSPORT=dom). One navigation per SKU."""
     warnings = _dom_dest_warning(dest)
+    if fallback_reason:
+        warnings.insert(0, _dom_fallback_warning(fallback_reason))
     wanted = list(dict.fromkeys(nm_ids))
     if len(wanted) > _settings.dom_max_cards:
         warnings.append(
@@ -757,16 +863,37 @@ async def _wb_card_dom(nm_ids: list[int], dest: str, ctx: Context | None) -> WbC
             "wb_dom_card: cross-border listing (foreign seller / AliExpress on WB) — longer delivery, returns by request"
         )
     log_event("wb_card.done", nm_count=len(nm_ids), items=len(items), transport="dom")
+    if wanted and not items:
+        # Every requested SKU was dropped: the card page could not be parsed for
+        # any of them. Without this the DOM path answered healthy=True with an
+        # empty items list — the "empty success" this flag exists to prevent.
+        warnings.append(
+            f"no_items: none of the {len(wanted)} requested nm_ids parsed from the rendered card "
+            "(card page shape drift?)"
+        )
     return WbCardResponse(
         dest=dest,
         count=len(items),
         items=items,
-        meta=MetaOut(source="wb_card", healthy=bool(items) or not wanted, warnings=warnings[:10]),
+        # The list stays inside its budget, and a list that had to be cut says
+        # how many diagnostics it suppressed (mcp_core.bound_warnings). The
+        # health verdict is computed from the FULL list, so a cut list cannot
+        # turn an unhealthy answer into a healthy one.
+        meta=MetaOut(
+            source="wb_card",
+            healthy=not R.health_warnings(warnings),
+            warnings=R.bound_warnings(warnings, limit=WARNING_LIMIT),
+        ),
     )
 
 
 async def _wb_search_dom(
-    query: str, dest: str, page: int, ctx: Context | None
+    query: str,
+    dest: str,
+    page: int,
+    ctx: Context | None,
+    *,
+    fallback_reason: str | None = None,
 ) -> WbSearchResponse | WbNoResultsResponse:
     """wb_search over the rendered search grid (WB_TRANSPORT=dom)."""
     url = dom_transport.search_url(query, page)
@@ -774,25 +901,44 @@ async def _wb_search_dom(
         await ctx.debug(f"wb_search[dom]: {url}")
     payload = await dom_transport.render(url, dom_transport.SEARCH_EXTRACT_JS, "search")
     items, warnings = dom_transport.parse_search_page(payload)
-    if not items and page == 1 and not payload.get("page_says_empty"):
-        # An empty first page without WB's own «ничего не нашлось» means the tile
-        # selectors stopped matching; reporting no_results would hide the drift.
-        log_event("wb_search.dom_drift", query=query[:100], tiles=len(payload.get("tiles") or []))
-        raise_tool_error(
-            ParserDriftError(
-                "wb_search[dom]: the search page rendered no product tiles and no empty-result notice",
-                provider="wb",
+    if not items and not payload.get("page_says_empty"):
+        # An empty page without WB's own «ничего не нашлось» means the tile
+        # selectors stopped matching; reporting no_results with healthy=True
+        # would hide the drift. Page 1 answers parser_drift outright — unlike a
+        # later page it cannot be a legitimate past-the-end read, because page 1
+        # always has results if the query matched anything at all.
+        if page == 1:
+            log_event("wb_search.dom_drift", query=query[:100], tiles=len(payload.get("tiles") or []))
+            raise_tool_error(
+                ParserDriftError(
+                    "wb_search[dom]: the search page rendered no product tiles and no empty-result notice",
+                    provider="wb",
+                )
             )
+        # Page >= 2: WB repeats the last page instead of agreeing that the list
+        # ended, so an empty grid here is either the true end of the results or
+        # the same selector drift. Cannot be told apart, so neither is claimed.
+        log_event("wb_search.dom_empty_unmarked", query=query[:100], page=page)
+        warnings.insert(
+            0,
+            "page_end_unverified: the rendered page carried no product tiles and no «nothing found» "
+            "notice, so the end of the results cannot be told apart from tile-selector drift — "
+            "check the previous page before concluding the list ended",
         )
     warnings = _dom_dest_warning(dest) + warnings
+    if fallback_reason:
+        warnings.insert(0, _dom_fallback_warning(fallback_reason))
     if not items:
         log_event("wb_search.no_results", transport="dom", query=query[:100], page=page)
-        return WbNoResultsResponse(
-            query=query,
-            page=page,
-            total_ids=0,
-            meta=MetaOut(source="wb_search", healthy=True, warnings=warnings[:10]) if warnings else None,
+        # An empty page still carries its warnings, and healthy follows them: the
+        # region note is `info:`, so an honest empty answer stays healthy, while
+        # page_end_unverified flips it.
+        empty_meta = MetaOut(
+            source="wb_search",
+            healthy=not R.health_warnings(warnings),
+            warnings=R.bound_warnings(warnings, limit=WARNING_LIMIT),
         )
+        return WbNoResultsResponse(query=query, page=page, total_ids=0, meta=empty_meta if warnings else None)
     log_event("wb_search.done", transport="dom", items=len(items), page=page)
     return WbSearchResponse(
         query=query,
@@ -800,8 +946,15 @@ async def _wb_search_dom(
         page_size=len(items),
         total_ids=len(items),
         count=len(items),
-        items=[WbCardItem(**item) for item in items],
-        meta=MetaOut(source="wb_search", healthy=True, warnings=warnings[:10]),
+        # A tile whose prices kept unproven roles has in_stock None (the parser's
+        # warning names it). WbCardItem.in_stock is True only with a usable price,
+        # so that tile is not in stock here; it must never fail the whole page.
+        items=[WbCardItem(**{**item, "in_stock": item["in_stock"] is True}) for item in items],
+        meta=MetaOut(
+            source="wb_search",
+            healthy=not R.health_warnings(warnings),
+            warnings=R.bound_warnings(warnings, limit=WARNING_LIMIT),
+        ),
     )
 
 
@@ -809,16 +962,18 @@ async def _wb_search_dom(
     name="wb_card",
     annotations=ToolAnnotations(
         title="WB Product Cards",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def wb_card(
     nm_ids: Annotated[
-        list[int],
+        list[NmId],
         Field(
+            min_length=1,
+            max_length=MAX_CARD_IDS,
             description="1..100 nmId integers (positive). Batch product cards from WB v4 API.",
         ),
     ],
@@ -837,25 +992,9 @@ async def wb_card(
     Returns prices in rubles, brand, supplier, supplier_rating, review_rating,
     feedbacks count, total_quantity for up to 100 SKUs.
 
-    ## Return Format
+    price_rub is None when the SKU has no sellable price — never 0; an unknown SKU is NOT an error, it simply does not appear in items.
 
-    WbCardResponse: {dest, count, items, meta}. Items carry nm_id, name, brand,
-    supplier, supplier_id, supplier_rating, review_rating, feedbacks,
-    total_quantity, in_stock, price_rub, price_original_rub. price_rub is None
-    when the SKU has no sellable price — never 0. Unknown SKUs are NOT an
-    error — they simply do not appear in items.
-
-    ## Error Format
-
-    ToolError: BadRequestError on malformed nm_ids; RateLimitedError on HTTP
-    429; TransportDownError on network failures, non-200 responses, an HTML wall
-    page from WB's edge, and unexpected internal errors; ParserDriftError on a
-    non-JSON or mis-shaped body.
-
-    Args:
-        nm_ids: 1..100 nmId integers.
-        dest: Region ID (default Moscow -1257786). Required for valid prices.
-              Other examples: -1257786 Moscow, -1029256 Saint Petersburg.
+    Full field list and error codes: `guide://wb/wb_card`.
     """
     log_event("wb_card.start", nm_count=len(nm_ids), dest=dest)
     if ctx is not None:
@@ -864,9 +1003,9 @@ async def wb_card(
     if not nm_ids:
         log_event("wb_card.validation_failed", reason="empty_nm_ids")
         raise_tool_error(BadRequestError("nm_ids empty"))
-    if len(nm_ids) > 100:
+    if len(nm_ids) > MAX_CARD_IDS:
         log_event("wb_card.validation_failed", reason="too_many_nm_ids", count=len(nm_ids))
-        raise_tool_error(BadRequestError(f"max 100 nm_ids, got {len(nm_ids)}"))
+        raise_tool_error(BadRequestError(f"max {MAX_CARD_IDS} nm_ids, got {len(nm_ids)}"))
     if any(isinstance(n, bool) or not isinstance(n, int) or n <= 0 for n in nm_ids):
         log_event("wb_card.validation_failed", reason="non_positive_nm_ids")
         raise_tool_error(BadRequestError("nm_ids must be positive integers"))
@@ -900,6 +1039,13 @@ async def wb_card(
             if status_code == 429:
                 log_event("wb_card.rate_limited")
                 raise_tool_error(RateLimitedError("wb", retry_after_s=30.0))
+            fallback_reason = _dom_fallback_reason(status_code, text)
+            if fallback_reason is not None:
+                log_event("wb_card.dom_fallback", reason=fallback_reason)
+                try:
+                    return await _wb_card_dom(nm_ids, dest, ctx, fallback_reason=fallback_reason)
+                except Exception as exc:
+                    _raise_dom_failure_after_refusal(exc, fallback_reason)
             if text and "<html" in text[:200].lower():
                 log_event("wb_card.blocked", reason="cloudflare_html")
                 raise_tool_error(
@@ -923,7 +1069,7 @@ async def wb_card(
                 raise_tool_error(ParserDriftError(str(exc), provider="wb"))
         except httpx.HTTPError as exc:
             log_event("wb_card.network_error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-            raise_tool_error(TransportDownError(str(exc), provider="wb"))
+            raise_tool_error_from(exc, str(exc), provider="wb")
 
         data, shape_error = _expect_json_object(data, "wb_card response")
         data = _require_object(data, "wb_card response")
@@ -946,23 +1092,23 @@ async def wb_card(
             dest=dest,
             count=len(item_dicts),
             items=[WbCardItem(**d) for d in item_dicts],
-            meta=MetaOut(source="wb_card", healthy=not warnings, warnings=warnings),
+            meta=MetaOut(source="wb_card", healthy=not R.health_warnings(warnings), warnings=warnings),
         )
     except ToolError:
         raise
     except Exception as exc:
         log_event("wb_card.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(str(exc)), provider="wb"))
+        raise_tool_error_from(exc, _redact(str(exc)), provider="wb")
 
 
 @mcp.tool(
     name="wb_root_info",
     annotations=ToolAnnotations(
         title="WB Root Info (imt_id)",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def wb_root_info(
@@ -979,16 +1125,7 @@ async def wb_root_info(
 
     All variants of one product share imt_id. Reviews indexed by imt_id, NOT by nmId.
 
-    ## Return Format
-
-    WbRootInfoResponse: {imt_id, subj_name, subj_root_name, colors,
-    compositions, options, host_used, meta}. imt_id is the root product id
-    shared by every variant — wb_reviews is indexed by it, not by nmId.
-
-    ## Error Format
-
-    On validation or transport/parse failure, raises ToolError with a JSON
-    message describing the error code and whether it is retryable.
+    Full field list and error codes: `guide://wb/wb_root_info`.
     """
     log_event("wb_root_info.start", nm_id=nm_id)
     if ctx is not None:
@@ -1026,7 +1163,7 @@ async def wb_root_info(
                 raise_tool_error(ParserDriftError(f"{exc} [url={url}]", provider="wb"))
         except httpx.HTTPError as exc:
             log_event("wb_root_info.network_error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-            raise_tool_error(TransportDownError(f"{exc} [url={url}]", provider="wb"))
+            raise_tool_error_from(exc, f"{exc} [url={url}]", provider="wb")
 
         data, shape_error = _expect_json_object(data, "wb_root_info response")
         data = _require_object(data, "wb_root_info response")
@@ -1065,7 +1202,7 @@ async def wb_root_info(
         raise
     except Exception as exc:
         log_event("wb_root_info.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(str(exc)), provider="wb"))
+        raise_tool_error_from(exc, _redact(str(exc)), provider="wb")
 
 
 def _aggregate_offer_warnings(items: list[dict]) -> list[str]:
@@ -1111,10 +1248,10 @@ def _wb_review_date_ts(created: object) -> float:
     name="wb_reviews",
     annotations=ToolAnnotations(
         title="WB Reviews by imt_id",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def wb_reviews(
@@ -1155,26 +1292,9 @@ async def wb_reviews(
     `sort` is applied CLIENT-SIDE over that pool. To surface complaints, "worst"
     reorders the returned pool by lowest rating first.
 
-    ## Return Format
+    an empty pool is NOT an error — a healthy response with zero feedbacks.
 
-    WbReviewsResponse: {imt_id, sort, pool_size, feedback_count, valuation,
-    valuation_distribution, feedbacks, host_used, meta}. Review items carry
-    rating, text, pros, cons, user, date. An empty pool is NOT an error — it
-    returns a healthy response with zero feedbacks.
-
-    ## Error Format
-
-    ToolError: BadRequestError on a bad limit or sort; ParserDriftError when
-    a 200 body has no feedbacks list; TransportDownError when every review
-    host fails and on unexpected internal errors.
-
-    Args:
-        imt_id: Root ID from wb_root_info.
-        limit: Max review texts to return (1..100). Counts always full.
-        sort: "recent"/"newest"/"default" (as returned, newest-first),
-              "best"/"highest" (highest rating first),
-              "worst"/"lowest"/"complaints" (LOWEST rating first — finds downsides).
-              Note: reorders the ~1000-review pool WB returns, not all feedbacks.
+    Full field list and error codes: `guide://wb/wb_reviews`.
     """
     log_event("wb_reviews.start", imt_id=imt_id, limit=limit, sort=sort)
     if ctx is not None:
@@ -1281,7 +1401,7 @@ async def wb_reviews(
                 valuation_distribution=data.get("valuationDistribution"),
                 feedbacks=[WbReviewItem(**f) for f in feedbacks],
                 host_used=host,
-                meta=MetaOut(source="wb_reviews", healthy=not warnings, warnings=warnings),
+                meta=MetaOut(source="wb_reviews", healthy=not R.health_warnings(warnings), warnings=warnings),
             )
 
         message = (
@@ -1293,17 +1413,17 @@ async def wb_reviews(
         raise
     except Exception as exc:
         log_event("wb_reviews.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(str(exc)), provider="wb"))
+        raise_tool_error_from(exc, _redact(str(exc)), provider="wb")
 
 
 @mcp.tool(
     name="wb_questions",
     annotations=ToolAnnotations(
         title="WB Buyer Questions by imt_id",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def wb_questions(
@@ -1352,26 +1472,9 @@ async def wb_questions(
     shares one question pool. Passing an nmId returns an empty pool with no error,
     so resolve the root id via ``wb_root_info`` first.
 
-    ## Return Format
+    an empty pool is NOT an error — it means nobody has asked yet.
 
-    WbQuestionsResponse: {imt_id, total_available, returned, skip,
-    answered_count, has_more, questions, meta}. Question items carry
-    question_id, text, date, user, answered, answer_text, answer_date, nm_id.
-    An empty pool is NOT an error — it means nobody has asked yet.
-
-    ## Error Format
-
-    ToolError: BadRequestError on a bad limit or skip; RateLimitedError on
-    HTTP 429; TransportDownError on network failures, non-200 responses and
-    unexpected internal errors; ParserDriftError when a 200 body loses the
-    count key or the questions shape.
-
-    Args:
-        imt_id: Root ID from wb_root_info.
-        limit: Max questions to return (1..100).
-        skip: Offset into the pool, for pagination.
-        answered_only: Keep only questions that have a seller answer.
-        ctx: MCP context, when called as a tool.
+    Full field list and error codes: `guide://wb/wb_questions`.
     """
     log_event("wb_questions.start", imt_id=imt_id, limit=limit, skip=skip, answered_only=answered_only)
     if ctx is not None:
@@ -1507,23 +1610,46 @@ async def wb_questions(
             answered_count=answered_count,
             has_more=offset < total_available,
             questions=[WbQuestionItem(**q) for q in collected],
-            meta=MetaOut(source="wb_questions", healthy=not warnings, warnings=warnings),
+            meta=MetaOut(source="wb_questions", healthy=not R.health_warnings(warnings), warnings=warnings),
         )
     except ToolError:
         raise
     except Exception as exc:
         log_event("wb_questions.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(str(exc)), provider="wb"))
+        raise_tool_error_from(exc, _redact(str(exc)), provider="wb")
+
+
+def _fallback_failure_text(exc: Exception) -> str:
+    """Name a fallback failure by code and message, never by a raw envelope.
+
+    A ``ConnectorError`` stringifies to its message, while a ToolError raised by
+    ``raise_tool_error`` carries a JSON payload; its ``error`` and ``message``
+    say what happened in a warning-sized form.
+    """
+    if isinstance(exc, ToolError):
+        try:
+            decoded = json.loads(str(exc))
+        except (ValueError, RecursionError):
+            pass
+        else:
+            if isinstance(decoded, dict):
+                code = decoded.get("error")
+                message = decoded.get("message")
+                if isinstance(code, str) and isinstance(message, str):
+                    return f"{code}: {message}"
+                if isinstance(code, str):
+                    return code
+    return str(exc)
 
 
 @mcp.tool(
     name="wb_search",
     annotations=ToolAnnotations(
         title="WB Catalog Search",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def wb_search(
@@ -1557,25 +1683,9 @@ async def wb_search(
     Uses search.wb.ru v9 product data, with a warned legacy IDs/card fallback.
     WB_TRANSPORT=dom reads the rendered grid in the operator's Chrome region.
 
-    ## Return Format
+    zero matches returns WbNoResultsResponse (status "no_results"), which is NOT an error; an unknown total stays null, and a failed read never becomes no_results.
 
-    WbSearchResponse: {query, page, page_size, total_ids, count, items, meta},
-    with items in the same shape as wb_card. Zero matches — or a page past the
-    end — returns WbNoResultsResponse {status: "no_results", query, page,
-    total_ids} instead. Optional meta reports DOM warnings only when present.
-    That is NOT an error; unknown totals remain null.
-
-    ## Error Format
-
-    ToolError: BadRequestError on a page outside 1..20; RateLimitedError on
-    HTTP 429; ParserDriftError on malformed JSON/shapes when neither path
-    answers successfully; TransportDownError on refusals or transport failures.
-    Failed reads never become no_results without a positive empty answer.
-
-    Args:
-        query: Russian text.
-        dest: Region. Default Moscow.
-        page: 1..20 (each page returns ~30 IDs from the long list).
+    Full field list and error codes: `guide://wb/wb_search`.
     """
     log_event("wb_search.start", query=query[:100], page=page, dest=dest)
     if ctx is not None:
@@ -1623,6 +1733,13 @@ async def wb_search(
         try:
             async with _wb_client() as client:
                 status_code, text, err = await _safe_get_text(client, v9_url)
+            fallback_reason = _dom_fallback_reason(status_code, text)
+            if fallback_reason is not None:
+                log_event("wb_search.dom_fallback", reason=fallback_reason)
+                try:
+                    return await _wb_search_dom(query, dest, page, ctx, fallback_reason=fallback_reason)
+                except Exception as exc:
+                    _raise_dom_failure_after_refusal(exc, fallback_reason)
             if status_code in (401, 403) or (status_code != 429 and _is_edge_wall(text)):
                 # A refusal must not become a stale legacy answer (#101).
                 log_event("wb_search.refused", endpoint="v9", status=status_code)
@@ -1673,6 +1790,7 @@ async def wb_search(
             v9_error = TransportDownError(_redact(f"{type(exc).__name__}: {exc}"), provider="wb")
 
         fallback_used = False
+        fallback_error: ConnectorError | ToolError | None = None
         if not products:
             # Legacy data is flagged when usable. Failure is not emptiness; only
             # a positively empty primary response can survive a failed fallback.
@@ -1680,18 +1798,40 @@ async def wb_search(
             fallback_used = True
             try:
                 products, total_found = await _search_via_search_goods(query, dest, page, ctx)
-            except ConnectorError as fallback_error:
-                log_event("wb_search.fallback_failed", error=_redact(str(fallback_error)))
+            except (ConnectorError, ToolError) as exc:
+                # The fallback raises a plain ToolError on a refusal (its
+                # raise_tool_error calls), which the ConnectorError handler used
+                # to miss: a positively empty v9 answer then died instead of
+                # returning the warned no_results the code below builds.
+                fallback_error = exc
+                log_event("wb_search.fallback_failed", error=_redact(str(exc)))
                 if v9_error is not None:
-                    if isinstance(fallback_error, RateLimitedError):
-                        raise_tool_error(fallback_error)
+                    if isinstance(exc, ToolError):
+                        raise
+                    if isinstance(exc, RateLimitedError):
+                        raise_tool_error(exc)
                     if isinstance(v9_error, ParserDriftError):
                         raise_tool_error(v9_error)
-                    raise_tool_error(fallback_error)
+                    raise_tool_error(exc)
 
         if not products:
             log_event("wb_search.no_results", query=query[:100])
-            return WbNoResultsResponse(query=query, page=page, total_ids=total_found)
+            # v9 answering positively empty does not make the fallback's own
+            # death irrelevant: the legacy path that should have confirmed the
+            # emptiness never ran, and the agent must not read the answer as a
+            # verified "nothing found" (audit 2026-11-01).
+            empty_meta = None
+            if fallback_error is not None:
+                empty_meta = MetaOut(
+                    source="wb_search",
+                    healthy=False,
+                    warnings=[
+                        "fallback_failed: v9 reported no products and the legacy search-goods fallback "
+                        f"failed too ({_redact(_fallback_failure_text(fallback_error))[:160]}), so this empty "
+                        "answer is unconfirmed — the query may still have matches"
+                    ],
+                )
+            return WbNoResultsResponse(query=query, page=page, total_ids=total_found, meta=empty_meta)
 
         # Past the end, WB repeats page 1 rather than returning nothing. Honour
         # the documented contract — a page past the end is "no results" — instead
@@ -1713,6 +1853,18 @@ async def wb_search(
             item_dicts.append(_card_item_dict(p))
 
         warnings = _aggregate_offer_warnings(item_dicts)
+        # The selfcheck compares this payload against the captured family
+        # registry; the tool's own answer now carries the same drift signal,
+        # so an agent does not need a human running doctor to learn the shape
+        # moved. The normalized items emit every key unconditionally, so the
+        # guard runs on the RAW product objects the flattener binds through.
+        # Products are non-empty here: a no-results page returned above. An
+        # all-delisted page keeps its "sizes": [] — the price family is
+        # vacuously absent inside an empty array, not lost, and the no_prices
+        # warning below is what speaks for that page.
+        drift = R.shape_drift_warning({"products": products}, SEARCH_REQUIRED_FAMILIES, source="wb_search")
+        if drift:
+            warnings.append(drift)
         if fallback_used:
             warnings.append(
                 "fallback: v9 search was unavailable, results came from the legacy id path "
@@ -1738,13 +1890,13 @@ async def wb_search(
             total_ids=total_found or len(item_dicts),
             count=len(item_dicts),
             items=[WbCardItem(**d) for d in item_dicts],
-            meta=MetaOut(source="wb_search", healthy=not warnings, warnings=warnings),
+            meta=MetaOut(source="wb_search", healthy=not R.health_warnings(warnings), warnings=warnings),
         )
     except ToolError:
         raise
     except Exception as exc:
         log_event("wb_search.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(str(exc)), provider="wb"))
+        raise_tool_error_from(exc, _redact(str(exc)), provider="wb")
 
 
 def _recover_search_ids(ids: Any) -> list[int]:
@@ -1954,10 +2106,10 @@ async def _search_via_search_goods(
     name="wb_seller",
     annotations=ToolAnnotations(
         title="WB Seller Legal Info",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def wb_seller(
@@ -1980,17 +2132,7 @@ async def wb_seller(
 
     Chain from `wb_card`: its `supplier_id` field feeds straight into this tool.
 
-    ## Return Format
-
-    WbSellerResponse: {supplier_id, name, full_name, trademark, inn, kpp,
-    ogrn, legal_address, taxpayer_code, foreign_codes, host_used, meta}.
-    foreign_codes carries non-RU registration codes (unp/bin/unn) for EAEU
-    sellers.
-
-    ## Error Format
-
-    On validation or transport/parse failure, raises ToolError with a JSON
-    message describing the error code and whether it is retryable.
+    Full field list and error codes: `guide://wb/wb_seller`.
     """
     log_event("wb_seller.start", supplier_id=supplier_id)
     if ctx is not None:
@@ -2031,7 +2173,7 @@ async def wb_seller(
         taxpayer_code=str(R.first_present(obj, "taxpayerCode", default="") or "").strip(),
         foreign_codes=foreign,
         host_used=host_used,
-        meta=MetaOut(source="wb_seller", healthy=not warnings, warnings=warnings),
+        meta=MetaOut(source="wb_seller", healthy=not R.health_warnings(warnings), warnings=warnings),
     )
     log_event("wb_seller.done", supplier_id=supplier_id, has_inn=bool(inn))
     return result
@@ -2098,10 +2240,10 @@ def _find_menu_subtree(nodes: list[Any], needle: str) -> dict | None:
     name="wb_categories",
     annotations=ToolAnnotations(
         title="WB Catalog Categories",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def wb_categories(
@@ -2137,17 +2279,7 @@ async def wb_categories(
     The live menu is ~800 KB, so responses are always a bounded slice — start at
     'top', then expand the branch you care about.
 
-    ## Return Format
-
-    WbCategoriesResponse: {root, max_depth, total_returned, truncated, items,
-    host_used, meta}. Nodes carry id, name, url, shard, query, depth,
-    children_count, children; shard+query are the selectors
-    wb_category_products needs to list a category feed.
-
-    ## Error Format
-
-    On validation or transport/parse failure, raises ToolError with a JSON
-    message describing the error code and whether it is retryable.
+    Full field list and error codes: `guide://wb/wb_categories`.
     """
     log_event("wb_categories.start", root=root, max_depth=max_depth)
     if ctx is not None:
@@ -2200,7 +2332,7 @@ async def wb_categories(
         truncated=truncated,
         items=items,
         host_used=host_used,
-        meta=MetaOut(source="wb_categories", healthy=not truncated, warnings=warnings),
+        meta=MetaOut(source="wb_categories", healthy=not R.health_warnings(warnings), warnings=warnings),
     )
 
 
@@ -2208,10 +2340,10 @@ async def wb_categories(
     name="wb_category_products",
     annotations=ToolAnnotations(
         title="WB Category Product Listing",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
 )
 async def wb_category_products(
@@ -2271,27 +2403,9 @@ async def wb_category_products(
     returning an empty list, because an empty list here would read as "this
     category has no products", which is false.
 
-    ## Return Format
+    price_rub is None when the SKU has no sellable price — never 0.
 
-    WbCategoryProductsResponse: {shard, query, page, sort, dest, count,
-    has_more, items, meta}, with items in the same shape as wb_card. has_more
-    is inferred from a full page — WB reports no total here.
-
-    ## Error Format
-
-    ToolError: BadRequestError on malformed selectors or the unlistable
-    'blackhole' shard; NotFoundError on a 404 (stale shard/query pair);
-    RateLimitedError on HTTP 429; TransportDownError on network failures,
-    non-200 responses, an HTML wall page from WB's edge, and unexpected internal errors;
-    ParserDriftError on a non-JSON or mis-shaped body.
-
-    Args:
-        shard: Catalog shard from wb_categories.
-        query: Catalog selector from wb_categories (`cat=` or `subject=`).
-        page: Page number, up to 100 products each.
-        sort: Upstream ordering.
-        dest: WB region id; defaults to WB_DEFAULT_DEST.
-        ctx: MCP context, when called as a tool.
+    Full field list and error codes: `guide://wb/wb_category_products`.
     """
     shard_norm = (shard or "").strip()
     query_norm = (query or "").strip().lstrip("?&")
@@ -2424,13 +2538,122 @@ async def wb_category_products(
             # A full page implies more may follow; WB reports no total here.
             has_more=len(item_dicts) >= WB_CATEGORY_PAGE_SIZE,
             items=[WbCardItem(**d) for d in item_dicts],
-            meta=MetaOut(source="wb_category_products", healthy=not warnings, warnings=warnings),
+            meta=MetaOut(source="wb_category_products", healthy=not R.health_warnings(warnings), warnings=warnings),
         )
     except ToolError:
         raise
     except Exception as exc:
         log_event("wb_category_products.error", error=_redact(str(exc)), exc_type=type(exc).__name__)
-        raise_tool_error(TransportDownError(_redact(str(exc)), provider="wb"))
+        raise_tool_error_from(exc, _redact(str(exc)), provider="wb")
+
+
+# START_BLOCK_SELFCHECK
+# START_CONTRACT: _wb_dom_selfcheck
+# PURPOSE: Probe one configured DOM path without retrying or solving challenges.
+# INPUTS: card or search; the same baseline, renderer and parser as the tools.
+# OUTPUTS: R.selfcheck_entry verdict with transport=dom; no escaping dependency errors.
+# SIDE_EFFECTS: One render call within a wall-clock bound covering the DOM page waits.
+# END_CONTRACT: _wb_dom_selfcheck
+async def _wb_dom_selfcheck(want: str) -> dict:
+    """R-WB-SELFCHECK-DOM: a rendered baseline, not an unused API host."""
+    nm = _SELFCHECK_NM
+    baseline = str(nm) if want == "card" else _SELFCHECK_SEARCH_QUERY
+    try:
+        # Reserve CDP navigation/cleanup and the 15s probe / 30s extractor waits
+        # in addition to the configured readiness, settling and politeness waits.
+        wall_s = 120.0 + _settings.dom_wait_s + _settings.dom_settle_ms / 1000 + _settings.dom_min_gap
+        async with asyncio.timeout(wall_s):
+            if want == "card":
+                payload = await dom_transport.render(dom_transport.card_url(nm), dom_transport.CARD_EXTRACT_JS, "card")
+                item, warnings = dom_transport.parse_card_page(payload, nm)
+                notes = R.bound_warnings(
+                    (_redact(note)[:200] for note in warnings), limit=9, subject="note", marker_prefix=""
+                )
+                price = R.coerce_price(item.get("price_rub")) if item is not None else None
+                if item is None or not item.get("name"):
+                    return R.selfcheck_entry(
+                        "drift",
+                        baseline=baseline,
+                        transport="dom",
+                        reason="schema_drift",
+                        notes=[*notes, "rendered card has no named baseline product"],
+                    )
+                if price is None:
+                    # The DOM parser marks an unavailable/unpriced main offer OOS,
+                    # just as a price-less, sold-out API baseline is not drift.
+                    return R.selfcheck_entry(
+                        "drift" if item.get("in_stock") else "inconclusive",
+                        baseline=baseline,
+                        transport="dom",
+                        reason="schema_drift" if item.get("in_stock") else "baseline_gone",
+                        notes=[*notes, "baseline main offer has no usable price"],
+                    )
+                return R.selfcheck_entry("healthy", baseline=baseline, transport="dom", price=price, notes=notes)
+
+            payload = await dom_transport.render(
+                dom_transport.search_url(baseline, 1), dom_transport.SEARCH_EXTRACT_JS, "search"
+            )
+            items, warnings = dom_transport.parse_search_page(payload)
+            notes = R.bound_warnings(
+                (_redact(note)[:200] for note in warnings), limit=9, subject="note", marker_prefix=""
+            )
+            if not items:
+                empty = bool(payload.get("page_says_empty"))
+                return R.selfcheck_entry(
+                    "inconclusive" if empty else "drift",
+                    baseline=baseline,
+                    transport="dom",
+                    reason="baseline_gone" if empty else "schema_drift",
+                    notes=[*notes, "WB reports no results" if empty else "rendered search has no product anchors"],
+                )
+            identified = [
+                item
+                for item in items
+                if isinstance(item.get("nm_id"), int) and not isinstance(item.get("nm_id"), bool) and item["nm_id"] > 0
+            ]
+            priced = [item for item in identified if R.coerce_price(item.get("price_rub")) is not None]
+            if not identified or not priced:
+                return R.selfcheck_entry(
+                    "drift",
+                    baseline=baseline,
+                    transport="dom",
+                    reason="schema_drift",
+                    raw_len=len(items),
+                    recovered_ids=len(identified),
+                    priced=len(priced),
+                    notes=[*notes, "rendered products lack identified, priced anchors"],
+                )
+            return R.selfcheck_entry(
+                "healthy",
+                baseline=baseline,
+                transport="dom",
+                recovered_ids=len(identified),
+                priced=len(priced),
+                notes=notes,
+            )
+    except Exception as exc:
+        state, reason = "inconclusive", "dependency_unavailable"
+        if isinstance(exc, TimeoutError):
+            reason = "timeout"
+        elif isinstance(exc, ToolError):
+            try:
+                error = json.loads(str(exc))
+            except json.JSONDecodeError:
+                error = None
+            code = error.get("error") if isinstance(error, dict) else None
+            if code == ErrorCode.CHALLENGE_REQUIRED:
+                reason = "blocked"
+            elif code == ErrorCode.TRANSPORT_DOWN:
+                reason = "transport_down"
+            elif code == ErrorCode.PARSER_DRIFT:
+                state, reason = "drift", "schema_drift"
+        return R.selfcheck_entry(
+            state,
+            baseline=baseline,
+            transport="dom",
+            reason=reason,
+            notes=[f"{type(exc).__name__}: {_redact(str(exc))}"[:200]],
+        )
 
 
 # CLI-only drift canary: ``marketplace-mcp doctor`` imports and calls wb_selfcheck()
@@ -2439,23 +2662,30 @@ async def wb_category_products(
 # client request.
 async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
     """Structural drift canary for WB (tri-state: success / drift_detected /
-    inconclusive). Probes EVERY endpoint family the tools depend on:
-      * card        — card.wb.ru v4 (wb_card / wb_search enrich): critical fields
-                      + price extract.
+    inconclusive). The check keys are stable across WB_TRANSPORT modes:
+      * card        — API mode: card.wb.ru v4 critical fields + price extract.
+                      DOM mode: the baseline card page via render/parse_card_page;
+                      a named product with a positive price is healthy.
       * reviews     — feedbacks2.wb.ru pool (wb_reviews): texts + productValuation.
-      * search_goods— search-goods.wildberries.ru (the legacy fallback path): the id
-                      list must still be a non-empty list of recoverable ids on a
-                      broad evergreen query, else wb_search silently returns no_results.
-      * search_v9   — search.wb.ru v9 (the PRIMARY path wb_search prefers): must
-                      answer 200 with identified, priced products, else a refusal of
-                      the primary path would only surface as the fallback's answers.
+      * search_goods— search-goods.wildberries.ru legacy id-list probe, unchanged;
+                      DOM mode notes that wb_search does not use this path.
+      * search_v9   — API mode: search.wb.ru v9 products, identified/priced counts.
+                      DOM mode: the same evergreen query's first grid via
+                      render/parse_search_page; identified, priced products are
+                      healthy, absent anchors are drift, WB's own empty notice
+                      makes the missing baseline inconclusive.
       * root_basket — basket-NN.wbbasket.ru (wb_root_info): imt_id must resolve,
                       else wb_root_info AND wb_reviews (indexed by imt_id) break.
 
+    WB_TRANSPORT=dom calls render exactly once for each of card/search_v9, never
+    those API hosts and never solves/retries captchas. Its wall-clock bounds
+    include the configured DOM waits plus CDP/extractor headroom. Reviews and
+    root_basket keep their API paths. An unavailable/unpriced main card offer is
+    inconclusive/baseline_gone; no named card is drift/schema_drift.
+
     Tri-state (audit 2026-06-01): an http!=200 / network error / OOS baseline is
-    `inconclusive` (transport/baseline rot), NEVER drift. Only a reached-200 body
-    whose parser-critical anchor is gone is `drift`. Run on demand before trusting
-    a batch.
+    `inconclusive` (transport/baseline rot), NEVER drift. A reachable body whose
+    parser-critical anchor is gone is `drift`. Run on demand before trusting a batch.
 
     ## Return Format
 
@@ -2467,133 +2697,148 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
 
     ## Error Format
 
-    Never raises ToolError: transport/timeout failures of individual
-    subchecks map to inconclusive entries, reached-200 shape failures to
-    drift entries — both are verdicts, not errors.
+    Never raises ToolError from a subcheck. DOM render ToolError JSON is mapped
+    by mcp_core.errors.ErrorCode: challenge_required -> inconclusive/blocked,
+    transport_down -> inconclusive/transport_down, parser_drift ->
+    drift/schema_drift. The subcheck's own wall-clock timeout is
+    inconclusive/timeout; unexpected failures are inconclusive/dependency_unavailable.
+    API transport/timeout and reached-200 shape verdicts remain unchanged.
     """
-    log_event("wb_selfcheck.start")
+    use_dom = _settings.transport == "dom"
+    log_event("wb_selfcheck.start", transport=_settings.transport)
     if ctx is not None:
-        await ctx.info("wb_selfcheck: probing card / reviews / search_goods / search_v9 / root_basket")
+        await ctx.info(
+            "wb_selfcheck: probing card / reviews / search_goods / search_v9 / root_basket "
+            f"(card/search_v9 transport={_settings.transport})"
+        )
     checks: dict[str, dict] = {}
 
-    # --- card v4 ---
+    # --- card (v4 API or rendered page) ---
     nm = _SELFCHECK_NM
-    card_url = f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest={WB_DEFAULT_DEST}&locale=ru&spp=30&nm={nm}"
-    await _polite_wait()
-    try:
-        async with asyncio.timeout(45):  # whole-subcheck wall-clock (audit CRASH_HANG)
-            async with _wb_client() as client:
-                status_code, text, err = await _fresh_get_text(client, card_url)
-            if err or status_code != 200:
-                checks["card"] = R.selfcheck_entry(
-                    "inconclusive", baseline=str(nm), reason="transport_down", notes=[f"http {status_code} err={err}"]
-                )
-            else:
-                try:
-                    data = json.loads(text or "")
-                except json.JSONDecodeError as exc:
-                    checks["card"] = R.selfcheck_entry(
-                        "drift",
-                        baseline=str(nm),
-                        reason="parse_error",
-                        notes=[f"card 200 JSON parse error: {str(exc)[:120]}"],
-                    )
-                    data = None
-                if not isinstance(data, dict):
-                    if data is not None:
-                        checks["card"] = R.selfcheck_entry(
-                            "drift",
-                            baseline=str(nm),
-                            reason="schema_drift",
-                            notes=[f"card 200 root is {type(data).__name__}, not object"],
-                        )
-                    elif "card" not in checks:
-                        checks["card"] = R.selfcheck_entry(
-                            "drift",
-                            baseline=str(nm),
-                            reason="schema_drift",
-                            notes=["card 200 root is null, not object"],
-                        )
-                    products: list[Any] = []
-                else:
-                    products, products_error = _card_products_checked(data)
-                    if products_error:
-                        checks["card"] = R.selfcheck_entry(
-                            "drift",
-                            baseline=str(nm),
-                            reason="schema_drift",
-                            notes=[f"card 200 products container error: {products_error}"],
-                        )
-                if not isinstance(data, dict) or ("card" in checks and checks["card"].get("state") == "drift"):
-                    pass
-                elif not products:
-                    # A SINGLE-SKU baseline returning 0 products is indistinguishable
-                    # from deletion/OOS at this endpoint — baseline rot, NOT drift
-                    # (audit 2026-06-01 FALSE_POSITIVE: don't cry wolf on a gone SKU).
+    if use_dom:
+        checks["card"] = await _wb_dom_selfcheck("card")
+    else:
+        card_url = (
+            f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest={WB_DEFAULT_DEST}&locale=ru&spp=30&nm={nm}"
+        )
+        await _polite_wait()
+        try:
+            async with asyncio.timeout(45):  # whole-subcheck wall-clock (audit CRASH_HANG)
+                async with _wb_client() as client:
+                    status_code, text, err = await _fresh_get_text(client, card_url)
+                if err or status_code != 200:
                     checks["card"] = R.selfcheck_entry(
                         "inconclusive",
                         baseline=str(nm),
-                        reason="baseline_gone",
-                        notes=[
-                            "no products on 200 body (baseline SKU deleted/OOS, "
-                            "or schema drift — cannot distinguish on one SKU)"
-                        ],
+                        reason="transport_down",
+                        notes=[f"http {status_code} err={err}"],
                     )
                 else:
-                    p = products[0]
-                    if not isinstance(p, dict):
+                    try:
+                        data = json.loads(text or "")
+                    except json.JSONDecodeError as exc:
                         checks["card"] = R.selfcheck_entry(
                             "drift",
                             baseline=str(nm),
-                            reason="schema_drift",
-                            notes=[f"card product entry is {type(p).__name__}, not object"],
+                            reason="parse_error",
+                            notes=[f"card 200 JSON parse error: {str(exc)[:120]}"],
+                        )
+                        data = None
+                    if not isinstance(data, dict):
+                        if data is not None:
+                            checks["card"] = R.selfcheck_entry(
+                                "drift",
+                                baseline=str(nm),
+                                reason="schema_drift",
+                                notes=[f"card 200 root is {type(data).__name__}, not object"],
+                            )
+                        elif "card" not in checks:
+                            checks["card"] = R.selfcheck_entry(
+                                "drift",
+                                baseline=str(nm),
+                                reason="schema_drift",
+                                notes=["card 200 root is null, not object"],
+                            )
+                        products: list[Any] = []
+                    else:
+                        products, products_error = _card_products_checked(data)
+                        if products_error:
+                            checks["card"] = R.selfcheck_entry(
+                                "drift",
+                                baseline=str(nm),
+                                reason="schema_drift",
+                                notes=[f"card 200 products container error: {products_error}"],
+                            )
+                    if not isinstance(data, dict) or ("card" in checks and checks["card"].get("state") == "drift"):
+                        pass
+                    elif not products:
+                        # A SINGLE-SKU baseline returning 0 products is indistinguishable
+                        # from deletion/OOS at this endpoint — baseline rot, NOT drift
+                        # (audit 2026-06-01 FALSE_POSITIVE: don't cry wolf on a gone SKU).
+                        checks["card"] = R.selfcheck_entry(
+                            "inconclusive",
+                            baseline=str(nm),
+                            reason="baseline_gone",
+                            notes=[
+                                "no products on 200 body (baseline SKU deleted/OOS, "
+                                "or schema drift — cannot distinguish on one SKU)"
+                            ],
                         )
                     else:
-                        missing = [
-                            k
-                            for k in ("id", "name", "sizes", "reviewRating", "feedbacks", "totalQuantity")
-                            if k not in p
-                        ]
-                        cur, _orig = _extract_price_rub(p)
-                        qty = R.coerce_int(p.get("totalQuantity"))
-                        if missing:
+                        p = products[0]
+                        if not isinstance(p, dict):
                             checks["card"] = R.selfcheck_entry(
                                 "drift",
                                 baseline=str(nm),
-                                missing_fields=missing,
-                                notes=[f"card missing critical fields: {missing}"],
-                            )
-                        elif qty is None:
-                            checks["card"] = R.selfcheck_entry(
-                                "drift",
-                                baseline=str(nm),
-                                reason="quantity_shape_drift",
-                                notes=["card totalQuantity is present but not parseable as an integer"],
-                            )
-                        elif cur is None and qty and qty > 0:
-                            checks["card"] = R.selfcheck_entry(
-                                "drift",
-                                baseline=str(nm),
-                                reason="price_shape_drift",
-                                notes=["in-stock baseline has positive totalQuantity but no parseable price"],
-                            )
-                        elif cur is None:
-                            # price None is legit if the baseline SKU went OOS — rot, not drift.
-                            checks["card"] = R.selfcheck_entry(
-                                "inconclusive",
-                                baseline=str(nm),
-                                reason="baseline_gone",
-                                notes=["price None (baseline SKU may be out of stock)"],
+                                reason="schema_drift",
+                                notes=[f"card product entry is {type(p).__name__}, not object"],
                             )
                         else:
-                            checks["card"] = R.selfcheck_entry("healthy", baseline=str(nm), price=cur)
-    except (TimeoutError, Exception) as exc:
-        checks["card"] = R.selfcheck_entry(
-            "inconclusive",
-            baseline=str(nm),
-            reason="timeout" if isinstance(exc, asyncio.TimeoutError) else "transport_down",
-            notes=[f"{type(exc).__name__}: {str(exc)[:120]}"],
-        )
+                            missing = [
+                                k
+                                for k in ("id", "name", "sizes", "reviewRating", "feedbacks", "totalQuantity")
+                                if k not in p
+                            ]
+                            cur, _orig = _extract_price_rub(p)
+                            qty = R.coerce_int(p.get("totalQuantity"))
+                            if missing:
+                                checks["card"] = R.selfcheck_entry(
+                                    "drift",
+                                    baseline=str(nm),
+                                    missing_fields=missing,
+                                    notes=[f"card missing critical fields: {missing}"],
+                                )
+                            elif qty is None:
+                                checks["card"] = R.selfcheck_entry(
+                                    "drift",
+                                    baseline=str(nm),
+                                    reason="quantity_shape_drift",
+                                    notes=["card totalQuantity is present but not parseable as an integer"],
+                                )
+                            elif cur is None and qty and qty > 0:
+                                checks["card"] = R.selfcheck_entry(
+                                    "drift",
+                                    baseline=str(nm),
+                                    reason="price_shape_drift",
+                                    notes=["in-stock baseline has positive totalQuantity but no parseable price"],
+                                )
+                            elif cur is None:
+                                # price None is legit if the baseline SKU went OOS — rot, not drift.
+                                checks["card"] = R.selfcheck_entry(
+                                    "inconclusive",
+                                    baseline=str(nm),
+                                    reason="baseline_gone",
+                                    notes=["price None (baseline SKU may be out of stock)"],
+                                )
+                            else:
+                                checks["card"] = R.selfcheck_entry("healthy", baseline=str(nm), price=cur)
+        except (TimeoutError, Exception) as exc:
+            checks["card"] = R.selfcheck_entry(
+                "inconclusive",
+                baseline=str(nm),
+                reason="timeout" if isinstance(exc, asyncio.TimeoutError) else "transport_down",
+                notes=[f"{type(exc).__name__}: {str(exc)[:120]}"],
+            )
 
     # --- reviews (feedbacks pool by imt_id) ---
     await _polite_wait()
@@ -2797,114 +3042,138 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
             notes=[f"{type(exc).__name__}: {str(exc)[:120]}"],
         )
 
-    # --- search_v9 (the PRIMARY path wb_search prefers) ---
+    if use_dom:
+        checks["search_goods"]["notes"].append("wb_search does not use this path while WB_TRANSPORT=dom")
+
+    # --- search_v9 (the configured wb_search path: API or rendered grid) ---
     #
-    # Probed separately from search_goods, because they fail differently and only
+    # In API mode, probed separately from search_goods, because they fail differently and only
     # this one is on the path a caller actually takes. When v9 was refused, search
     # fell through to the legacy id list and answered with unrelated products and
     # prices attached — and this canary stayed green, because its other probe reads
     # search-goods and never touched v9. A refused primary path has to be visible.
-    v9_params = httpx.QueryParams(
-        {
-            "appType": "1",
-            "curr": "rub",
-            "dest": WB_DEFAULT_DEST,
-            "locale": "ru",
-            "query": sq,
-            "resultset": "catalog",
-            "page": "1",
-            "spp": "30",
-        }
-    )
-    v9_url = f"https://search.wb.ru/exactmatch/ru/common/v9/search?{v9_params}"
-    await _polite_wait()
-    try:
-        async with asyncio.timeout(45):
-            async with _wb_client() as client:
-                status_code, text, err = await _fresh_get_text(client, v9_url)
-            if err or status_code == 429:
-                checks["search_v9"] = R.selfcheck_entry(
-                    "inconclusive",
-                    baseline=sq,
-                    reason="rate_limited" if status_code == 429 else "transport_down",
-                    notes=[f"http {status_code} err={err} — primary search path (v9) unavailable"],
-                )
-            elif status_code != 200:
-                checks["search_v9"] = R.selfcheck_entry(
-                    "inconclusive",
-                    baseline=sq,
-                    reason="transport_down",
-                    notes=[f"http {status_code} — primary search path refused"],
-                )
-            else:
-                try:
-                    payload = json.loads(text or "")
-                except json.JSONDecodeError as exc:
+    if use_dom:
+        checks["search_v9"] = await _wb_dom_selfcheck("search")
+    else:
+        v9_params = httpx.QueryParams(
+            {
+                "appType": "1",
+                "curr": "rub",
+                "dest": WB_DEFAULT_DEST,
+                "locale": "ru",
+                "query": sq,
+                "resultset": "catalog",
+                "page": "1",
+                "spp": "30",
+            }
+        )
+        v9_url = f"https://search.wb.ru/exactmatch/ru/common/v9/search?{v9_params}"
+        await _polite_wait()
+        try:
+            async with asyncio.timeout(45):
+                async with _wb_client() as client:
+                    status_code, text, err = await _fresh_get_text(client, v9_url)
+                if err or status_code == 429:
                     checks["search_v9"] = R.selfcheck_entry(
-                        "drift",
+                        "inconclusive",
                         baseline=sq,
-                        reason="parse_error",
-                        notes=[f"v9 returned HTTP 200 but invalid JSON: {exc}"],
+                        reason="rate_limited" if status_code == 429 else "transport_down",
+                        notes=[f"http {status_code} err={err} — primary search path (v9) unavailable"],
                     )
-                    payload = None
-                if payload is not None:
-                    v9_products: Any = None
-                    if isinstance(payload, dict):
-                        v9_products = payload.get("products")
-                        if not isinstance(v9_products, list):
-                            nested = payload.get("data")
-                            if isinstance(nested, dict) and isinstance(nested.get("products"), list):
-                                v9_products = nested["products"]
-                    if not isinstance(payload, dict):
+                elif status_code != 200:
+                    checks["search_v9"] = R.selfcheck_entry(
+                        "inconclusive",
+                        baseline=sq,
+                        reason="transport_down",
+                        notes=[f"http {status_code} — primary search path refused"],
+                    )
+                else:
+                    try:
+                        payload = json.loads(text or "")
+                    except json.JSONDecodeError as exc:
                         checks["search_v9"] = R.selfcheck_entry(
                             "drift",
                             baseline=sq,
-                            reason="schema_drift",
-                            notes=[f"v9 returned {type(payload).__name__}, not object"],
+                            reason="parse_error",
+                            notes=[f"v9 returned HTTP 200 but invalid JSON: {exc}"],
                         )
-                    elif not isinstance(v9_products, list):
-                        checks["search_v9"] = R.selfcheck_entry(
-                            "drift",
-                            baseline=sq,
-                            reason="schema_drift",
-                            notes=["v9 200 body has no products list (wb_search would fall back to stale ids)"],
-                        )
-                    elif not v9_products:
-                        checks["search_v9"] = R.selfcheck_entry(
-                            "drift",
-                            baseline=sq,
-                            reason="empty_products",
-                            notes=["v9 answered 200 with no products for an evergreen query"],
-                        )
-                    else:
-                        identified = [
-                            item
-                            for item in v9_products
-                            if isinstance(item, dict)
-                            and (
-                                (isinstance(item.get("id"), int) and not isinstance(item.get("id"), bool))
-                                or (isinstance(item.get("nmId"), int) and not isinstance(item.get("nmId"), bool))
-                            )
-                        ]
-                        priced = [item for item in identified if item.get("salePriceU") or item.get("priceU")]
-                        if not identified:
+                        payload = None
+                    if payload is not None:
+                        v9_products: Any = None
+                        if isinstance(payload, dict):
+                            v9_products = payload.get("products")
+                            if not isinstance(v9_products, list):
+                                nested = payload.get("data")
+                                if isinstance(nested, dict) and isinstance(nested.get("products"), list):
+                                    v9_products = nested["products"]
+                        if not isinstance(payload, dict):
                             checks["search_v9"] = R.selfcheck_entry(
                                 "drift",
                                 baseline=sq,
-                                raw_len=len(v9_products),
-                                notes=["v9 products carry no numeric id (id-shape drift)"],
+                                reason="schema_drift",
+                                notes=[f"v9 returned {type(payload).__name__}, not object"],
+                            )
+                        elif not isinstance(v9_products, list):
+                            checks["search_v9"] = R.selfcheck_entry(
+                                "drift",
+                                baseline=sq,
+                                reason="schema_drift",
+                                notes=["v9 200 body has no products list (wb_search would fall back to stale ids)"],
+                            )
+                        elif not v9_products:
+                            checks["search_v9"] = R.selfcheck_entry(
+                                "drift",
+                                baseline=sq,
+                                reason="empty_products",
+                                notes=["v9 answered 200 with no products for an evergreen query"],
                             )
                         else:
-                            checks["search_v9"] = R.selfcheck_entry(
-                                "healthy", baseline=sq, recovered_ids=len(identified), priced=len(priced)
-                            )
-    except (TimeoutError, Exception) as exc:
-        checks["search_v9"] = R.selfcheck_entry(
-            "inconclusive",
-            baseline=sq,
-            reason="timeout" if isinstance(exc, asyncio.TimeoutError) else "transport_down",
-            notes=[f"{type(exc).__name__}: {str(exc)[:120]}"],
-        )
+                            identified = [
+                                item
+                                for item in v9_products
+                                if isinstance(item, dict)
+                                and (
+                                    (isinstance(item.get("id"), int) and not isinstance(item.get("id"), bool))
+                                    or (isinstance(item.get("nmId"), int) and not isinstance(item.get("nmId"), bool))
+                                )
+                            ]
+                            priced = [item for item in identified if item.get("salePriceU") or item.get("priceU")]
+                            if not identified:
+                                checks["search_v9"] = R.selfcheck_entry(
+                                    "drift",
+                                    baseline=sq,
+                                    raw_len=len(v9_products),
+                                    notes=["v9 products carry no numeric id (id-shape drift)"],
+                                )
+                            else:
+                                # Identifiable products are not enough: the
+                                # search tool's own answer warns through the same
+                                # required-family registry, and the canary must
+                                # fail the same way when a whole parser-critical
+                                # family vanishes.
+                                drift = R.shape_drift_warning(
+                                    {"products": v9_products}, SEARCH_REQUIRED_FAMILIES, source="wb_search"
+                                )
+                                if drift:
+                                    checks["search_v9"] = R.selfcheck_entry(
+                                        "drift",
+                                        baseline=sq,
+                                        reason="shape_drift",
+                                        recovered_ids=len(identified),
+                                        priced=len(priced),
+                                        notes=[drift],
+                                    )
+                                else:
+                                    checks["search_v9"] = R.selfcheck_entry(
+                                        "healthy", baseline=sq, recovered_ids=len(identified), priced=len(priced)
+                                    )
+        except (TimeoutError, Exception) as exc:
+            checks["search_v9"] = R.selfcheck_entry(
+                "inconclusive",
+                baseline=sq,
+                reason="timeout" if isinstance(exc, asyncio.TimeoutError) else "transport_down",
+                notes=[f"{type(exc).__name__}: {str(exc)[:120]}"],
+            )
 
     # --- root_basket (wb_root_info imt_id resolution) ---
     await _polite_wait()
@@ -3008,10 +3277,17 @@ async def wb_selfcheck(ctx: Context | None = None) -> WbSelfCheckResponse:
     return WbSelfCheckResponse.model_validate(result)
 
 
+# END_BLOCK_SELFCHECK
+
 # Advertised output schemas are the dominant constant cost of an MCP mount:
 # replace the full Pydantic tree with top-level field names (~64 % fewer
 # wire tokens on the unified server).
 apply_compact_output_schemas(mcp)
+
+# The reference half of every tool description is served as an MCP resource
+# (guide://<source>/<tool>) and the error taxonomy as marketplace://errors, so
+# the agent pays for them when it reads them instead of on every request.
+register_reference_resources(mcp)
 
 
 if __name__ == "__main__":

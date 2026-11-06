@@ -15,8 +15,21 @@ cd ru-marketplace-mcp
 uv sync --frozen --all-packages
 ```
 
+Without a checkout, the `ru-marketplace-mcp` package on PyPI holds every server
+and the CLI, and one command installs it and runs the guided setup:
+
+```console
+uvx ru-marketplace-mcp setup
+```
+
+The client entry it writes pins the release that ran. In the commands below,
+replace `uv run marketplace-mcp` with `uvx ru-marketplace-mcp`.
+
 Node and jsdom are needed for contributor DOM tests only. You can use the MCP
 servers without running the test suite or installing Node.
+
+The next step is to wire a client, and the guided setup does it for you (see
+step 2).
 
 ## 2. Choose one server for your task
 
@@ -26,7 +39,39 @@ servers without running the test suite or installing Node.
 | Inspect a shortlist with optional reviews | `decision-mcp` | Comparison tools plus `decision_inspect` |
 | Search a specific marketplace, read reviews, or use Cian | `marketplace-mcp` | All installed connectors |
 
-Start with one entry in your client's MCP configuration. Replace the absolute
+Start with the guided setup:
+
+```console
+uv run marketplace-mcp setup
+```
+
+It detects Claude Desktop, Cursor and Claude Code, writes the config with the
+compare profile by default, starts the scraping Chrome, runs doctor's live
+checks and offers `unblock` for a source the site walls off. `--dry-run` prints
+the steps and files without writing, starting or requesting anything;
+`--profile decision` or `--profile full` chooses another tool set.
+
+To write one named client's config instead:
+
+```console
+uv run marketplace-mcp install claude --write
+```
+
+It adds one `marketplace` entry to the client's own config file, fills in the
+absolute path to `uv` and to your checkout, keeps other servers and settings as
+they are, and saves the old file as `<file>.bak-<timestamp>`. Restart the client
+afterwards. The default `--profile compare` writes `compare-mcp`: 4
+price-comparison tools, the cheapest per request. `--profile decision`
+adds shortlist card inspection (5 tools), and `--profile full` writes
+`marketplace-mcp` with every per-source tool, several times the cost (measured
+per profile in [TOOLS.md](TOOLS.md)). The entry
+name stays `marketplace`, and a config that already has it keeps its profile
+unless you pass `--profile`. `--dry-run` shows what would be written and writes
+nothing; `--per-source` writes one entry per source instead and cannot be
+combined with `--profile`.
+
+If you prefer to paste the configuration yourself, start with one entry in your
+client's MCP configuration. Replace the absolute
 path with the clone from step 1; use forward slashes on Windows as shown.
 
 ```json
@@ -48,13 +93,14 @@ format: follow its [bundle guide](../dsh/README.md).
 To generate individual source entries with your checkout path already filled in:
 
 ```console
-uv run marketplace-mcp install claude
+uv run marketplace-mcp install claude --per-source
 ```
 
-The command prints configuration for manual insertion. Copy only the sources
-you want. MPStats is optional and needs a paid token; ordinary marketplace
-queries do not need it. `install cursor`, `install claude-code`, and
-`install dsh` are also supported.
+The command prints the per-source block for manual insertion. Copy only the
+sources you want; without `--per-source` it prints the single `marketplace`
+entry for the selected profile described above. MPStats is optional and needs a
+paid token; ordinary marketplace queries do not need it. `install cursor`,
+`install claude-code`, and `install dsh` are also supported.
 
 ## 3. Check two sources before adding a browser
 
@@ -62,17 +108,28 @@ queries do not need it. `install cursor`, `install claude-code`, and
 uv run marketplace-mcp doctor wildberries yandex_market
 ```
 
-These checks use anonymous HTTP. A blocked endpoint can still require a different
-network. Doctor's Chrome status is separate: a missing Chrome does not prevent
-anonymous HTTP checks from working.
+With the default `WB_TRANSPORT=api`, these checks use anonymous HTTP. A blocked
+endpoint can still require a different network. Doctor's Chrome status is separate:
+a missing Chrome does not prevent anonymous HTTP checks from working. If you set
+`WB_TRANSPORT=dom`, WB's `card` and `search_v9` checks instead open two pages in
+the operator's Chrome (baseline card and search grid); a captcha is `inconclusive`
+and is never solved or retried. WB's other probes still use HTTP; see
+[the rendered-page notes](ANTI_BOT.md#when-the-api-refuses-rendered-pages-wb_transportdom).
 
 | Result | Meaning | Next step |
 | --- | --- | --- |
 | `success`, exit 0 | Selected selfchecks passed | Try the request below |
 | `drift_detected`, exit 1 | A response no longer matched the parser checks | Report the affected source and diagnostic output |
-| `inconclusive` or `error`, exit 2 | Access or execution prevented a verdict | Read the reason; check network, browser, or required login |
-| Argument error, exit 2 | Unknown source, option, or missing argument | Correct the command; no source was queried |
+| `inconclusive`, exit 2 | Acknowledged block or unavailable probe; `budget_refused` means the live budget prevented verification | Follow the next step; this is not verified health or an alarm |
 | Status-file write failure, exit 3 | The report could not be saved | Check the output path and permissions |
+| `error`, exit 4 | A selfcheck raised or returned invalid output | Report the checker failure; this is a hard-failure alarm, not a source block |
+| Argument/setup error, exit 4 | Unknown source, option, missing argument, or doctor could not run | Correct the command or setup; no successful verdict was produced |
+
+A failed checker takes precedence over drift, and drift over an inconclusive
+source. Nightly alarms on 1 and 4, not 2. A budget refusal never counts as a
+healthy check. `unblock` discovery/re-check uses the same hard-failure code;
+`setup` also returns 4 if its health check or unblock re-check fails, otherwise
+its exit still describes whether a client was configured.
 
 For machine-readable results:
 
@@ -111,14 +168,34 @@ ruble prices.
 
 ## 5. Add browser-backed sources when needed
 
-Follow [Chrome setup](CDP_SETUP.md) to start the dedicated CDP browser. Sign in
-to Taobao or Megamarket if using those sources, then run a targeted check:
+Follow [Chrome setup](CDP_SETUP.md) to start the dedicated CDP browser. Your
+everyday Chrome can stay open. Sign in to Taobao or Megamarket if using those
+sources, then run a targeted check:
 
 ```console
 uv run marketplace-mcp doctor ozon aliexpress cian
 ```
 
-Keep the same MCP session when using browser challenge handoff. Configuration,
+On Windows the connector's autostart parks the scraping window off-screen, so
+you cannot log in or pass a site's check until it is on-screen. You can start a
+visible Chrome yourself or move the existing window:
+
+```console
+uv run marketplace-mcp browser start    # launch the scraping Chrome on-screen (--hidden: off-screen)
+uv run marketplace-mcp browser status   # is the endpoint reachable, where is the window
+uv run marketplace-mcp browser show     # bring the window on-screen and activate its first tab
+```
+
+When `doctor` reports a wall, let `unblock` open the right page and wait while
+you pass the check or log in:
+
+```console
+uv run marketplace-mcp unblock ozon
+uv run marketplace-mcp unblock --dry-run ozon   # print the page, open nothing
+```
+
+Repeat the call from the same client (the same MCP session, or the same stdio
+server process) when using browser challenge handoff. Configuration,
 supported challenge types, and limits are documented in
 [optional challenge handoff](CDP_SETUP.md#optional-challenge-handoff).
 

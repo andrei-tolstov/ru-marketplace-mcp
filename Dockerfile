@@ -8,13 +8,13 @@
 # reducing the attack surface. This is the layout uv's own Docker guide
 # recommends.
 #
-# Tags are pinned deliberately. The builder pins uv 0.11.32 (the version this
-# repo's uv.lock was produced with) on Python 3.12; the runtime pins the same
-# Python minor. Floating tags would let a base rebuild change the toolchain out
-# from under a reproducible install.
+# Tags are pinned deliberately, each with its digest. The builder pins a uv
+# release on Python 3.12; the runtime pins the same Python minor. Floating tags
+# would let a base rebuild change the toolchain out from under a reproducible
+# install. Dependabot (.github/dependabot.yml) moves the tags and digests.
 
 # ---- Stage 1: build the environment -----------------------------------------
-FROM ghcr.io/astral-sh/uv:0.11.32-python3.12-trixie-slim AS builder
+FROM ghcr.io/astral-sh/uv:0.13.6-python3.12-trixie-slim@sha256:bf889bda77474aa50c351caf1538b855ef2b7a30add45f26ca50dcb6ade06402 AS builder
 
 # - bytecode compile for faster cold starts (production images start often).
 # - copy mode, not hardlink: the cache mount and the image are different
@@ -68,7 +68,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --all-packages --frozen --no-dev
 
 # ---- Stage 2: runtime -------------------------------------------------------
-FROM python:3.12-slim-trixie AS runtime
+FROM python:3.12-slim-trixie@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159 AS runtime
 
 # Run as an unprivileged user: a scraper reachable over HTTP should not be root
 # inside its container. Create the user first so the copied tree is owned by it.
