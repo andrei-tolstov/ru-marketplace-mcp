@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from drom_connector import server
 from fastmcp.exceptions import ToolError
@@ -330,7 +332,7 @@ async def test_drom_search_error_preserves_cdp_detail(monkeypatch):
         return 0, "CDP timeout after 20.0s", "cdp"
 
     monkeypatch.setattr(server, "_fetch", fake_fetch)
-    with pytest.raises(ToolError, match="CDP timeout after 20.0s"):
+    with pytest.raises(ToolError, match=re.escape("CDP timeout after 20.0s")):
         await server.drom_search("масло")
 
 
@@ -340,5 +342,5 @@ async def test_drom_card_error_preserves_cdp_detail(monkeypatch):
         return 0, "CDP timeout after 20.0s", "cdp"
 
     monkeypatch.setattr(server, "_fetch", fake_fetch)
-    with pytest.raises(ToolError, match="CDP timeout after 20.0s"):
+    with pytest.raises(ToolError, match=re.escape("CDP timeout after 20.0s")):
         await server.drom_card("g12841036510")
