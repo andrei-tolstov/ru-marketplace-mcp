@@ -20,11 +20,11 @@
   - [x] 4.1 Обновить `.github/workflows/ci.yml`: шаг `dsh bundle` (`test "$skills" -eq 16`) <!-- id: 4.1 -->
   - [x] 4.2 Пересчитать baseline токенов в `work/performance/wire-baseline.json` для 42 тулов (`marketplace-mcp`) и обновить ceiling <!-- id: 4.2 -->
   - [x] 4.3 Проверить `scripts/mcp_wire.py` и `scripts/test_mcp_wire_budgets.py` <!-- id: 4.3 -->
-- [ ] 5. Полная верификация, коммит, пуш и синхронизация <!-- id: 5 -->
+- [x] 5. Полная верификация, коммит, пуш и синхронизация <!-- id: 5 -->
   - [x] 5.1 Проверить `scripts/check_test_count.py` (при необходимости обновить README.md/docs) <!-- id: 5.1 -->
   - [x] 5.2 Прогнать линтеры, тайпчекер и полный офлайн-набор тестов (`uv run pytest -q -m "not live and not cdp"`) <!-- id: 5.2 -->
-  - [ ] 5.3 Закоммитить изменения и запушить в `origin/main` <!-- id: 5.3 -->
-  - [ ] 5.4 Синхронизировать `C:\mcp\ru_marketplace-mcp` <!-- id: 5.4 -->
+  - [x] 5.3 Закоммитить изменения и запушить в `origin/main` <!-- id: 5.3 -->
+  - [x] 5.4 Синхронизировать `C:\mcp\ru_marketplace-mcp` <!-- id: 5.4 -->
 
 ## Review & Results
 
