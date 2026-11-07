@@ -3,7 +3,7 @@
   "ceilings": {
     "compare-mcp": 1860,
     "decision-mcp": 2109,
-    "marketplace-mcp": 13588
+    "marketplace-mcp": 15394
   },
   "profiles": {
     "compare-mcp": {
@@ -12,7 +12,7 @@
       "wire_tokens": 1735,
       "model_tokens": 1429,
       "instructions_tokens": 36,
-      "latency_ms": 3765.0,
+      "latency_ms": 6855.6,
       "schema_sha256": "314450e09450b9c9671380bc16f3848988248fe598e73f6442d32dea1c8a1ef2",
       "tools": [
         {
@@ -43,7 +43,7 @@
       "wire_tokens": 2008,
       "model_tokens": 1636,
       "instructions_tokens": 36,
-      "latency_ms": 3735.0,
+      "latency_ms": 5717.6,
       "schema_sha256": "d837e8784dd65be0ce161251d3ea85b7fdce1b451f465036eae8c9e4576f58cf",
       "tools": [
         {
@@ -75,12 +75,12 @@
     },
     "marketplace-mcp": {
       "script": "marketplace-mcp",
-      "tool_count": 39,
-      "wire_tokens": 13084,
-      "model_tokens": 9504,
-      "instructions_tokens": 153,
-      "latency_ms": 3719.0,
-      "schema_sha256": "cb40899b11a8f262c3b88353fbdc33550fef0f5e9c5b5eaf989d156ff79bd716",
+      "tool_count": 43,
+      "wire_tokens": 14505,
+      "model_tokens": 10526,
+      "instructions_tokens": 155,
+      "latency_ms": 6286.7,
+      "schema_sha256": "df375a527206d4f68b8d9a5bc201cf836cb2bba87b49216f0be65146f4da007c",
       "tools": [
         {
           "name": "aliexpress_card",
@@ -114,8 +114,8 @@
         },
         {
           "name": "cian_search",
-          "tokens": 741,
-          "model_tokens": 647
+          "tokens": 747,
+          "model_tokens": 654
         },
         {
           "name": "citilink_card",
@@ -173,6 +173,26 @@
           "model_tokens": 105
         },
         {
+          "name": "drom_card",
+          "tokens": 331,
+          "model_tokens": 195
+        },
+        {
+          "name": "drom_card_photos",
+          "tokens": 367,
+          "model_tokens": 303
+        },
+        {
+          "name": "drom_search",
+          "tokens": 440,
+          "model_tokens": 352
+        },
+        {
+          "name": "drom_seller",
+          "tokens": 219,
+          "model_tokens": 128
+        },
+        {
           "name": "lamoda_card",
           "tokens": 196,
           "model_tokens": 100
@@ -214,7 +234,7 @@
         },
         {
           "name": "ozon_search",
-          "tokens": 243,
+          "tokens": 251,
           "model_tokens": 162
         },
         {
@@ -229,8 +249,8 @@
         },
         {
           "name": "wb_card",
-          "tokens": 276,
-          "model_tokens": 207
+          "tokens": 289,
+          "model_tokens": 219
         },
         {
           "name": "wb_categories",
@@ -259,7 +279,7 @@
         },
         {
           "name": "wb_search",
-          "tokens": 294,
+          "tokens": 306,
           "model_tokens": 231
         },
         {
@@ -269,13 +289,13 @@
         },
         {
           "name": "yandex_card",
-          "tokens": 411,
-          "model_tokens": 270
+          "tokens": 420,
+          "model_tokens": 279
         },
         {
           "name": "yandex_search",
-          "tokens": 562,
-          "model_tokens": 473
+          "tokens": 578,
+          "model_tokens": 489
         }
       ]
     }

@@ -79,7 +79,7 @@ DROM_HEADERS = {
     "Referer": f"{SITE_BASE}/",
 }
 
-_ITEM_ID_RE = re.compile(r"(?:-|\bg)(\d{6,})(?:\.html|\?|/|$)")
+_ITEM_ID_RE = re.compile(r"(?:[-/]|^|\bg)(\d{6,})(?:\.html|\?|/|$)")
 _GOOD_ID_RE = re.compile(r"(?:-g|/g)(\d{6,})")
 
 mcp = FastMCP(
@@ -156,35 +156,39 @@ async def _cdp_fetch(url: str, ctx: Context | None) -> tuple[int, str]:
             raw = await asyncio.wait_for(
                 page.evaluate(
                     """async (args) => {
-                    const res = await fetch(args.url, {
-                        credentials: 'include',
-                        headers: {
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                            'Accept-Language': 'ru-RU,ru;q=0.9'
-                        }
-                    });
-                    const reader = res.body.getReader();
-                    let total = 0;
-                    let chunks = [];
-                    while (true) {
-                        const {done, value} = await reader.read();
-                        if (done) break;
-                        total += value.length;
-                        if (total > args.cap) {
-                            return JSON.stringify({status: 0, text: 'BODY_CAP_EXCEEDED'});
-                        }
-                        chunks.push(value);
-                    }
-                    const buf = new Uint8Array(total);
-                    let off = 0;
-                    for (const c of chunks) { buf.set(c, off); off += c.length; }
-                    let text = '';
                     try {
-                        text = new TextDecoder('windows-1251').decode(buf);
-                    } catch(e) {
-                        text = new TextDecoder('utf-8').decode(buf);
+                        const res = await fetch(args.url, {
+                            credentials: 'include',
+                            headers: {
+                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                                'Accept-Language': 'ru-RU,ru;q=0.9'
+                            }
+                        });
+                        const reader = res.body.getReader();
+                        let total = 0;
+                        let chunks = [];
+                        while (true) {
+                            const {done, value} = await reader.read();
+                            if (done) break;
+                            total += value.length;
+                            if (total > args.cap) {
+                                return JSON.stringify({status: 0, text: 'BODY_CAP_EXCEEDED'});
+                            }
+                            chunks.push(value);
+                        }
+                        const buf = new Uint8Array(total);
+                        let off = 0;
+                        for (const c of chunks) { buf.set(c, off); off += c.length; }
+                        let text = '';
+                        try {
+                            text = new TextDecoder('windows-1251').decode(buf);
+                        } catch(e) {
+                            text = new TextDecoder('utf-8').decode(buf);
+                        }
+                        return JSON.stringify({status: res.status, text: text, url: res.url});
+                    } catch (err) {
+                        return JSON.stringify({status: 0, text: 'FETCH_ERROR: ' + String(err)});
                     }
-                    return JSON.stringify({status: res.status, text: text, url: res.url});
                 }""",
                     {"url": url, "cap": MAX_BODY_BYTES},
                 ),
@@ -235,9 +239,9 @@ async def _fetch(url: str, ctx: Context | None) -> tuple[int, str, str]:
         return status, body, "cdp"
     except NavBlocked as exc:
         raise_tool_error(TransportDownError(f"baza.drom.ru CDP navigation blocked: {exc}", status_code=403))
+    except ToolError:
+        raise
     except Exception as exc:
-        if isinstance(exc, ToolError):
-            raise
         raise_tool_error(TransportDownError(f"baza.drom.ru CDP fetch failed: {_redact(str(exc))}"))
 
 
@@ -369,7 +373,7 @@ def _extract_item_id(raw: str) -> str | None:
     m = _GOOD_ID_RE.search(raw)
     if m:
         return f"g{m.group(1)}"
-    m = re.search(r"-(\d{6,})\.html", raw)
+    m = re.search(r"[-/](\d{6,})\.html", raw)
     if m:
         return m.group(1)
     m = _ITEM_ID_RE.search(raw)
@@ -897,7 +901,8 @@ async def drom_search(
 
     status, html, tier = await _fetch(url, ctx)
     if status != 200:
-        raise_tool_error(TransportDownError(f"baza.drom.ru search returned HTTP {status} via {tier}."))
+        detail = f": {_redact(html[:120])}" if html else ""
+        raise_tool_error(TransportDownError(f"baza.drom.ru search returned HTTP {status} via {tier}{detail}."))
 
     items_raw, total_count = _parse_search_html(html)
 
@@ -965,7 +970,8 @@ async def drom_card(
     if status == 404:
         raise_tool_error(NotFoundError(f"baza.drom.ru item '{item_id}' not found (404)."))
     if status != 200:
-        raise_tool_error(TransportDownError(f"baza.drom.ru card fetch failed: HTTP {status} via {tier}."))
+        detail = f": {_redact(html[:120])}" if html else ""
+        raise_tool_error(TransportDownError(f"baza.drom.ru card fetch failed: HTTP {status} via {tier}{detail}."))
 
     card_data = _parse_card_html(html, target_url, fallback_id=item_id)
     card_data["tier_used"] = tier
@@ -1056,6 +1062,7 @@ async def drom_card_photos(
                     ImageContent(type="image", data=b64_str, mime_type=mime),
                 ],
                 structured_content={
+                    "item_id": "direct_url",
                     "bulletin_id": "direct_url",
                     "title": cleaned,
                     "photos_count": 1,
@@ -1079,7 +1086,8 @@ async def drom_card_photos(
     if status == 404:
         raise_tool_error(NotFoundError(f"baza.drom.ru item '{item_id}' not found (404)."))
     if status != 200:
-        raise_tool_error(TransportDownError(f"baza.drom.ru card fetch failed: HTTP {status} via {tier}."))
+        detail = f": {_redact(html[:120])}" if html else ""
+        raise_tool_error(TransportDownError(f"baza.drom.ru card fetch failed: HTTP {status} via {tier}{detail}."))
 
     card_data = _parse_card_html(html, target_url, fallback_id=item_id)
     images = card_data.get("images", [])
@@ -1092,6 +1100,7 @@ async def drom_card_photos(
                 )
             ],
             structured_content={
+                "item_id": item_id,
                 "bulletin_id": item_id,
                 "title": card_data.get("title") or item_id,
                 "photos_count": 0,
@@ -1153,6 +1162,7 @@ async def drom_card_photos(
         output_contents.append(ImageContent(type="image", data=b64_str, mime_type=mime_type))
 
     structured = {
+        "item_id": item_id,
         "bulletin_id": item_id,
         "title": title_str,
         "photos_count": len(downloaded_images),
@@ -1193,7 +1203,8 @@ async def drom_seller(
     if p_status == 404:
         raise_tool_error(NotFoundError(f"baza.drom.ru seller '{seller_id}' not found (404)."))
     if p_status != 200:
-        raise_tool_error(TransportDownError(f"Failed to fetch seller profile: HTTP {p_status} via {p_tier}."))
+        p_detail = f": {_redact(p_html[:120])}" if p_html else ""
+        raise_tool_error(TransportDownError(f"Failed to fetch seller profile: HTTP {p_status} via {p_tier}{p_detail}."))
 
     f_html: str | None = None
     try:

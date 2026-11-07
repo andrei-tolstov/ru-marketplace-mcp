@@ -850,6 +850,7 @@ _NATIVE_OUTPUT_FIELDS = {
         "image_omitted_reason",
     ],
     "drom_card_photos": [
+        "item_id",
         "bulletin_id",
         "title",
         "photos_count",

@@ -98,6 +98,16 @@ prices gives `N results, 0 priced (not ranked)`. Rouble-source detail keeps
 5. Use `compare_verify_offer` on the winning row for a cheap card-level check;
    then use a native `*_card` tool for deeper reviews or seller details.
 
+## Sequential CDP Source Invocations (Browser Protection)
+
+When querying sources that rely on the operator's Chrome via CDP (`dns`, `citilink`, `aliexpress`, `ozon`, `avito`, `drom`, `taobao`, `megamarket`, `lamoda`):
+- Chrome CDP has a bounded navigation concurrency budget (`CHROME_CDP_MAX_NAVIGATIONS=3` by default).
+- Running `compare_prices` across all sources concurrently fans out up to 9 CDP navigations simultaneously. In resource-constrained environments or under anti-bot challenges (Qrator, ServicePipe, x5sec), this queue congestion can cause 20-second CDP timeouts on two-tier fallbacks (`ozon`, `avito`, `drom`) while pure CDP sources occupy the browser slots.
+- **Recommended invocation pattern**:
+  1. For instant answers, query fast direct API sources first: `compare_prices(query=..., sources=["wildberries", "yandex_market"])`.
+  2. Query CDP sources **sequentially or in small batches** (e.g. `sources=["ozon"]`, then `sources=["avito"]`, `sources=["drom"]`, etc.) when complete cross-market coverage is needed.
+  3. When an agent calls individual connector tools directly, **never invoke multiple CDP tools in parallel in the same turn** — call them one by one.
+
 Set `in_stock_only=true` when the user asks where the item can be bought now.
 The response keeps excluded offers for audit, but ranks and selects winners only
 from listings whose marketplace explicitly reports stock.

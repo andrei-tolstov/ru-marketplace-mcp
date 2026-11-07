@@ -91,6 +91,40 @@ async def test_megamarket_card_dispatch_uses_native_argument_in_both_profiles(mo
     assert calls == ["100023282378", "100023282378"]
 
 
+async def test_drom_card_dispatch_uses_url_or_id(monkeypatch):
+    calls: list[str] = []
+
+    async def card(*, url_or_id):
+        calls.append(url_or_id)
+        return {"item_id": url_or_id, "price_rub": 2500, "oem": "04465-33470"}
+
+    monkeypatch.setattr(server, "SOURCES", {"drom": SimpleNamespace(drom_card=card)})
+    result = await server.compare_verify_offer("drom", "137849325")
+    assert result["card"]["item_id"] == "137849325"
+    assert calls == ["137849325"]
+
+
+async def test_search_drom_adapts_item_id_correctly(monkeypatch):
+    class FakeDromSearch:
+        async def drom_search(self, query):
+            item = SimpleNamespace(
+                item_id="g12841036510",
+                title="Колодки тормозные",
+                price_rub=2050.0,
+                seller_name="AUTORAZBORKADV",
+                url="https://baza.drom.ru/g12841036510.html",
+            )
+            return SimpleNamespace(items=[item])
+
+    monkeypatch.setattr(server, "SOURCES", {"drom": FakeDromSearch()})
+    batch = await server._search_drom("колодки", limit=5)
+    assert len(batch) == 1
+    assert batch[0].source == "drom"
+    assert batch[0].product_id == "g12841036510"
+    assert batch[0].price_rub == 2050.0
+    assert batch[0].seller == "AUTORAZBORKADV"
+
+
 async def test_default_comparison_omits_deselected_sources_but_explicit_request_is_rejected(monkeypatch):
     async def search(query, limit):
         return [offer("wildberries", 100)]

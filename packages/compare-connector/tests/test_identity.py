@@ -78,6 +78,13 @@ def test_mapping_discards_invalid_gtin_instead_of_guessing():
     assert identity.mpn == ""
 
 
+def test_mapping_recognizes_oem_as_mpn():
+    identity = identity_from_mapping({"brand": "Toyota", "oem": "04465-33470", "item_id": "g12841036510"})
+    assert identity.brand == "Toyota"
+    assert identity.mpn == "0446533470"
+    assert identity.native_product_id == "g12841036510"
+
+
 @pytest.mark.parametrize("value", ["00000000", "-4006381333931", "400638133393.1", [4006381333931], True])
 def test_gtin_rejects_malformed_values(value):
     assert normalize_gtin(value) == ""

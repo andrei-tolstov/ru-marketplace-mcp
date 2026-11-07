@@ -89,7 +89,8 @@ def identity_from_mapping(raw: Mapping[str, Any], *, source: str = "") -> Produc
     brand = _field(raw, "brand", "brand_name")
     model = _field(raw, "model", "model_name")
     # Marketplace SKU / vendor_code / article are seller identifiers, not MPN.
-    mpn = _field(raw, "mpn", "manufacturer_part_number")
+    # OEM numbers (e.g. Drom auto parts) represent manufacturer part numbers.
+    mpn = _field(raw, "mpn", "manufacturer_part_number", "oem")
     gtin = _field(raw, "gtin", "barcode", "ean")
     variants: dict[str, str] = {}
     for key in ("color", "colour", "size", "storage", "memory", "capacity"):

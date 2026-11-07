@@ -883,7 +883,7 @@ async def _search_drom(query: str, limit: int) -> list[MarketOffer]:
         offers.append(
             MarketOffer(
                 source="drom",
-                product_id=str(item.bulletin_id or ""),
+                product_id=str(item.item_id or ""),
                 title=item.title or "",
                 brand="",
                 seller=item.seller_name or "",
@@ -1367,6 +1367,7 @@ async def _call_card_tool(name: str, product_id_or_url: str, *, include_reviews:
             "dns": "product_url",
             "citilink": "product_url",
             "aliexpress": "item_id_or_url",
+            "drom": "url_or_id",
         }[name]
         result = await tool(**{argument: product_id_or_url})
     # by_alias=False keeps the nested card's metadata under "meta", as it has
@@ -1562,6 +1563,10 @@ async def compare_sources(ctx: Context | None = None) -> dict[str, Any]:
                 "reachable only through the operator's Chrome (x5sec); a challenged session "
                 "surfaces as a transport error, and coupon prices are reported as warnings, "
                 "never ranked as plain rubles"
+            ),
+            "drom": (
+                "search and cards via curl_cffi or the operator's Chrome (CDP); auto parts, wheels, "
+                "oils and listings on baza.drom.ru"
             ),
         },
         "source_timeout_s": SOURCE_TIMEOUT_S,

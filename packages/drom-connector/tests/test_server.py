@@ -34,6 +34,9 @@ def test_extract_item_id_goods():
 def test_extract_item_id_url():
     url = "https://baza.drom.ru/vladivostok/chemistry/motoroil/maslo-motornoe-toyota-0w20-200l-137849325.html"
     assert server._extract_item_id(url) == "137849325"
+    assert server._extract_item_id("https://baza.drom.ru/bulletin/137849325.html") == "137849325"
+    assert server._extract_item_id("https://baza.drom.ru/ib/137849325.html") == "137849325"
+    assert server._extract_item_id("https://baza.drom.ru/137849325.html") == "137849325"
 
 
 def test_extract_seller_id():
@@ -261,6 +264,7 @@ async def test_drom_card_photos_tool(monkeypatch, card_part_html):
     assert "0446533470" in result.content[0].text
     assert result.structured_content is not None
     assert result.structured_content["photos_count"] >= 1
+    assert result.structured_content["item_id"] == "g12841036510"
 
     for item in result.content[1:]:
         assert isinstance(item, ImageContent)
@@ -285,6 +289,7 @@ async def test_drom_card_photos_direct_url(monkeypatch):
     assert result.content[1].mime_type == "image/png"
     assert result.structured_content is not None
     assert result.structured_content["photos_count"] == 1
+    assert result.structured_content["item_id"] == "direct_url"
 
 
 @pytest.mark.asyncio
@@ -317,3 +322,23 @@ async def test_drom_card_photos_download_failure(monkeypatch, card_part_html):
 
     with pytest.raises(ToolError):
         await server.drom_card_photos("g12841036510")
+
+
+@pytest.mark.asyncio
+async def test_drom_search_error_preserves_cdp_detail(monkeypatch):
+    async def fake_fetch(url, ctx):
+        return 0, "CDP timeout after 20.0s", "cdp"
+
+    monkeypatch.setattr(server, "_fetch", fake_fetch)
+    with pytest.raises(ToolError, match="CDP timeout after 20.0s"):
+        await server.drom_search("масло")
+
+
+@pytest.mark.asyncio
+async def test_drom_card_error_preserves_cdp_detail(monkeypatch):
+    async def fake_fetch(url, ctx):
+        return 0, "CDP timeout after 20.0s", "cdp"
+
+    monkeypatch.setattr(server, "_fetch", fake_fetch)
+    with pytest.raises(ToolError, match="CDP timeout after 20.0s"):
+        await server.drom_card("g12841036510")

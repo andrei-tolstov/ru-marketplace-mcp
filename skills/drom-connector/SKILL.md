@@ -16,15 +16,15 @@ Two access tiers:
 - Tier 1: impersonated HTTPS (curl_cffi) when an RU residential proxy is configured
 
 ## When to use
-- Search auto parts and accessories with optional filters (city, price range, sorting, new/used, with photo)
+- Search auto parts and accessories with optional filters (city, category, sorting, new/used, with photo)
 - Product or bulletin details: title, price, description, photos, brand, OEM numbers, condition, stock availability, breadcrumbs
 - Seller reputation, verification status, rating, active bulletin count, and recent buyer feedbacks
 
 ## Tools available
-- `drom_search(query, page, city, min_price, max_price, sort, has_photo, is_new)` — search listings. price_rub is None for listings without a specified price (e.g. negotiable, exchange) — never 0.
-- `drom_card(item_id_or_url)` — detailed card info: price, description, attributes, photos, seller summary, breadcrumbs.
+- `drom_search(query, page=1, city=None, category=None, condition=None, sort_by=None, in_stock_only=False, with_photos_only=False)` — search listings. price_rub is None for listings without a specified price (e.g. negotiable, exchange) — never 0. `condition` can be `"new"` or `"used"`; `sort_by` can be `"price_asc"` or `"price_desc"`.
+- `drom_card(url_or_id)` — detailed card info: price, description, attributes, photos, seller summary, OEM numbers, compatibility, breadcrumbs. Accepts numeric ID (`"137849325"`), goods ID (`"g12841036510"`), or full baza.drom.ru URL (e.g. `/bulletin/137849325.html`).
 - `drom_card_photos(url_or_id, max_photos=5, high_res=True)` — downloads and returns binary images (`ImageContent`) and lot summary for multimodal inspection.
-- `drom_seller(seller_id_or_url)` — seller rating, feedbacks count, registration year, city, active bulletin count, recent reviews
+- `drom_seller(seller_id_or_url, feedbacks_page=1)` — seller rating, feedbacks count, registration year, city, active bulletin count, recent reviews.
 
 **Not an MCP tool:** `drom_selfcheck()` is a tri-state drift canary. It is CLI-only — `marketplace-mcp doctor` runs every connector's canary at once.
 
@@ -53,15 +53,16 @@ Two access tiers:
    - Дать обоснованную рекомендацию: "Деталь в отличном состоянии, можно брать" / "Есть незначительные косметические дефекты" / "Критический износ/сломаны крепления — брать не рекомендуется".
 
 ## What search and card payloads carry
-- **`bulletin_id`**: can be numeric (for regular ads, e.g. `137849325`) or catalog goods identifier with a leading `g` (e.g. `g12841036510`).
+- **`item_id` / `bulletin_id`**: can be numeric (for regular ads, e.g. `137849325`) or catalog goods identifier with a leading `g` (e.g. `g12841036510`).
 - **`price_rub`**: extracted as a normalized float. When price is not specified, it is `None`, never 0.
 - **`breadcrumbs`**: hierarchical category navigation from schema.org JSON-LD or DOM breadcrumbs trail.
 - **`seller`**: on card and seller pages, carries verified status, rating, reviews count, and active bulletin count.
 
 ## Gotchas
+- **CDP Concurrency**: Drom shares the operator's Chrome instance with other CDP connectors. Avoid concurrent CDP tool calls — invoke Drom and other CDP tools sequentially.
 - baza.drom.ru serves pages in Windows-1251. The connector handles URL percent-encoding and HTML decoding automatically.
 - Datacenter IPs are dropped or blocked by WAF over direct TLS. Tier 2 CDP Chrome session is the default and recommended mode.
-- Paging: baza.drom.ru pagination uses `?page=N`. Sorting options: `relevance`, `price_asc`, `price_desc`, `date_desc`.
+- Paging: baza.drom.ru pagination uses `?page=N`. Sorting options: `sort_by="price_asc"` or `"price_desc"`.
 
 ## DSH activation
 
