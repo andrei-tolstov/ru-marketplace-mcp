@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -1375,21 +1374,47 @@ def test_a_new_product_carries_no_condition_warning():
 
 async def test_compare_prices_runs_fast_sources_concurrently_and_cdp_sequentially(monkeypatch):
     """Fast API sources run concurrently via gather; CDP sources run sequentially one by one."""
-    events: list[tuple[str, str, float]] = []
+    wb_started = asyncio.Event()
+    ym_started = asyncio.Event()
 
-    async def _make_stub(name: str, delay: float):
-        events.append(("start", name, time.monotonic()))
-        await asyncio.sleep(delay)
-        events.append(("end", name, time.monotonic()))
-        return [MarketOffer(source=name, product_id="1", title=f"Item {name}", price_rub=100.0)]
+    trace: list[str] = []
+    cdp_running: list[str] = []
+    max_cdp_concurrency = 0
+
+    async def _wb(q, limit):
+        trace.append("wb_start")
+        wb_started.set()
+        await ym_started.wait()
+        trace.append("wb_end")
+        return [MarketOffer(source="wildberries", product_id="1", title="Item WB", price_rub=100.0)]
+
+    async def _ym(q, limit):
+        trace.append("ym_start")
+        ym_started.set()
+        await wb_started.wait()
+        trace.append("ym_end")
+        return [MarketOffer(source="yandex_market", product_id="2", title="Item YM", price_rub=110.0)]
+
+    async def _cdp(name: str):
+        nonlocal max_cdp_concurrency
+        assert "wb_end" in trace
+        assert "ym_end" in trace
+
+        cdp_running.append(name)
+        max_cdp_concurrency = max(max_cdp_concurrency, len(cdp_running))
+        trace.append(f"{name}_start")
+        await asyncio.sleep(0)
+        trace.append(f"{name}_end")
+        cdp_running.remove(name)
+        return [MarketOffer(source=name, product_id="3", title=f"Item {name}", price_rub=120.0)]
 
     stub_sources(
         monkeypatch,
         {
-            "wildberries": lambda q, limit: _make_stub("wildberries", 0.05),
-            "yandex_market": lambda q, limit: _make_stub("yandex_market", 0.05),
-            "ozon": lambda q, limit: _make_stub("ozon", 0.05),
-            "citilink": lambda q, limit: _make_stub("citilink", 0.05),
+            "wildberries": _wb,
+            "yandex_market": _ym,
+            "ozon": lambda q, limit: _cdp("ozon"),
+            "citilink": lambda q, limit: _cdp("citilink"),
         },
     )
 
@@ -1403,32 +1428,27 @@ async def test_compare_prices_runs_fast_sources_concurrently_and_cdp_sequentiall
         "citilink",
     ]
 
-    starts = {name: t for ev, name, t in events if ev == "start"}
-    ends = {name: t for ev, name, t in events if ev == "end"}
-
-    # Fast sources (wildberries & yandex_market) ran concurrently:
-    # both started before either ended
-    assert starts["wildberries"] < ends["yandex_market"]
-    assert starts["yandex_market"] < ends["wildberries"]
-
-    # Both fast sources finished before any CDP source started
-    assert ends["wildberries"] <= starts["ozon"]
-    assert ends["yandex_market"] <= starts["ozon"]
-
-    # CDP sources ran strictly sequentially: ozon finished before citilink started
-    assert ends["ozon"] <= starts["citilink"]
+    # Fast sources both ran concurrently before either CDP source
+    assert max_cdp_concurrency == 1
+    cdp_events = [ev for ev in trace if ev.startswith(("ozon", "citilink"))]
+    assert cdp_events == ["ozon_start", "ozon_end", "citilink_start", "citilink_end"]
 
 
 async def test_compare_prices_tool_timeout_budget_exhaustion(monkeypatch):
     """When the total tool timeout budget is exceeded, subsequent CDP sources time out gracefully."""
-    monkeypatch.setattr(server, "TOOL_TIMEOUT_S", 0.08)
+    current_time = [1000.0]
 
-    async def _slow_wb(q, limit):
-        await asyncio.sleep(0.06)
+    def _mock_monotonic() -> float:
+        return current_time[0]
+
+    monkeypatch.setattr(server.time, "monotonic", _mock_monotonic)
+    monkeypatch.setattr(server, "TOOL_TIMEOUT_S", 10.0)
+
+    async def _wb(q, limit):
         return [MarketOffer(source="wildberries", product_id="1", title="Item WB", price_rub=100.0)]
 
-    async def _slow_ozon(q, limit):
-        await asyncio.sleep(0.05)
+    async def _ozon(q, limit):
+        current_time[0] += 12.0
         return [MarketOffer(source="ozon", product_id="2", title="Item Ozon", price_rub=120.0)]
 
     async def _citilink(q, limit):
@@ -1437,8 +1457,8 @@ async def test_compare_prices_tool_timeout_budget_exhaustion(monkeypatch):
     stub_sources(
         monkeypatch,
         {
-            "wildberries": _slow_wb,
-            "ozon": _slow_ozon,
+            "wildberries": _wb,
+            "ozon": _ozon,
             "citilink": _citilink,
         },
     )
@@ -1448,11 +1468,11 @@ async def test_compare_prices_tool_timeout_budget_exhaustion(monkeypatch):
     assert result.complete is False
     outcomes = {o.source: o for o in result.source_outcomes}
     assert outcomes["wildberries"].status == "ok"
-    # Either ozon or citilink or both exceeded budget; citilink definitely exceeded
+    assert outcomes["ozon"].status == "ok"
     assert outcomes["citilink"].status == "timeout"
     assert "tool timeout budget" in outcomes["citilink"].detail
     # Partial results are preserved
-    assert len(result.offers) >= 1
+    assert len(result.offers) == 2
     assert result.cheapest is not None
 
 

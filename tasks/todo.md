@@ -1,44 +1,32 @@
-# План: Последовательный вызов CDP-источников и увеличение таймаута в compare_prices
+# План: Исправление нестабильного теста в CI (Windows py3.12)
 
-- [ ] 1. Исследование и проектирование архитектуры <!-- id: 1 -->
-  - [x] 1.1 Определить критерий отнесения источников к CDP / fast-источникам (через `mcp_core.sources`) <!-- id: 1.1 -->
-  - [x] 1.2 Спроектировать схему таймаутов (per-source timeout `COMPARE_SOURCE_TIMEOUT` и tool-level timeout `COMPARE_TOOL_TIMEOUT`) <!-- id: 1.2 -->
-  - [x] 1.3 Подготовить детальный Implementation Plan артефакт и согласовать с пользователем <!-- id: 1.3 -->
-- [x] 2. Реализация в `mcp-core` и `compare-connector` <!-- id: 2 -->
-  - [x] 2.1 В `packages/mcp-core/src/mcp_core/sources.py`: добавить предикат `is_cdp_source` (с учётом DOM-режима Wildberries) <!-- id: 2.1 -->
-  - [x] 2.2 В `packages/compare-connector/src/compare_connector/server.py`: обновить `_run_source` для приёма индивидуального `timeout` <!-- id: 2.2 -->
-  - [x] 2.3 В `compare_prices`: разделить `active` на быстрые (без CDP) и CDP-источники; быстрые запускать через `asyncio.gather`, CDP — строго последовательно <!-- id: 2.3 -->
-  - [x] 2.4 В `compare_prices`: реализовать учёт общего бюджета времени (`COMPARE_TOOL_TIMEOUT`, по умолчанию 450с) с корректной фиксацией таймаутов при исчерпании бюджета <!-- id: 2.4 -->
-  - [x] 2.5 В `compare_sources`: экспортировать информацию об общем таймауте инструмента (`tool_timeout_s`) <!-- id: 2.5 -->
-- [x] 3. Обновление документации и скиллов <!-- id: 3 -->
-  - [x] 3.1 Обновить `skills/compare-prices/SKILL.md` и `dsh/skills/compare-prices/SKILL.md` <!-- id: 3.1 -->
-  - [x] 3.2 Обновить `skills/marketplace/SKILL.md` и `dsh/skills/marketplace/SKILL.md` <!-- id: 3.2 -->
-  - [x] 3.3 Обновить `docs/CDP_SETUP.md` с описанием `COMPARE_TOOL_TIMEOUT` <!-- id: 3.3 -->
-- [x] 4. Тестирование и верификация <!-- id: 4 -->
-  - [x] 4.1 Добавить тесты на параллельность fast-источников и последовательность CDP-источников в `packages/compare-connector/tests/test_server.py` <!-- id: 4.1 -->
-  - [x] 4.2 Добавить тест на исчерпание бюджета `COMPARE_TOOL_TIMEOUT` <!-- id: 4.2 -->
-  - [x] 4.3 Прогнать весь тестовый набор `packages/compare-connector/tests` <!-- id: 4.3 -->
-  - [x] 4.4 Запустить линтер `ruff` и проверку типов `mypy` <!-- id: 4.4 -->
+- [x] 1. Диагностика и локализация сбоя в CI <!-- id: 1 -->
+  - [x] 1.1 Получить логи упавшего CI job `Tests (windows-latest, py3.12)` (job ID 129169899374) <!-- id: 1.1 -->
+  - [x] 1.2 Локализовать причину сбоя: таймаут `_slow_wb` в `test_compare_prices_tool_timeout_budget_exhaustion` из-за неточного таймера сна на Windows CI runner <!-- id: 1.2 -->
+- [x] 2. Рефакторинг тестов `compare-connector` <!-- id: 2 -->
+  - [x] 2.1 Перевести `test_compare_prices_tool_timeout_budget_exhaustion` на детерминированные псевдо-часы `time.monotonic` без `asyncio.sleep` <!-- id: 2.1 -->
+  - [x] 2.2 Перевести `test_compare_prices_runs_fast_sources_concurrently_and_cdp_sequentially` на синхронизацию через `asyncio.Event` и счётчик конкурентности <!-- id: 2.2 -->
+- [x] 3. Локальная верификация <!-- id: 3 -->
+  - [x] 3.1 Запустить тесты `test_server.py` многократно (stress-run) для подтверждения отсутствия флаков <!-- id: 3.1 -->
+  - [x] 3.2 Прогнать все гейты качества (`ruff`, `mypy`, `check_test_count.py`, `check_no_print.py`, `check_versions.py`) <!-- id: 3.2 -->
+  - [x] 3.3 Прогнать полный офлайн-сьют `pytest -q -m "not live and not cdp"` <!-- id: 3.3 -->
+- [ ] 4. Синхронизация, коммит и пуш в git <!-- id: 4 -->
+  - [ ] 4.1 Закоммитить изменения и запушить в `origin/main` <!-- id: 4.1 -->
+  - [ ] 4.2 Синхронизировать с `C:\mcp\ru_marketplace-mcp` <!-- id: 4.2 -->
+  - [ ] 4.3 Дождаться прохождения всех проверок в GitHub Actions CI <!-- id: 4.3 -->
 
 ## Review & Results
 
-- **Двухфазное исполнение `compare_prices`**:
-  - В `mcp_core.sources` добавлен предикат `is_cdp_source` и набор `BROWSER_ACCESS_TIERS`.
-  - В `compare_connector.server`:
-    - Быстрые HTTP-источники (`wildberries` в API режиме, `yandex_market`) запускаются параллельно через `asyncio.gather`.
-    - Все CDP-источники (`ozon`, `avito`, `taobao`, `megamarket`, `lamoda`, `dns`, `citilink`, `aliexpress`, `drom`, а также `wildberries` в DOM-режиме) запускаются строго последовательно.
-    - Исходный детерминированный порядок вывода (`source_outcomes` и `offers`) сохраняется согласно списку `active`.
-- **Управление таймаутами**:
-  - Добавлена переменная окружения `COMPARE_TOOL_TIMEOUT` (по умолчанию 450 секунд, `TOOL_TIMEOUT_S = max(COMPARE_TOOL_TIMEOUT, SOURCE_TIMEOUT_S)`).
-  - В последовательном цикле CDP проверяется оставшийся дедлайн: если бюджет времени исчерпан, последующие источники получают честный статус `timeout` (`"tool timeout budget (...) exceeded"`), а уже полученные результаты сохраняются и возвращаются пользователю.
-  - В `compare_sources` экспортируется `"tool_timeout_s": TOOL_TIMEOUT_S`, документация и контракты в `mcp_core.resources` обновлены.
-- **Документация и скиллы**:
-  - Обновлены `skills/compare-prices/SKILL.md`, `dsh/skills/compare-prices/SKILL.md`, `skills/marketplace/SKILL.md`, `dsh/skills/marketplace/SKILL.md` и `docs/CDP_SETUP.md`.
-  - Счётчик тестов в документации (`README.md`, `docs/ARCHITECTURE.md`) обновлён до 3288.
+- **Причина падения в CI (`windows-latest, py3.12`)**:
+  - В тесте `test_compare_prices_tool_timeout_budget_exhaustion` использовался жесткий бюджет `TOOL_TIMEOUT_S = 0.08` и реальные задержки `asyncio.sleep(0.06)` для fast-источника `wildberries`.
+  - На нагруженном виртуальном раннере Windows в GitHub Actions системный таймер (квант 15.6 мс) и планировщик потоков задержали выполнение `_slow_wb` более чем на 80 мс, из-за чего fast-источник непреднамеренно упал по таймауту вместо `'ok'`.
+- **Элегантное решение без сна и флаков**:
+  - `test_compare_prices_tool_timeout_budget_exhaustion`: переведён на детерминированные виртуальные часы `time.monotonic` через `monkeypatch`. Время продвигается строго детерминированно между вызовами, задержки `asyncio.sleep` устранены полностью.
+  - `test_compare_prices_runs_fast_sources_concurrently_and_cdp_sequentially`: задержки `asyncio.sleep(0.05)` заменены на взаимную синхронизацию через `asyncio.Event` (`wb_started`, `ym_started`), что математически доказывает конкурентный старт обеих корутин без ожидания таймеров. Последовательность CDP доказана через явный счётчик активных задач (`max_cdp_concurrency == 1`).
 - **Верификация**:
-  - `check_test_count.py`: согласуется во всех 7 местах (3288).
-  - `ruff check .` и `ruff format --check .`: без замечаний.
-  - `mypy`: 121 файл проверен успешно (включая кроссплатформенные проверки `win32`, `darwin`, `linux`).
-  - Все гейты качества (`check_no_print.py`, `check_provenance.py`, `check_lock_revision.py`, `check_versions.py`): зеленые.
-  - `pytest packages/compare-connector/tests`: 377 passed.
-  - Полный офлайн-сьют `pytest -q -m "not live and not cdp"`: 3177 passed, 111 skipped, 0 failed.
+  - 25 последовательных запусков стресс-теста: 100% успех.
+  - `ruff check .` и `ruff format --check .`: чисто.
+  - `mypy`: 121 файл проверен успешно.
+  - Все скрипты гейтов качества (`check_no_print`, `check_provenance`, `check_lock_revision`, `check_versions`, `check_test_count`): зеленые.
+  - Полный сьют `pytest -q -m "not live and not cdp"`: 3177 passed.
+  - Сьют `pytest -q scripts`: 314 passed.
