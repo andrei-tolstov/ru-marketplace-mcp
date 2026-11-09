@@ -90,7 +90,9 @@ configured, because without it every call would answer `auth_missing`.
 - **CDP Concurrency & Sequential Invocations**: All CDP connectors (`dns_*`,
   `citilink_*`, `aliexpress_*`, `ozon_*`, `avito_*`, `drom_*`, `megamarket_*`,
   `lamoda_*`, `taobao_*`, `cian_*`) share a single Chrome instance managed by a
-  process-wide navigation budget (`CHROME_CDP_MAX_NAVIGATIONS=3`). Agents should
+  process-wide navigation budget (`CHROME_CDP_MAX_NAVIGATIONS=3`). `compare_prices`
+  automatically executes CDP sources sequentially after parallel fast API queries.
+  When agents call individual connector tools directly, they should
   **invoke CDP tools sequentially (one by one)** rather than fanning out concurrent
   tool calls across multiple CDP sources in a single turn. Concurrent fan-outs
   saturate browser CPU and cause false 20s timeouts on later queued requests.

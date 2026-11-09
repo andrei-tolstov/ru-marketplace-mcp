@@ -172,6 +172,7 @@ payload shape and the connector needs updating.
 | `CHROME_CDP_PORT` | `9222` | Debugging port |
 | `CHROME_NAV_TIMEOUT_MS` | `20000` | Initial page-navigation timeout in milliseconds, shared by Playwright and raw CDP unless a connector supplies its own value; finite and greater than zero |
 | `ALI_TIMEOUT` | `45` | AliExpress search and card-landing navigation timeout in seconds; overrides the shared navigation setting; finite and greater than zero |
+| `COMPARE_TOOL_TIMEOUT` | `450` | Total tool-call ceiling in seconds for `compare_prices` across all sources (fast API sources run in parallel, CDP sources run sequentially) |
 | `CHROME_SCRAPING_PROFILE` | platform default above | Profile directory |
 | `CHROME_BINARY` | auto-detected | Explicit path to Chrome/Chromium/Edge |
 | `CHROME_STEALTH` | `1` | Windows: park the window off-screen; macOS: open tabs in the background and keep the app hidden (⌘H) so it never steals focus or switches your Space |
@@ -191,9 +192,10 @@ load-event/main-document-status behavior; changing the budget does not make a
 20-second default unless `CHROME_NAV_TIMEOUT_MS` is set.
 
 These are navigation limits, not end-to-end tool limits. CDP attachment, settling,
-extraction and teardown have separate bounds. `compare_prices` still applies
-`COMPARE_SOURCE_TIMEOUT` (45 seconds by default) to the whole source call, and
-AliExpress selfchecks keep their 90-second outer limit. A larger navigation setting
+extraction and teardown have separate bounds. `compare_prices` executes fast API sources
+in parallel and CDP sources sequentially, bounded by `COMPARE_SOURCE_TIMEOUT` (45 seconds
+by default) for each source and `COMPARE_TOOL_TIMEOUT` (450 seconds by default) for the
+whole tool invocation. AliExpress selfchecks keep their 90-second outer limit. A larger navigation setting
 does not override those ceilings. If a normal page needs more time, increase the
 appropriate budgets rather than blocking the site's anti-bot resources.
 

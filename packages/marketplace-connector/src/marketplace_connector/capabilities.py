@@ -37,6 +37,7 @@ from typing import Any
 
 from mcp_core.source_selection import canonical
 from mcp_core.sources import (
+    BROWSER_ACCESS_TIERS,
     BY_NAME,
     ROUTE_API_THEN_DOM,
     ROUTE_DOM,
@@ -49,7 +50,7 @@ from mcp_core.sources import (
 # Access tiers whose sources can use the operator's Chrome at all. A source
 # outside this set is reached over plain HTTP: for it, "open the scraping
 # Chrome" is the wrong instruction, and docs/ANTI_BOT.md is the right one.
-BROWSER_ACCESS_TIERS = frozenset({"cdp", "graphql_or_cdp", "http_or_cdp"})
+# BROWSER_ACCESS_TIERS is imported from mcp_core.sources.
 
 
 def browser_backed(capability: dict[str, Any] | None) -> bool:

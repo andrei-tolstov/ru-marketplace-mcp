@@ -80,7 +80,13 @@ from mcp_core.source_selection import selected
 # SEARCHABLE below is the one per-source list compare still spells out, because
 # an existing test parses that literal; a parity test keeps it equal to the
 # registry's text-search sources.
-from mcp_core.sources import BY_NAME, CARD_TOOL_NAMES, COMPARE_SOURCES, FOREIGN_CURRENCY_SOURCES
+from mcp_core.sources import (
+    BY_NAME,
+    CARD_TOOL_NAMES,
+    COMPARE_SOURCES,
+    FOREIGN_CURRENCY_SOURCES,
+    is_cdp_source,
+)
 from pydantic import Field
 
 from compare_connector.identity import (
@@ -104,6 +110,10 @@ SERVER_STARTED_AT = datetime.datetime.now(datetime.UTC).isoformat().replace("+00
 # Per-source ceiling. Yandex pages are ~2 MB and WB search occasionally stalls, so
 # a slow source must not hold the whole comparison hostage.
 SOURCE_TIMEOUT_S = float(os.environ.get("COMPARE_SOURCE_TIMEOUT", "45"))
+
+# Total ceiling across all sources. With sequential CDP execution, up to 9 browser-backed
+# sources may query sequentially, each bounded by SOURCE_TIMEOUT_S.
+TOOL_TIMEOUT_S = max(float(os.environ.get("COMPARE_TOOL_TIMEOUT", "450")), SOURCE_TIMEOUT_S)
 
 # How many native diagnostics one source may contribute to a comparison. The
 # list stays bounded, and a bounded list that had to be cut says how many
@@ -1003,7 +1013,9 @@ def _source_error(exc: Exception) -> dict[str, Any]:
 
 
 # START_BLOCK_SOURCE_OUTCOME
-async def _run_source(name: str, query: str, limit: int) -> tuple[SourceOutcome, list[MarketOffer]]:
+async def _run_source(
+    name: str, query: str, limit: int, timeout: float | None = None
+) -> tuple[SourceOutcome, list[MarketOffer]]:
     """Query one marketplace, converting any failure into a reported outcome.
 
     R-COMPARE-FOREIGN-DETAIL: foreign-source detail counts native prices and
@@ -1011,15 +1023,16 @@ async def _run_source(name: str, query: str, limit: int) -> tuple[SourceOutcome,
     Never raises: a comparison with three of four sources is useful, while an
     exception would discard the three that worked.
     """
+    effective_timeout = timeout if timeout is not None else SOURCE_TIMEOUT_S
     started = time.monotonic()
     try:
-        offers = await asyncio.wait_for(_SEARCH_IMPLS[name](query, limit), timeout=SOURCE_TIMEOUT_S)
+        offers = await asyncio.wait_for(_SEARCH_IMPLS[name](query, limit), timeout=effective_timeout)
     except TimeoutError:
         return (
             SourceOutcome(
                 source=name,
                 status="timeout",
-                detail=f"no response within {SOURCE_TIMEOUT_S:.0f}s",
+                detail=f"no response within {effective_timeout:.0f}s",
                 error_code=ErrorCode.TIMEOUT.value,
                 retryable=True,
                 elapsed_ms=round((time.monotonic() - started) * 1000),
@@ -1183,7 +1196,47 @@ async def compare_prices(
     if ctx is not None:
         await ctx.info(f"compare_prices: {text!r} across {', '.join(active)}")
 
-    results = await asyncio.gather(*(_run_source(name, text, per_source_limit) for name in active))
+    fast_sources = [name for name in active if not is_cdp_source(name)]
+    cdp_sources = [name for name in active if is_cdp_source(name)]
+
+    deadline = time.monotonic() + TOOL_TIMEOUT_S
+
+    fast_results: list[tuple[SourceOutcome, list[MarketOffer]]] = []
+    if fast_sources:
+        remaining = deadline - time.monotonic()
+        fast_timeout = min(SOURCE_TIMEOUT_S, max(0.0, remaining))
+        fast_results = list(
+            await asyncio.gather(
+                *(_run_source(name, text, per_source_limit, timeout=fast_timeout) for name in fast_sources)
+            )
+        )
+
+    cdp_results: list[tuple[SourceOutcome, list[MarketOffer]]] = []
+    for name in cdp_sources:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            cdp_results.append(
+                (
+                    SourceOutcome(
+                        source=name,
+                        status="timeout",
+                        detail=f"tool timeout budget ({TOOL_TIMEOUT_S:.0f}s) exceeded",
+                        error_code=ErrorCode.TIMEOUT.value,
+                        retryable=True,
+                        elapsed_ms=0,
+                    ),
+                    [],
+                )
+            )
+            continue
+        source_timeout = min(SOURCE_TIMEOUT_S, remaining)
+        cdp_results.append(await _run_source(name, text, per_source_limit, timeout=source_timeout))
+
+    results_by_name = {
+        **dict(zip(fast_sources, fast_results, strict=True)),
+        **dict(zip(cdp_sources, cdp_results, strict=True)),
+    }
+    results = [results_by_name[name] for name in active]
 
     outcomes = [outcome for outcome, _ in results]
     offers: list[MarketOffer] = _dedupe(offer for _, source_offers in results for offer in source_offers)
@@ -1570,6 +1623,7 @@ async def compare_sources(ctx: Context | None = None) -> dict[str, Any]:
             ),
         },
         "source_timeout_s": SOURCE_TIMEOUT_S,
+        "tool_timeout_s": TOOL_TIMEOUT_S,
         "server_version": SERVER_VERSION,
         "server_started_at": SERVER_STARTED_AT,
         "process_id": os.getpid(),

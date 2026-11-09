@@ -100,13 +100,16 @@ prices gives `N results, 0 priced (not ranked)`. Rouble-source detail keeps
 
 ## Sequential CDP Source Invocations (Browser Protection)
 
-When querying sources that rely on the operator's Chrome via CDP (`dns`, `citilink`, `aliexpress`, `ozon`, `avito`, `drom`, `taobao`, `megamarket`, `lamoda`):
-- Chrome CDP has a bounded navigation concurrency budget (`CHROME_CDP_MAX_NAVIGATIONS=3` by default).
-- Running `compare_prices` across all sources concurrently fans out up to 9 CDP navigations simultaneously. In resource-constrained environments or under anti-bot challenges (Qrator, ServicePipe, x5sec), this queue congestion can cause 20-second CDP timeouts on two-tier fallbacks (`ozon`, `avito`, `drom`) while pure CDP sources occupy the browser slots.
-- **Recommended invocation pattern**:
-  1. For instant answers, query fast direct API sources first: `compare_prices(query=..., sources=["wildberries", "yandex_market"])`.
-  2. Query CDP sources **sequentially or in small batches** (e.g. `sources=["ozon"]`, then `sources=["avito"]`, `sources=["drom"]`, etc.) when complete cross-market coverage is needed.
-  3. When an agent calls individual connector tools directly, **never invoke multiple CDP tools in parallel in the same turn** — call them one by one.
+`compare_prices` automatically protects Chrome from CDP navigation queue congestion:
+- Fast direct-API sources (`wildberries` in default API mode, `yandex_market`) execute concurrently in parallel (`asyncio.gather`).
+- All browser-backed CDP sources (`dns`, `citilink`, `aliexpress`, `ozon`, `avito`, `drom`, `taobao`, `megamarket`, `lamoda`, and `wildberries` in DOM mode) execute **strictly sequentially one after another**.
+- This sequential execution ensures requests never exceed the Chrome navigation concurrency budget (`CHROME_CDP_MAX_NAVIGATIONS=3`), eliminating contention timeouts.
+
+**Tool Execution Timeout Consideration**:
+- Because CDP sources query sequentially, an all-source comparison can take 1–3 minutes end-to-end (bounded by `COMPARE_TOOL_TIMEOUT`, 450s default, and per-source `COMPARE_SOURCE_TIMEOUT`, 45s default).
+- Ensure your MCP client tool call timeout is configured appropriately (e.g. 300–450 seconds).
+- For instant (<3s) answers, query fast direct API sources only: `compare_prices(query=..., sources=["wildberries", "yandex_market"])`.
+- When an agent calls individual connector tools directly outside `compare_prices`, **never invoke multiple CDP tools in parallel in the same turn** — call them one by one.
 
 Set `in_stock_only=true` when the user asks where the item can be bought now.
 The response keeps excluded offers for audit, but ranks and selects winners only

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -1370,3 +1371,95 @@ def test_a_new_product_carries_no_condition_warning():
     ]
 
     assert server._relevance_warnings("iphone 15", priced) == []
+
+
+async def test_compare_prices_runs_fast_sources_concurrently_and_cdp_sequentially(monkeypatch):
+    """Fast API sources run concurrently via gather; CDP sources run sequentially one by one."""
+    events: list[tuple[str, str, float]] = []
+
+    async def _make_stub(name: str, delay: float):
+        events.append(("start", name, time.monotonic()))
+        await asyncio.sleep(delay)
+        events.append(("end", name, time.monotonic()))
+        return [MarketOffer(source=name, product_id="1", title=f"Item {name}", price_rub=100.0)]
+
+    stub_sources(
+        monkeypatch,
+        {
+            "wildberries": lambda q, limit: _make_stub("wildberries", 0.05),
+            "yandex_market": lambda q, limit: _make_stub("yandex_market", 0.05),
+            "ozon": lambda q, limit: _make_stub("ozon", 0.05),
+            "citilink": lambda q, limit: _make_stub("citilink", 0.05),
+        },
+    )
+
+    result = await server.compare_prices("test query", sources=["wildberries", "ozon", "yandex_market", "citilink"])
+
+    # Output order strictly follows active sources
+    assert [o.source for o in result.source_outcomes] == [
+        "wildberries",
+        "ozon",
+        "yandex_market",
+        "citilink",
+    ]
+
+    starts = {name: t for ev, name, t in events if ev == "start"}
+    ends = {name: t for ev, name, t in events if ev == "end"}
+
+    # Fast sources (wildberries & yandex_market) ran concurrently:
+    # both started before either ended
+    assert starts["wildberries"] < ends["yandex_market"]
+    assert starts["yandex_market"] < ends["wildberries"]
+
+    # Both fast sources finished before any CDP source started
+    assert ends["wildberries"] <= starts["ozon"]
+    assert ends["yandex_market"] <= starts["ozon"]
+
+    # CDP sources ran strictly sequentially: ozon finished before citilink started
+    assert ends["ozon"] <= starts["citilink"]
+
+
+async def test_compare_prices_tool_timeout_budget_exhaustion(monkeypatch):
+    """When the total tool timeout budget is exceeded, subsequent CDP sources time out gracefully."""
+    monkeypatch.setattr(server, "TOOL_TIMEOUT_S", 0.08)
+
+    async def _slow_wb(q, limit):
+        await asyncio.sleep(0.06)
+        return [MarketOffer(source="wildberries", product_id="1", title="Item WB", price_rub=100.0)]
+
+    async def _slow_ozon(q, limit):
+        await asyncio.sleep(0.05)
+        return [MarketOffer(source="ozon", product_id="2", title="Item Ozon", price_rub=120.0)]
+
+    async def _citilink(q, limit):
+        return [MarketOffer(source="citilink", product_id="3", title="Item Citilink", price_rub=130.0)]
+
+    stub_sources(
+        monkeypatch,
+        {
+            "wildberries": _slow_wb,
+            "ozon": _slow_ozon,
+            "citilink": _citilink,
+        },
+    )
+
+    result = await server.compare_prices("test query", sources=["wildberries", "ozon", "citilink"])
+
+    assert result.complete is False
+    outcomes = {o.source: o for o in result.source_outcomes}
+    assert outcomes["wildberries"].status == "ok"
+    # Either ozon or citilink or both exceeded budget; citilink definitely exceeded
+    assert outcomes["citilink"].status == "timeout"
+    assert "tool timeout budget" in outcomes["citilink"].detail
+    # Partial results are preserved
+    assert len(result.offers) >= 1
+    assert result.cheapest is not None
+
+
+async def test_wildberries_dom_mode_treated_as_cdp(monkeypatch):
+    """When WB is configured for DOM transport, is_cdp_source treats it as CDP."""
+    monkeypatch.setenv("WB_TRANSPORT", "dom")
+    assert server.is_cdp_source("wildberries") is True
+
+    monkeypatch.setenv("WB_TRANSPORT", "api")
+    assert server.is_cdp_source("wildberries") is False

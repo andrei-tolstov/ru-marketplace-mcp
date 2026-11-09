@@ -285,7 +285,7 @@ raise — they are reported in `source_outcomes`.""",
     "compare_sources": """## Return Format
 
 Plain object: {installed, searchable, not_installed, deselected, notes,
-source_timeout_s, server_version, server_started_at, process_id}. notes
+source_timeout_s, tool_timeout_s, server_version, server_started_at, process_id}. notes
 explains per-source access quirks (CDP-only sources, currencies, missing
 text search).
 
@@ -831,6 +831,7 @@ _NATIVE_OUTPUT_FIELDS = {
         "deselected",
         "notes",
         "source_timeout_s",
+        "tool_timeout_s",
         "server_version",
         "server_started_at",
         "process_id",

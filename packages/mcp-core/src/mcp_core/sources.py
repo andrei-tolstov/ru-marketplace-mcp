@@ -50,6 +50,8 @@ shipping.
 # CARD_TOOL_NAMES: Source -> card tool compare uses to inspect one offer.
 # FOREIGN_CURRENCY_SOURCES: Compare sources that do not quote roubles.
 # MOUNT_GATED_SOURCES: Sources the unified server mounts only when configured.
+# BROWSER_ACCESS_TIERS: Access tiers whose sources can use the operator's Chrome.
+# is_cdp_source: True when a source uses or may use the operator's scraping Chrome (CDP).
 # END_MODULE_MAP
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ from typing import Any
 
 __all__ = [
     "ALIASES",
+    "BROWSER_ACCESS_TIERS",
     "BY_NAME",
     "CAPABILITIES",
     "CARD_TOOL_NAMES",
@@ -76,6 +79,7 @@ __all__ = [
     "SOURCES",
     "UNBLOCK_PAGES",
     "SourceSpec",
+    "is_cdp_source",
     "source_route",
     "wb_route",
 ]
@@ -589,3 +593,17 @@ CARD_TOOL_NAMES: dict[str, str] = _card_tools()
 FOREIGN_CURRENCY_SOURCES: tuple[str, ...] = tuple(spec.name for spec in _comparable() if spec.currency != "rub")
 
 MOUNT_GATED_SOURCES: frozenset[str] = frozenset(spec.name for spec in _mounted() if spec.mount_gated)
+
+BROWSER_ACCESS_TIERS: frozenset[str] = frozenset({"cdp", "graphql_or_cdp", "http_or_cdp", "cdp_or_residential"})
+
+
+def is_cdp_source(name: str, *, env: Mapping[str, str] | None = None) -> bool:
+    """True when a source uses or may use the operator's scraping Chrome (CDP)."""
+    cleaned = (name or "").strip().lower().replace("-", "_")
+    canon = ALIASES.get(cleaned, cleaned)
+    spec = BY_NAME.get(canon)
+    if spec is None:
+        return False
+    if canon == "wildberries":
+        return source_route("wildberries", env=env) == ROUTE_DOM
+    return spec.requires_cdp or spec.access in BROWSER_ACCESS_TIERS
